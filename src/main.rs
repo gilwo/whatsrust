@@ -224,7 +224,11 @@ async fn main() -> Result<()> {
         println!();
 
         loop {
-            match lines.next_line().await {
+            let next = tokio::select! {
+                _ = cancel_for_repl.cancelled() => break,
+                next = lines.next_line() => next,
+            };
+            match next {
                 Ok(Some(line)) => {
                     let line = line.trim().to_string();
                     if line.is_empty() {
@@ -980,7 +984,12 @@ async fn main() -> Result<()> {
         warn!("bridge did not fully stop within 5 seconds");
     }
 
-    Ok(())
+    // Graceful shutdown is complete (bridge drained + state backed up). The
+    // REPL spawns a blocking stdin reader thread (tokio::io::stdin), which stays
+    // parked in a read() syscall whenever stdin is an open terminal/pipe. The
+    // runtime's drop would block forever waiting on that thread, so exit
+    // explicitly instead of returning and hanging.
+    std::process::exit(0);
 }
 
 // ---------------------------------------------------------------------------
