@@ -61,8 +61,15 @@ fn read_local_media_file(path: &Path) -> Result<Vec<u8>> {
     Ok(std::fs::read(path)?)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // CLI mode: fire request to running daemon
