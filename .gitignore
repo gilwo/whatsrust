@@ -8,3 +8,9 @@
 .cargo/config.toml
 .DS_Store
 review-pack/
+*.log
+.mcp.json
+.env
+# Session-tracking artifacts (personal, machine-local; not part of the repo)
+*.md.compact.md
+whatsrust-project_*.md
