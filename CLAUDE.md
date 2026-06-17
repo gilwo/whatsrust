@@ -12,6 +12,7 @@ Where to look for what — read the relevant doc before changing related code.
 | User-facing features, install, API/MCP overview | `README.md` |
 | Contributing workflow | `CONTRIBUTING.md` |
 | **Architecture Decision Records (the "why" ledger)** | `docs/adr/` — start at `docs/adr/0000-index.md` |
+| **Feature roadmap & status (LIVE — what's done/in-flight/planned)** | `docs/plans/FEATURES.md` |
 | Design specs / plans (the "what/how" blueprints) | `docs/plans/*.md` |
 | In-flight: historical fetch + semantic/lexical search | `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (+ ADRs 0001–0025) |
 
