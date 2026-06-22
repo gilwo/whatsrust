@@ -1,11 +1,12 @@
 # Historical Message Fetch + Semantic/Lexical Search Design
 
-**Date:** 2026-06-17
-**Status:** Designed (not yet implemented)
+**Date:** 2026-06-17  
+**Status:** Designed (not yet implemented)  
+**Updated:** 2026-06-22 — Incorporates 2026-06-18 design review resolution (R1-R12, see session file)
 
 Consolidated spec for explicitly-triggered, per-chat historical message backfill
 with local lexical (FTS5) + semantic (vector) search. This document is the
-*what/how* blueprint; the *why* lives in the ADRs (`docs/adr/0001-0025`), which
+*what/how* blueprint; the *why* lives in the ADRs (`docs/adr/0001-0036`), which
 are cross-linked throughout (e.g. "see ADR 0008").
 
 ---
@@ -14,7 +15,7 @@ are cross-linked throughout (e.g. "see ADR 0008").
 
 **Goals**
 - Explicitly trigger historical message backfill for a single chat or group.
-- Fetch modes: `all`, `since:<ts>`, bounded by `max_messages` — composable stop conditions on one backward-pagination loop (ADR 0003).
+- Fetch target kinds: `all`, `since:<ts>`, `count:<n>` — single target per request with autonomy backstop (ADR 0033, supersedes earlier composable-stop-conditions).
 - Store backfilled + live messages in one unified timeline, retained indefinitely.
 - Lexical search (FTS5, always on) + optional semantic search (vectors via a sidecar).
 - Multilingual (user data is Hebrew/Arabic; design is language-neutral). See ADR 0018.
@@ -39,8 +40,8 @@ are cross-linked throughout (e.g. "see ADR 0008").
                 └──────────┬───────────┘
                            ▼
                 ┌──────────────────────┐    paced (dedicated backfill pacer; ADR 0020)
-                │  backfill worker      │    sequential await-response loop
-                └──────────┬───────────┘
+                │  backfill worker      │    SINGLE worker, sequential FIFO (ADR 0026)
+                └──────────┬───────────┘    3-level abort: batch atomic, job resumable, task cooperative
                            ▼
               history-source trait  ──────►  wa-rs Client.fetch_message_history()
               (test seam; ADR 0025)          PDO HistorySyncOnDemandRequest → primary phone
@@ -74,33 +75,52 @@ FTS5 + embed-pending path; backfill is enrichment, not a separate pipeline.
 The pinned fork (`199-biotechnologies/whatsapp-rust` @ `9fb13a7`) is ~v0.2-era.
 Upstream (`jlucaso1`) is at **v0.6.0** with a heavily-reworked history-sync/PDO
 subsystem (`pdo.rs` 501→870, `history_sync.rs` 281→1066) — exactly what we build on.
-**Rebase the fork onto upstream v0.6.0 first** (ADR 0002), as a spike that must resolve:
 
-1. Whether history-sync `WebMessageInfo` is already plaintext (suspected yes) or needs separate Signal decryption (ADR 0014 fallback B).
-2. Magnitude of whatsrust API breakage v0.2→v0.6 (event variants, client signatures; the recent LID work may overlap).
-3. That the ON_DEMAND `HistorySyncNotification` response path is wired to an event whatsrust can consume (today it is only logged).
+**Rebase spike is a HARD GO/NO-GO GATE** (ADR 0002). Must resolve criteria before any F1 implementation:
+
+**Gate criteria:**
+- **G1:** whatsrust compiles + 89 tests pass vs v0.6 (API-breakage blast radius tractable).
+- **G2:** History `WebMessageInfo` already plaintext (feeds ADR 0014 single-extraction adapter).
+- **G3:** ON_DEMAND response correlatable to its request (drives paginated loop). Single-worker (ADR 0026) lowers bar: one PDO in-flight → "match the only one" suffices.
+
+**Pivot paths pre-attached:**
+- G1 deep-breakage → time-box rebase ≤N days, else cherry-pick only history-sync/PDO OR defer F1.
+- G2 encrypted → ADR 0014 fallback B (parallel extractor).
+- G3 no-correlation → single-flight matching; if impossible → F1 not viable, STOP.
+
+**Minimal spike result (2026-06-22, static inspection of upstream v0.6.0):** Overall lean **GO, MEDIUM effort (~1-2 days mechanical)**. G1 = LIKELY-FAIL-but-mechanical (~15-20 call sites: Event::Message Arc wrappers, .on_event closure signature, exhaustive match adds 4 variants/removes JoinedGroup, LazyHistorySync); G2 = LIKELY-PASS (WebMessageInfo.message populated plaintext); G3 = LIKELY-PASS (peer_data_request_session_id field 12 exposed). JoinedGroup landmine defused (low-stakes handler, stale cache acceptable). No architectural blockers.
 
 Per CLAUDE.md: work in `../whatsapp-rust`, push, bump the pinned `rev`.
 
 ---
 
-## The fetch model (ADR 0003)
+## The fetch model (ADR 0003, refined by ADR 0033)
 
 - **Anchor-based backward pagination.** `HistorySyncOnDemandRequest` takes an anchor
   (`oldest_msg_id`, `oldest_msg_from_me`, `oldest_msg_timestamp_ms`) + `on_demand_msg_count`
   → returns messages older than the anchor. Each batch's new oldest message becomes the next anchor.
 - **Single contiguous backward frontier per chat.** We only ever fetch *older than the current oldest contiguous anchor* → no mid-history gaps, no arbitrary windows.
-- **Stop conditions (composable):** `all` = until phone reports exhausted; `since:<ts>` = until oldest crosses T; `max_messages` = until N pulled. They combine (e.g. `since:90d` + `max:5000`).
-- **Resume = re-trigger.** The persisted `backfill_cursor` holds the frontier; re-triggering the same chat continues from it. "Fetch 5000, then continue" is the same call twice.
+
+**Target model (contained-C, ADR 0033):** Single `target` kind per request (clean discriminator, NOT ambiguous composition):
+- **`since:T`** → done when oldest crosses T OR phone exhausted. AUTO-CONTINUES across paced segments.
+- **`all`** → done when phone exhausted. AUTO-CONTINUES.
+- **`count:N`** → done when N fetched. Does NOT auto-continue ("fetch up to N then stop").
+
+**Autonomy backstop (ADR 0033):** CONFIG-level guarded knob (ban-critical, ADR 0022/0030) bounds how far auto-continuing (since/all) may run in ONE trigger before STOP + require re-trigger. e.g. backstop=20k msgs. PARKS-and-requires-retrigger, does NOT auto-enqueue child jobs (flat queue, ADR 0026).
+
+**Example:** target=since:9mo, backstop=20k. 10k chat → completes in one trigger (~25-40min auto-continuing). 50k chat → runs to 20k → parks → "re-trigger to continue".
+
+- **Resume = re-trigger.** The persisted `backfill_cursor` holds the frontier; re-triggering the same chat continues from it.
 - **No-op fast path:** if the cursor says `exhausted`, the job completes immediately.
 
 ---
 
-## Storage / schema (ADR 0009)
+## Storage / schema (ADR 0009, migration via ADR 0028-0032)
 
 Migrate existing `inbound_messages` → unified `messages` **in place**
-(`ALTER TABLE ... RENAME` + `ADD COLUMN`), bump schema version. Live ingest becomes
-a full writer of the new columns. Sketches (illustrative, finalize at implementation):
+(`ALTER TABLE ... RENAME` + `ADD COLUMN`), bump schema version v7→v8 (ADR 0031 single-integer invariant). **Staged migration mode** (ADR 0028): open→read version→wal_checkpoint(TRUNCATE)→backup `.pre-migration-v7-<ts>.bak` (fail-closed)→TX migrate→validate (ADR 0029: V1 structural + V3 smoke probes)→start. Circuit-breaker (ADR 0030): pin file prevents re-migration crash loop, `--rollback` / `--migrate` flags. FTS5 availability probed at migration boundary (ADR 0032).
+
+Live ingest becomes a full writer of the new columns. Sketches (illustrative, finalize at implementation):
 
 ```sql
 -- Unified message timeline (live + backfill)
@@ -137,15 +157,23 @@ CREATE TABLE backfill_cursor (
     last_backfill_at     INTEGER
 );
 
--- Durable backfill-job queue (twin of outbound_queue; ADR 0010)
+-- Durable backfill-job queue (twin of outbound_queue; ADR 0010, schema revised by ADR 0033)
 CREATE TABLE backfill_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_jid TEXT NOT NULL, mode TEXT NOT NULL,        -- 'all' | 'since' | ...
-    since_ts INTEGER, max_messages INTEGER,
+    chat_jid TEXT NOT NULL,
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('since', 'all', 'count')),  -- ADR 0033 contained-C
+    target_value INTEGER,                              -- ts for since, count for count, NULL for all
     status TEXT NOT NULL,                              -- queued|running|paused|done|cancelled|failed
     fetched INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
+
+-- Generic KV table for singletons (ADR 0036, created in F1 migration)
+CREATE TABLE IF NOT EXISTS metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+-- watchdog baseline: ('watchdog_last_alerted_size', '<bytes>'); seed-on-absence (no false-alert on first tick)
 
 -- FTS5 external-content over messages (ADR 0019)
 CREATE VIRTUAL TABLE messages_fts USING fts5(
@@ -163,6 +191,25 @@ the `done` flag — drain work is derived by set-difference (ADR 0017).
 **Existing access points to update:** `insert_inbound`, `search_inbound`,
 the two delete paths, `prune_old_data` (remove its age-based DELETE — see Retention),
 and the schema migration block in `storage.rs`.
+
+**Single-connection model (ADR 0027):** Keep single `Arc<Mutex<Connection>>` (short closures, WAL allows readers between writes). Chunked transactions (backfill/embedding batches). Targeted hardening: `snapshot_db` gets its own backup connection (stops multi-second global stall). Reader pool deferred until measured latency problem.
+
+---
+
+## Migration & rollback (ADR 0028-0032)
+
+**Staged migration mode (ADR 0028):** version < CURRENT → enter migration mode BEFORE full start:
+1. `PRAGMA wal_checkpoint(TRUNCATE)` (flush WAL into main file, ensures backup captures single consistent file)
+2. Backup → `whatsapp.db.pre-migration-v<from>-<ts>.bak` via SQLite Backup API (fail-closed: backup fails → abort migration)
+3. Run migration in TX (`user_version` bump LAST → crash mid-migration auto-rolls-back, DB stays v_old)
+4. Validate (ADR 0029: V1 structural checks + V3 smoke probes — FTS5 triggers, set-difference drain query, vector roundtrip; skip V2 full integrity_check as gate)
+5. Pass → full start; fail → halt + instruct
+
+**Circuit-breaker (ADR 0030):** Pin file `whatsapp.db.migration-pin` prevents re-migration crash loop. Startup decision table (pin presence × binary CURRENT vs DB version vs blocked_target) → normal / migration / halt-instruct / run-with-warning. `--rollback` (valid only when pin present, no footgun): restore .bak + DELETE -wal/-shm + update pin + EXIT (point-in-time-loss warning). `--migrate` clears pin + force retry. Newer binary (CURRENT > blocked_target) auto-retries.
+
+**Schema version invariant (ADR 0031):** Single integer `CURRENT_SCHEMA_VERSION`. ANY migration-required change ⟺ version bump ⟺ full ceremony. Optional performance indexes = idempotent `CREATE INDEX IF NOT EXISTS` at startup, OUTSIDE version system. No MAJOR.MINOR split in v1 (deferred behind measured trigger).
+
+**FTS5 probe (ADR 0032):** One-time probe at v7→v8 boundary before FTS5 DDL (`CREATE VIRTUAL TABLE temp.__fts5_probe...` or `sqlite_compileoption_used`). Absent → actionable error ("keep default `bundled` rusqlite feature") + leave DB at v7. Deliberate-misbuild guard, not degraded mode.
 
 ---
 
@@ -222,25 +269,27 @@ the spike proves history `WebMessageInfo` is incompatible.
 
 ---
 
-## Retention + storage watchdog (ADR 0012, 0013)
+## Retention + storage watchdog (ADR 0012, 0013, 0036)
 
 - **No time-based deletion of message history** — kept indefinitely; removal only by
   explicit user action. Remove the age-based `DELETE FROM ...` from `prune_old_data`
   (keep outbound-queue cleanup, which is transient operational data).
-- **Watchdog:** reuse the existing periodic prune task scaffolding (`bridge.rs`, interval
+- **Watchdog (ADR 0013/0036):** reuse the existing periodic prune task scaffolding (`bridge.rs`, interval
   `prune_interval_secs`). Each tick: `PRAGMA wal_checkpoint(PASSIVE)` then measure total
   on-disk footprint = `whatsapp.db` + `-wal` + `-shm` (filesystem `stat`, WAL-accurate —
-  NOT the `page_count` pragma). Compare to a **persisted last-alerted baseline**; on
-  ≥50% growth → log warning + emit a `BridgeEvent` (SSE-visible) → reset baseline.
+  NOT the `page_count` pragma). Compare to **persisted last-alerted baseline** (stored in `metadata` table, ADR 0036); on
+  ≥50% growth → log warning + emit a `BridgeEvent` (SSE-visible) → reset baseline. **Seed-on-absence:** first tick after table created → seed current size silently, no false-alert.
 
 ---
 
-## Anti-ban + safety
+## Worker topology + anti-ban + safety
+
+- **Backfill worker (ADR 0026):** SINGLE worker, sequential FIFO (genuine twin of outbound worker). "Concurrency cap" = 1 by construction; excess enqueues. Connection-gated (PDO needs live WA). Three-level abort: **BATCH** (send PDO → response → persist+cursor in ONE TX) = atomic, never interrupted; **JOB** = abortable at batch boundaries → 'cancelled', resumable; **TASK** = cooperative stop. Inter-batch sleep INTERRUPTIBLE (cancel responsive). CASE-guarded terminal status write prevents cancel-race. Shutdown unification: SIGINT/shutdown stops at batch boundary, terminal state = function of stop-reason (cancel-API → 'cancelled', shutdown → 'queued'/resumable). Embedding-drain is SEPARATE always-on task (talks only to sidecar).
 
 - **Backfill pacing (ADR 0020):** dedicated pacer, SEPARATE from the outbound `SendPacer`
   (must not consume send budget). burst=1, base ~4s/batch with ±40% jitter (always on).
   Strictly **sequential** (await each response → extract anchor → pace → next), which the
-  anchor-based protocol requires anyway. Occasional randomized long pauses (every ~5-15
+  anchor-based protocol + single-worker model require. Occasional randomized long pauses (every ~5-15
   batches, ~20-90s) as secondary insurance; conservative *average rate* is the primary
   defense. Response timeout → exponential backoff → pause job (resumable). No elaborate
   human-simulation in v1.
@@ -264,15 +313,17 @@ the spike proves history `WebMessageInfo` is incompatible.
 
 ---
 
-## API / MCP surface (ADR 0011)
+## API / MCP surface (ADR 0011, refined by ADR 0033-0035)
 
 - **Endpoints:** `POST /api/history-fetch` (enqueue → job_id), `GET /api/history-fetch`
   (status / list active), `POST /api/history-fetch/cancel`. Reuse the existing SSE
   stream for live progress.
 - **MCP tool:** one — `whatsrust_fetch_history` (mirrors the trigger). Its description
   documents the pacing/limits for agent expectation-setting (ADR 0021).
-- **Immediate trigger return:** `{job_id, chat_jid, mode, resume_anchor, more_remain, status}`;
-  no-op fast path when the cursor is `exhausted`.
+- **Immediate trigger return:** `{job_id, chat_jid, target_kind, target_value?, resume_anchor, more_remain, status}`;
+  no-op fast path when the cursor is `exhausted`. Response echoes `{requested, accepted}` for clamped values (autonomy backstop, ADR 0033).
+- **Enqueue-time validation (ADR 0035):** per-chat cooldown + one-active-per-chat enforced BEFORE durable write. Return structured back-pressure (`{status: already_active, job_id}` / 429 `{retry_after}`).
+- **Progress (ADR 0034):** since/all modes show fuzzy "N fetched, more remain" (no ETA/total); count mode shows "N / target" (precise). SSE emits explicit `paused/cooldown` state during long pauses (ADR 0020 UX contract).
 - "Continue/resume" needs no separate endpoint — re-trigger resumes from the cursor.
 
 ---
@@ -313,22 +364,26 @@ Extends the project's culture (inline unit tests, real temp-file DB for storage,
 
 ## Implementation phasing (suggested order)
 
-0. **wa-rs rebase spike** (ADR 0002) — resolves the open risks below before anything else.
-1. **Storage + migration** — unified `messages`, sibling tables, FTS5 + triggers, access-point updates.
-2. **Fetch worker** — history-source trait, backfill-job queue, pagination loop, cursor, pacer (ADR 0003/0010/0020).
+0. **wa-rs rebase spike** (ADR 0002) — HARD GO/NO-GO GATE, resolves G1/G2/G3 before anything else. Spike result: GO-leaning, MEDIUM ~1-2 days.
+1. **Storage + migration** — unified `messages`, sibling tables (`metadata`, `media_refs`, `embeddings`, `backfill_cursor`, `backfill_jobs` with revised schema), FTS5 + triggers, access-point updates. Staged migration mode (ADR 0028-0032).
+2. **Fetch worker** — history-source trait, backfill-job queue, single-worker FIFO pagination loop (ADR 0026), cursor, pacer (ADR 0020), contained-C target model (ADR 0033), enqueue-time validation (ADR 0035).
 3. **Search** — FTS5 query + BLOB cosine rerank (ADR 0008/0019).
-4. **Embedding sidecar + drain** — Embedder trait, stdio JSON-RPC, drain worker, multi-model store (ADR 0015/0017/0024).
-5. **Safety + config** — daemon-side guards, fail-closed config, `.env` + `.env.example` (ADR 0021/0022/0023).
-6. **API / MCP** — trigger/status/cancel, `whatsrust_fetch_history`, SSE progress (ADR 0011).
-7. **Watchdog** — repurpose periodic task (ADR 0012/0013).
-8. **Tests** — per ADR 0025 alongside each layer.
+4. **Embedding sidecar + drain** — Embedder trait, stdio JSON-RPC (ADR 0024), drain worker (ADR 0015), multi-model store (ADR 0017), embeddable-text classification (ADR 0016).
+5. **Safety + config** — daemon-side guards (ADR 0021), fail-closed config (ADR 0022), `.env` + `.env.example` (ADR 0023), autonomy backstop (ADR 0033).
+6. **API / MCP** — trigger/status/cancel, `whatsrust_fetch_history`, SSE progress with fuzzy/precise per target-kind (ADR 0011/0034).
+7. **Watchdog** — repurpose periodic task (ADR 0012/0013/0036), metadata table seed-on-absence.
+8. **Tests** — per ADR 0025 alongside each layer (history-source fake, Embedder fake, storage temp-DB, minimal fake-sidecar binary).
 
 ---
 
-## Open risks (spike must resolve)
+## Open risks (spike resolved G1-G3, remaining runtime unknowns)
 
-- Is history `WebMessageInfo` plaintext, or does it need separate Signal decryption? (ADR 0014)
-- v0.2→v0.6 wa-rs API breakage surface in `bridge.rs` (events, client signatures, LID overlap).
-- Does the ON_DEMAND `HistorySyncNotification` response reliably route to a consumable event, and how is a per-chat request correlated to its response? (upstream added `stanza_id`/device-0 validation in `pdo.rs`).
+**Resolved by spike (2026-06-22):**
+- **G1 (API breakage):** ~15-20 call sites, MEDIUM ~1-2 days mechanical. Event::Message Arc wrappers, .on_event closure, exhaustive match adds 4 / removes JoinedGroup (landmine defused — low-stakes handler).
+- **G2 (WebMessageInfo plaintext):** LIKELY-PASS. WebMessageInfo.message populated plaintext (phone decrypts before packing into blob).
+- **G3 (correlation):** LIKELY-PASS. peer_data_request_session_id field 12 exposed + single-worker fallback.
+
+**Runtime unknowns (measure during implementation):**
 - Does media `directPath` from history reliably resolve for lazy hydration, or expire too fast to be useful? (ADR 0005 — best-effort assumed).
 - CJK-without-embedder lexical quality (trigger for deferred trigram option C; ADR 0018).
+- Search latency under concurrent backfill (triggers ADR 0027 reader-pool option if >100ms p95).

@@ -1,7 +1,8 @@
 # 0003. Per-chat backward-pagination fetch model with resumable cursor
 
 **Status:** Accepted  
-**Date:** 2026-06-17
+**Date:** 2026-06-17  
+**Updated:** 2026-06-22 — Composable-stop-conditions schema superseded by contained-C (ADR 0033)
 
 ## Context
 
@@ -19,6 +20,8 @@ Per-chat backward-pagination loop over `HistorySyncOnDemandRequest`. Single cont
 - `max_messages:<n>`: stop after n messages
 
 Runtime cap enforced via parameter. Resumable continuation via persisted per-chat frontier cursor in `backfill_cursor` table (chat_jid, oldest_anchor, more_remain, exhausted, last_backfill_at). Re-trigger = resume from cursor.
+
+**Note (2026-06-22):** Original composable schema (nullable `since_ts` + `max_messages`, "whichever first") superseded by **ADR 0033 contained-C model** (single `target_kind` + `target_value`, autonomy backstop). Frontier and resumable-continuation principles unchanged.
 
 ## Consequences
 
