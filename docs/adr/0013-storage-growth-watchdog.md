@@ -28,7 +28,7 @@ Alert threshold: notify when growth is significant (≥50% vs last baseline), no
 3. Compare to persisted `last_alerted_size` (stored in `metadata` table or bridge state)
 4. If `current >= last_alerted * 1.5` (≥50% growth) → log warning + emit `BridgeEvent::StorageAlert {current_mb, baseline_mb, growth_pct}` (SSE-visible) → update `last_alerted_size = current`
 
-**Baseline tracking:** persist `last_alerted_size` in SQLite `metadata` table (key-value store, reused pattern from existing schema).
+**Baseline tracking:** persist `last_alerted_size` in SQLite `metadata` table (key-value store, created in F1 migration, see ADR 0036). **Behavioral note:** Missing baseline row (first run after table created) → SEED current size silently, NO alert (else first tick false-alerts ∞% growth). Baseline present → compare.
 
 ## Consequences
 

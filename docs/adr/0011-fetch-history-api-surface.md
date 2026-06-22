@@ -1,7 +1,8 @@
 # 0011. Fetch history API surface: trigger, status, cancel, SSE progress
 
 **Status:** Accepted  
-**Date:** 2026-06-17
+**Date:** 2026-06-17  
+**Updated:** 2026-06-22 — Request/response schema refined by ADR 0033/0034/0035
 
 ## Context
 

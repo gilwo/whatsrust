@@ -38,7 +38,26 @@ This directory contains Architecture Decision Records (ADRs) for the whatsrust p
 | [0023](0023-env-var-config-with-dotenv.md) | Env-var config with dotenv support | 2026-06-17 | Accepted |
 | [0024](0024-sidecar-jsonrpc-protocol-schema.md) | Sidecar JSON-RPC protocol schema | 2026-06-17 | Accepted |
 | [0025](0025-layered-testing-strategy.md) | Layered testing strategy with two fake seams | 2026-06-17 | Accepted |
+| [0026](0026-backfill-worker-topology-and-abort-granularity.md) | Backfill worker topology and abort granularity | 2026-06-22 | Accepted |
+| [0027](0027-single-connection-db-contention-model.md) | Single-connection DB contention model | 2026-06-22 | Accepted |
+| [0028](0028-staged-migration-mode-with-validation.md) | Staged migration mode with pre-migration backup and validation | 2026-06-22 | Accepted |
+| [0029](0029-migration-validation-strategy.md) | Migration validation strategy | 2026-06-22 | Accepted |
+| [0030](0030-migration-circuit-breaker.md) | Migration circuit-breaker with rollback and migrate flags | 2026-06-22 | Accepted |
+| [0031](0031-single-integer-schema-version-invariant.md) | Single-integer schema version invariant | 2026-06-22 | Accepted |
+| [0032](0032-fts5-availability-probe-at-migration-boundary.md) | FTS5 availability probe at migration boundary | 2026-06-22 | Accepted |
+| [0033](0033-fetch-target-model-contained-c.md) | Fetch target model: contained-C (single target kind, autonomy backstop) | 2026-06-22 | Accepted |
+| [0034](0034-fuzzy-progress-for-auto-continuing-fetch.md) | Fuzzy progress for auto-continuing fetch targets | 2026-06-22 | Accepted |
+| [0035](0035-cooldown-and-dedup-via-single-frontier.md) | Cooldown and dedup via single frontier model | 2026-06-22 | Accepted |
+| [0036](0036-metadata-kv-table.md) | Generic metadata KV table for singleton scalars | 2026-06-22 | Accepted |
+
+## Revised ADRs
+
+The following ADRs were revised during the 2026-06-18 design review resolution:
+- **0002** — Added GO/NO-GO gate criteria + minimal spike result (G1/G2/G3 + pivot paths + spike findings)
+- **0003** — Noted composable-stop-conditions schema superseded by ADR 0033 contained-C
+- **0011** — Noted request/response schema refined by ADR 0033/0034/0035
+- **0013** — Added metadata table seed-on-absence behavioral note (ADR 0036)
 
 ## Future ADRs
 
-Start numbering at 0026. Follow the established format. Keep each ADR focused on one decision.
+Start numbering at 0037. Follow the established format. Keep each ADR focused on one decision.
