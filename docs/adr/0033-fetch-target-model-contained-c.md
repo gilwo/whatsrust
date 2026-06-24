@@ -32,6 +32,8 @@ target_value INTEGER -- ts for since, count for count, NULL for all
 ```
 NO composable since+max combo. The clamp ceiling for count + the autonomy backstop for since/all are CONFIG, applied at enqueue; response echoes `{requested, accepted}`.
 
+**Hardening (2026-06-24, v2 review):** Autonomy backstop is **global config ONLY**, not per-request (fork decision M3). Rationale: `count:N` target kind already covers power-user chunking; per-request would overlap + muddy the intent/safety split. One knob, clean separation.
+
 **Example:** 9mo/>10k scenario — target=since:9mo, backstop=20k. 10k < 20k → COMPLETES IN ONE TRIGGER (~25-40min, auto-continuing across paced segments, no manual re-trigger). A 50k chat → runs to 20k backstop → parks → "re-trigger to continue" → behaves like manual thereafter.
 
 **Progress (ADR 0034):** since/all completion has NO reliable ETA/total (phone doesn't pre-report window size) → SSE shows "N fetched, still going" (fuzzy), NOT "N/total %". count mode CAN show N/target.

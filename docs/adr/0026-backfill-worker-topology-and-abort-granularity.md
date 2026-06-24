@@ -61,3 +61,7 @@ Worker boundary branches on "is THIS job cancelled (row) vs is the DAEMON shutti
 
 **Future:**
 - If fairness becomes a stated requirement (rapid triggers across N chats), add priority queue or round-robin claim, but keep single worker (parallelism still buys nothing).
+
+**Hardening (2026-06-24, v2 review):**
+- **Stuck-anchor guard (R2):** Fetch loop — if response new-oldest-anchor == request anchor for K=2 consecutive batches → abort job 'failed' ("anchor not advancing"). ~5 LOC, bounds 22h runaway scenario.
+- **R3 decoupled embedding:** Note cross-ref to ADR 0015 — embedding drain decoupling + >100k pathological-pending → pause backfill ENQUEUE (circuit-breaker), not lockstep.

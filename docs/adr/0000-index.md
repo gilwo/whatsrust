@@ -58,6 +58,22 @@ The following ADRs were revised during the 2026-06-18 design review resolution:
 - **0011** — Noted request/response schema refined by ADR 0033/0034/0035
 - **0013** — Added metadata table seed-on-absence behavioral note (ADR 0036)
 
+The following ADRs received hardening notes during the 2026-06-23 v2 design review resolution (2026-06-24):
+- **0002** — GO criteria extended: requires live smoke test (fork R1) + actual compile (M1)
+- **0013** — Watchdog baseline seeding revised: at migration completion, not lazy (B2)
+- **0015** — Spawn location (B3), no-embedder idle (M2), loading timeout (B4), decoupled from backfill (R3)
+- **0017** — Per-model purge uses incremental_vacuum, not full VACUUM (R-prior5)
+- **0021** — Global backfill queue-depth limit (R5)
+- **0024** — Loading timeout (B4)
+- **0026** — Stuck-anchor guard (R2), R3 decoupling note
+- **0028** — Shutdown-race fix (B1)
+- **0029** — Validation gap fix (B1), semantic validation accepted (M5)
+- **0030** — Pin consistency check (R4)
+- **0032** — Startup FTS5 probe (M4)
+- **0033** — Autonomy backstop global-config-only (fork M3)
+- **0035** — Cooldown TOCTOU fix (B5)
+- **0036** — Watchdog baseline seeding revised (B2)
+
 ## Future ADRs
 
 Start numbering at 0037. Follow the established format. Keep each ADR focused on one decision.

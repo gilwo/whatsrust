@@ -26,9 +26,11 @@ Earlier considered option (auto-stale and re-embed on model change) would silent
 **Explicit per-model purge:** deliberate admin operation (API/MCP/CLI):
 ```sql
 DELETE FROM embeddings WHERE model_id = ?;
--- followed by PRAGMA incremental_vacuum
+-- followed by PRAGMA incremental_vacuum in a loop (NOT full VACUUM which locks)
 ```
 Returns count + bytes reclaimed. NEVER automatic. **Destructive but losslessly reapplicable** (message text is retained source of truth; embeddings are deterministic for fixed model → re-drain reproduces them).
+
+**Hardening (2026-06-24, v2 review R-prior5):** Per-model purge uses `PRAGMA incremental_vacuum` in a loop, NOT full `VACUUM` (which locks writers). Incremental mode frees pages gradually without blocking.
 
 **Drain-work derivation = set difference (no per-message done flag):**
 "Embed for active model M" = embeddable messages (ADR 0016 classification) lacking an `(message_id, M)` row in `embeddings`:

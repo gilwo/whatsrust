@@ -56,3 +56,6 @@ Point-in-time: messages received after upgrade are LOST on override (logged + do
 **Future:**
 - Auto-prune old .bak files (keep N most recent, configurable)
 - 503 health endpoint during migration mode (low priority — migrations are fast)
+
+**Hardening (2026-06-24, v2 review):**
+- **Shutdown-race fix (B1):** Migration runs in `Store::new` BEFORE SIGINT handler installed → Ctrl-C just terminates (mostly self-safe). Backup phase: write `.bak.tmp` + atomic-rename on success (partial temp never mistaken for good). Migration TX: SQLite auto-rollback on next open (free). Validation phase (the real gap): persist `schema_validated_version` key in metadata, set ONLY after validation passes; startup re-validates whenever != CURRENT (validation idempotent). Cleaner than signal-masking.

@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS metadata (
 
 **NOTE:** Migration-pin (ADR 0030) stays a SIDECAR FILE, NOT this table — the pin must work when this table doesn't yet exist (after rollback to a pre-metadata version). Control-plane flag can't live in the data it gates.
 
-**Watchdog behavioral note (ADR 0013 revision):** Missing baseline row (first run after table created) → SEED current size silently, NO alert (else first tick false-alerts ∞% growth). Baseline present → compare. Query:
+**Watchdog behavioral note (revised 2026-06-24, v2 review B2):** Seed baseline DETERMINISTICALLY as final migration step (synchronous, before daemon accepts work), NOT lazily on first tick. Query:
 ```sql
 SELECT value FROM metadata WHERE key='watchdog_last_alerted_size'
 -- NULL → seed current, INSERT INTO metadata VALUES ('watchdog_last_alerted_size', ?current)

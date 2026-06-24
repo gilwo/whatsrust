@@ -74,3 +74,6 @@ Failed migration → rollback → restart → auto-migrate → fail again → �
 
 **Future:**
 - `--rollback` could auto-fetch old binary from GitHub releases (optional convenience).
+
+**Hardening (2026-06-24, v2 review):**
+- **Pin consistency check (R4):** Startup validates pin vs DB (rolled_back: pinned_version==user_version; failed: user_version<blocked_target); mismatch → halt "pin inconsistent". Pin written atomically (temp+rename).

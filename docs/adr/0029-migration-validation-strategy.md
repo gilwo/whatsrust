@@ -49,3 +49,7 @@ After schema migration commits, we need confidence the new schema is operational
 **Future:**
 - Add V3 probe for `metadata` table (INSERT/SELECT/DELETE key-value pair)
 - If repeated validation failures in production, expand V3 coverage (measure before adding).
+
+**Hardening (2026-06-24, v2 review):**
+- **Validation gap fix (B1):** Add `schema_validated_version` key in metadata, set only after validation passes; startup re-validates whenever != CURRENT. Closes shutdown-interrupted-validation gap.
+- **Semantic validation accepted (M5):** Current V1+V3 approach accepted as-is (TX rollback prevents partial DDL; full-scan prohibitive). Optional future `--validate-full` flag for manual debugging. Documented accepted risk.
