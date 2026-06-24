@@ -22,6 +22,8 @@ Rebase the `199-biotechnologies/whatsapp-rust` fork onto upstream v0.6.0 as **st
 - **G2:** History `WebMessageInfo` already plaintext (feeds ADR 0014 single-extraction adapter).
 - **G3:** ON_DEMAND response correlatable to its request (drives the paginated loop). ADR 0026 single-worker LOWERS bar: one PDO outstanding at a time → "match the only in-flight" suffices even without explicit id.
 
+**Hardening (2026-06-24, v2 review):** GO requires **ACTUAL compile + 89 unit tests + ~15-30min LIVE smoke test** (connect, send, receive, verify group-sender parsing, small history fetch) against a real account (fork decision R1). Rationale: unit tests are pure-logic/no-live-WA by culture; runtime breakage (decryption, media, JID/LID) is exactly what they miss. Folds in M1 (spike must actually compile+test, not static-predict).
+
 **Pivot paths (pre-attached):**
 - **G1 deep-breakage:** Time-box rebase ≤N days, else cherry-pick only history-sync/PDO commits onto current pin OR defer F1 + ship audit quick-wins first.
 - **G2 encrypted:** ADR 0014 fallback B (parallel extractor).

@@ -45,3 +45,6 @@ Design review #6: "where is per-chat cooldown enforced?". ADR 0033 contained-C e
 
 **Future:**
 - If "parallel fetches for same chat" becomes a stated requirement (unlikely), add target-kind multiplexing — but confirm it's needed first.
+
+**Hardening (2026-06-24, v2 review):**
+- **Cooldown TOCTOU fix (B5):** Check-and-insert in ONE TX/closure (BEGIN→check cooldown+one-active→INSERT-or-reject→COMMIT). Single `Mutex<Connection>` serializes it free, mirrors `claim_next_job` atomicity. Closes the concurrent-requests-both-pass-check race.

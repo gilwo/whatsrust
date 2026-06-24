@@ -2,7 +2,8 @@
 
 **Date:** 2026-06-17  
 **Status:** Designed (not yet implemented)  
-**Updated:** 2026-06-22 — Incorporates 2026-06-18 design review resolution (R1-R12, see session file)
+**Updated:** 2026-06-22 — Incorporates 2026-06-18 design review resolution (R1-R12)  
+**Updated:** 2026-06-23 — Incorporates v2 review resolution (hardening notes, 3 fork decisions)
 
 Consolidated spec for explicitly-triggered, per-chat historical message backfill
 with local lexical (FTS5) + semantic (vector) search. This document is the
@@ -90,6 +91,8 @@ subsystem (`pdo.rs` 501→870, `history_sync.rs` 281→1066) — exactly what we
 
 **Minimal spike result (2026-06-22, static inspection of upstream v0.6.0):** Overall lean **GO, MEDIUM effort (~1-2 days mechanical)**. G1 = LIKELY-FAIL-but-mechanical (~15-20 call sites: Event::Message Arc wrappers, .on_event closure signature, exhaustive match adds 4 variants/removes JoinedGroup, LazyHistorySync); G2 = LIKELY-PASS (WebMessageInfo.message populated plaintext); G3 = LIKELY-PASS (peer_data_request_session_id field 12 exposed). JoinedGroup landmine defused (low-stakes handler, stale cache acceptable). No architectural blockers.
 
+**Hardened (v2, fork R1):** GO requires ACTUAL compile + 89 unit tests + ~15-30min LIVE smoke test (connect, send, receive, verify group-sender parsing, small history fetch) against a real account. Folds in M1 (spike must compile+test, not static-predict). Rationale: unit tests are pure-logic/no-live-WA; runtime breakage (decryption, media, JID/LID) is what they miss.
+
 Per CLAUDE.md: work in `../whatsapp-rust`, push, bump the pinned `rev`.
 
 ---
@@ -106,7 +109,7 @@ Per CLAUDE.md: work in `../whatsapp-rust`, push, bump the pinned `rev`.
 - **`all`** → done when phone exhausted. AUTO-CONTINUES.
 - **`count:N`** → done when N fetched. Does NOT auto-continue ("fetch up to N then stop").
 
-**Autonomy backstop (ADR 0033):** CONFIG-level guarded knob (ban-critical, ADR 0022/0030) bounds how far auto-continuing (since/all) may run in ONE trigger before STOP + require re-trigger. e.g. backstop=20k msgs. PARKS-and-requires-retrigger, does NOT auto-enqueue child jobs (flat queue, ADR 0026).
+**Autonomy backstop (ADR 0033, hardened v2):** CONFIG-level guarded knob (ban-critical, ADR 0022/0030), **global config ONLY, not per-request** (fork M3) — `count:N` target already covers power-user chunking. Bounds how far auto-continuing (since/all) may run in ONE trigger before STOP + require re-trigger. e.g. backstop=20k msgs. PARKS-and-requires-retrigger, does NOT auto-enqueue child jobs (flat queue, ADR 0026).
 
 **Example:** target=since:9mo, backstop=20k. 10k chat → completes in one trigger (~25-40min auto-continuing). 50k chat → runs to 20k → parks → "re-trigger to continue".
 
@@ -198,18 +201,20 @@ and the schema migration block in `storage.rs`.
 
 ## Migration & rollback (ADR 0028-0032)
 
-**Staged migration mode (ADR 0028):** version < CURRENT → enter migration mode BEFORE full start:
+**Staged migration mode (ADR 0028, hardened v2):** version < CURRENT → enter migration mode BEFORE full start:
 1. `PRAGMA wal_checkpoint(TRUNCATE)` (flush WAL into main file, ensures backup captures single consistent file)
-2. Backup → `whatsapp.db.pre-migration-v<from>-<ts>.bak` via SQLite Backup API (fail-closed: backup fails → abort migration)
-3. Run migration in TX (`user_version` bump LAST → crash mid-migration auto-rolls-back, DB stays v_old)
-4. Validate (ADR 0029: V1 structural checks + V3 smoke probes — FTS5 triggers, set-difference drain query, vector roundtrip; skip V2 full integrity_check as gate)
-5. Pass → full start; fail → halt + instruct
+2. Backup → `whatsapp.db.pre-migration-v<from>-<ts>.bak` via SQLite Backup API (**write `.bak.tmp` + atomic-rename (B1)**, fail-closed: backup fails → abort migration)
+3. Run migration in TX (`user_version` bump LAST → crash mid-migration auto-rolls-back via SQLite (B1), DB stays v_old)
+4. Validate (ADR 0029: V1 structural checks + V3 smoke probes — FTS5 triggers, set-difference drain query, vector roundtrip; skip V2 full integrity_check as gate; **semantic validation accepted as-is (M5), optional future --validate-full flag**)
+5. **Persist `schema_validated_version` key in metadata ONLY after validation passes (B1); startup re-validates whenever != CURRENT (closes validation-interrupted gap)**
+6. **Seed watchdog baseline DETERMINISTICALLY as final migration step (B2), synchronous before daemon accepts work**
+7. Pass → full start; fail → halt + instruct
 
-**Circuit-breaker (ADR 0030):** Pin file `whatsapp.db.migration-pin` prevents re-migration crash loop. Startup decision table (pin presence × binary CURRENT vs DB version vs blocked_target) → normal / migration / halt-instruct / run-with-warning. `--rollback` (valid only when pin present, no footgun): restore .bak + DELETE -wal/-shm + update pin + EXIT (point-in-time-loss warning). `--migrate` clears pin + force retry. Newer binary (CURRENT > blocked_target) auto-retries.
+**Circuit-breaker (ADR 0030, hardened v2):** Pin file `whatsapp.db.migration-pin` (**written atomically temp+rename (R4)**) prevents re-migration crash loop. **Startup validates pin vs DB consistency (R4): rolled_back→pinned_version==user_version, failed→user_version<blocked_target; mismatch→halt "pin inconsistent".** Startup decision table (pin presence × binary CURRENT vs DB version vs blocked_target) → normal / migration / halt-instruct / run-with-warning. `--rollback` (valid only when pin present, no footgun): restore .bak + DELETE -wal/-shm + update pin + EXIT (point-in-time-loss warning). `--migrate` clears pin + force retry. Newer binary (CURRENT > blocked_target) auto-retries.
 
 **Schema version invariant (ADR 0031):** Single integer `CURRENT_SCHEMA_VERSION`. ANY migration-required change ⟺ version bump ⟺ full ceremony. Optional performance indexes = idempotent `CREATE INDEX IF NOT EXISTS` at startup, OUTSIDE version system. No MAJOR.MINOR split in v1 (deferred behind measured trigger).
 
-**FTS5 probe (ADR 0032):** One-time probe at v7→v8 boundary before FTS5 DDL (`CREATE VIRTUAL TABLE temp.__fts5_probe...` or `sqlite_compileoption_used`). Absent → actionable error ("keep default `bundled` rusqlite feature") + leave DB at v7. Deliberate-misbuild guard, not degraded mode.
+**FTS5 probe (ADR 0032, hardened v2):** **Cheap startup probe after version check (M4):** `SELECT 1 FROM messages_fts LIMIT 0` (catches bundled→system-sqlite swap). Plus one-time probe at v7→v8 boundary before FTS5 DDL (`CREATE VIRTUAL TABLE temp.__fts5_probe...` or `sqlite_compileoption_used`). Absent → actionable error ("keep default `bundled` rusqlite feature") + leave DB at v7. Deliberate-misbuild guard, not degraded mode.
 
 ---
 
@@ -241,12 +246,21 @@ the spike proves history `WebMessageInfo` is incompatible.
 
 ## Embedding subsystem
 
-- **Drain worker (ADR 0015):** dedicated (3rd worker, alongside outbound + backfill),
-  Notify-woken + periodic timer. Batches `embed_status='pending'` rows (batch=64,
-  configurable) → sidecar → write vectors + flip `done`. No embedder configured →
-  worker idles. Configured-but-failing → exponential backoff (cap 60s), rows STAY
-  `pending` (transient outage must not leave permanent semantic holes). Per-row
-  rejection → attempts cap 3 → `failed`.
+- **Drain worker (ADR 0015, hardened v2):** dedicated (3rd worker, alongside outbound + backfill),
+  Notify-woken + periodic timer. **Spawns as INDEPENDENT long-lived task in WhatsAppBridge::start
+  alongside prune/backup (B3), shares cancel token, NOT in run_bot_session** (connection-agnostic).
+  Batches `embed_status='pending'` rows (batch=64, configurable) → sidecar → write vectors + flip `done`.
+  **No embedder configured → DON'T spawn drain worker (M2).** Configured-but-failing → exponential
+  backoff (cap 60s), rows STAY `pending` (transient outage must not leave permanent semantic holes).
+  **Persistently failing → after N backoffs drop to Notify-only (M2).** Per-row rejection →
+  attempts cap 3 → `failed`. **Loading timeout (B4): >60s continuous loading → treat as error → FTS5 fallback
+  (rows stay pending).**
+  **Decoupled from backfill (fork R3):** Drain FULLY DECOUPLED from backfill in normal range (slow/absent
+  sidecar never blocks backfill or lexical search). Set-difference (ADR 0017) is durable truth; any queue
+  is IN-MEMORY flow-control only (restart → re-derive, nothing lost). ONE bound: if pending-embedding
+  count grows PATHOLOGICAL (>100k runaway) → pause backfill ENQUEUE until drained (circuit-breaker on
+  runaway, NOT lockstep). Rationale: anti-ban pacing makes backfill ~16 msg/s vs embedding ~32-128 msg/s
+  (2-8× headroom) → lag is a tail case.
 - **Embeddable text (ADR 0016):** genuine natural language only (text body, image/video/doc
   captions, poll question+options, contact name, location name). Everything else →
   `skipped` at write time (never sent to sidecar). Text-only in v1.
@@ -284,7 +298,7 @@ the spike proves history `WebMessageInfo` is incompatible.
 
 ## Worker topology + anti-ban + safety
 
-- **Backfill worker (ADR 0026):** SINGLE worker, sequential FIFO (genuine twin of outbound worker). "Concurrency cap" = 1 by construction; excess enqueues. Connection-gated (PDO needs live WA). Three-level abort: **BATCH** (send PDO → response → persist+cursor in ONE TX) = atomic, never interrupted; **JOB** = abortable at batch boundaries → 'cancelled', resumable; **TASK** = cooperative stop. Inter-batch sleep INTERRUPTIBLE (cancel responsive). CASE-guarded terminal status write prevents cancel-race. Shutdown unification: SIGINT/shutdown stops at batch boundary, terminal state = function of stop-reason (cancel-API → 'cancelled', shutdown → 'queued'/resumable). Embedding-drain is SEPARATE always-on task (talks only to sidecar).
+- **Backfill worker (ADR 0026, hardened v2):** SINGLE worker, sequential FIFO (genuine twin of outbound worker). "Concurrency cap" = 1 by construction; excess enqueues. Connection-gated (PDO needs live WA). Three-level abort: **BATCH** (send PDO → response → persist+cursor in ONE TX) = atomic, never interrupted; **JOB** = abortable at batch boundaries → 'cancelled', resumable; **TASK** = cooperative stop. Inter-batch sleep INTERRUPTIBLE (cancel responsive). CASE-guarded terminal status write prevents cancel-race. **Stuck-anchor guard (R2):** if response new-oldest-anchor == request anchor for K=2 consecutive batches → abort job 'failed' ("anchor not advancing"), bounds 22h runaway. Shutdown unification: SIGINT/shutdown stops at batch boundary, terminal state = function of stop-reason (cancel-API → 'cancelled', shutdown → 'queued'/resumable). Embedding-drain is SEPARATE always-on task (talks only to sidecar). **R3 decoupling:** embedding drain fully decoupled (see Embedding subsystem section above); >100k pathological-pending → pause backfill ENQUEUE (circuit-breaker).
 
 - **Backfill pacing (ADR 0020):** dedicated pacer, SEPARATE from the outbound `SendPacer`
   (must not consume send budget). burst=1, base ~4s/batch with ±40% jitter (always on).
@@ -297,9 +311,9 @@ the spike proves history `WebMessageInfo` is incompatible.
     `paused/cooldown` + resume-hint states so pauses don't read as hangs; trigger returns
     a rough ETA; document that semantic coverage lags fetch (FTS5 immediate, embeddings drain behind).
     Throughput reference: ~4s/batch × 64 → 5k ≈ 6-10 min (background marathon).
-- **Daemon-side uniform enforcement (ADR 0021):** MCP is a thin proxy; pacers +
+- **Daemon-side uniform enforcement (ADR 0021, hardened v2):** MCP is a thin proxy; pacers +
   global backfill concurrency cap + per-chat cooldown + `max_messages` clamp +
-  outbound queue-depth limit live in the daemon BELOW the MCP layer → uniform across
+  outbound queue-depth limit + **global backfill QUEUE-DEPTH limit (R5, small ~3-5 pending; excess→429 "backfill queue full")** live in the daemon BELOW the MCP layer → uniform across
   CLI/REST/MCP, an agent cannot outrun the pacer or pick a client that skips safety.
   All guards return structured back-pressure errors (429-style `{error, retry_after_secs}`,
   `{requested, accepted}`, `{status: already_active, job_id}`) so agents self-correct.
@@ -322,7 +336,7 @@ the spike proves history `WebMessageInfo` is incompatible.
   documents the pacing/limits for agent expectation-setting (ADR 0021).
 - **Immediate trigger return:** `{job_id, chat_jid, target_kind, target_value?, resume_anchor, more_remain, status}`;
   no-op fast path when the cursor is `exhausted`. Response echoes `{requested, accepted}` for clamped values (autonomy backstop, ADR 0033).
-- **Enqueue-time validation (ADR 0035):** per-chat cooldown + one-active-per-chat enforced BEFORE durable write. Return structured back-pressure (`{status: already_active, job_id}` / 429 `{retry_after}`).
+- **Enqueue-time validation (ADR 0035, hardened v2):** **Check-and-insert in ONE TX/closure (B5)** — BEGIN→check cooldown+one-active→INSERT-or-reject→COMMIT (atomic via single Mutex<Connection>, mirrors claim_next_job). Per-chat cooldown + one-active-per-chat enforced BEFORE durable write. Return structured back-pressure (`{status: already_active, job_id}` / 429 `{retry_after}`).
 - **Progress (ADR 0034):** since/all modes show fuzzy "N fetched, more remain" (no ETA/total); count mode shows "N / target" (precise). SSE emits explicit `paused/cooldown` state during long pauses (ADR 0020 UX contract).
 - "Continue/resume" needs no separate endpoint — re-trigger resumes from the cursor.
 
@@ -373,6 +387,45 @@ Extends the project's culture (inline unit tests, real temp-file DB for storage,
 6. **API / MCP** — trigger/status/cancel, `whatsrust_fetch_history`, SSE progress with fuzzy/precise per target-kind (ADR 0011/0034).
 7. **Watchdog** — repurpose periodic task (ADR 0012/0013/0036), metadata table seed-on-absence.
 8. **Tests** — per ADR 0025 alongside each layer (history-source fake, Embedder fake, storage temp-DB, minimal fake-sidecar binary).
+
+---
+
+## Implementation hardening notes (2026-06-23 v2 review resolution)
+
+Second design review identified 5 blocking issues (B1-B5), 5 major risks (M1-M5), and 5 risks (R1-R5) — all resolved. Three fork decisions made; clear-fix resolutions incorporated above + cross-linked to ADRs. Summary:
+
+**Fork decisions (3):**
+- **M3 (autonomy backstop):** Global config ONLY, not per-request — `count:N` already covers power-user chunking; per-request would muddy intent/safety split. → ADR 0033.
+- **R1 (rebase GO criteria):** Requires compile + 89 unit tests + ~15-30min LIVE smoke test (connect, send, receive, group-sender parsing, small history fetch). Runtime breakage (decryption, media, JID/LID) is what unit tests miss. → ADR 0002.
+- **R3 (embedding/backfill coupling):** C2 decoupled + safety ceiling. Drain FULLY DECOUPLED (slow/absent sidecar never blocks backfill/lexical). Set-difference (ADR 0017) is durable truth; any queue is IN-MEMORY flow-control (restart → re-derive). ONE bound: pending-embedding >100k pathological → pause backfill ENQUEUE (circuit-breaker, NOT lockstep). → ADR 0015 + ADR 0026 note.
+
+**Clear-fix resolutions (blocking B1-B5):**
+- **B1 (migration shutdown-race):** Backup `.bak.tmp` + atomic-rename; migration TX auto-rollback; `schema_validated_version` key in metadata set ONLY after validation passes, startup re-validates != CURRENT. → ADR 0028 + 0029.
+- **B2 (watchdog false-alert):** Seed baseline DETERMINISTICALLY as final migration step (synchronous, before daemon accepts work), NOT lazily on first tick. → ADR 0013 + 0036.
+- **B3 (drain worker spawn):** Spawns as INDEPENDENT long-lived task in WhatsAppBridge::start alongside prune/backup, shares cancel token, NOT in run_bot_session. → ADR 0015.
+- **B4 (sidecar loading timeout):** Drain tracks time-in-loading; >60s continuous loading → treat as error → FTS5 fallback (rows stay pending). → ADR 0024 + 0015.
+- **B5 (cooldown TOCTOU):** Check-and-insert in ONE TX/closure (atomic via single Mutex<Connection>, mirrors claim_next_job). → ADR 0035.
+
+**Clear-fix resolutions (major M1-M5):**
+- **M1 (spike compile):** Folds into R1 (GO requires actual compile+test, not static-predict). → ADR 0002.
+- **M2 (drain idle churn):** No embedder configured → don't spawn drain worker. Persistently-failing → after N backoffs drop to Notify-only. → ADR 0015.
+- **M4 (FTS5 startup probe):** Add cheap probe after version check: `SELECT 1 FROM messages_fts LIMIT 0`, complements migration-boundary probe (catches bundled→system-sqlite swap). → ADR 0032.
+- **M5 (semantic validation):** Accepted as-is (TX rollback prevents partial DDL; full-scan prohibitive). Optional future --validate-full flag. → ADR 0029.
+
+**Clear-fix resolutions (risks R2/R4/R5/R-prior5):**
+- **R2 (stuck-anchor loop):** Response new-oldest-anchor == request anchor for K=2 consecutive batches → abort job 'failed' ("anchor not advancing"), bounds 22h runaway. → ADR 0026.
+- **R4 (pin consistency):** Startup validates pin vs DB (rolled_back→pinned_version==user_version, failed→user_version<blocked_target); mismatch→halt. Pin written atomically temp+rename. → ADR 0030.
+- **R5 (N-chat marathon):** Global backfill queue-depth limit (small ~3-5 pending; excess→429 "backfill queue full"). → ADR 0021.
+- **R-prior5 (purge vacuum):** incremental_vacuum in a loop, NOT full VACUUM (which locks). → ADR 0017.
+
+**Minor items ticked (inline above or noted here):**
+- CJK trigram early-bench → phase 3 (deferred option C, ADR 0018).
+- media_refs `expired` flag set on CDN 404 → skip re-attempts (best-effort hydration, ADR 0005).
+- **⚠️ prune age-DELETE removal MUST land in PHASE 1** (else first prune tick deletes backfilled history; ADR 0012 indefinite retention).
+- `.env.example` explicit subtask F5 (ADR 0023 config).
+- `-shm` code comment (why measured; ADR 0013/0036 watchdog).
+- `group_cache` on-demand population — verify during rebase spike (add to spike checklist, ADR 0002).
+- Re-trigger auto-resumes from cursor (no flag; ADR 0035 cooldown/dedup).
 
 ---
 

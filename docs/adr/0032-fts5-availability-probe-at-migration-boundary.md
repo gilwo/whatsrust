@@ -44,3 +44,6 @@ OR use `sqlite_compileoption_used('ENABLE_FTS5')` pragma.
 
 **Future:**
 - If other compile-time features become hard deps (e.g., JSON1), add similar probes.
+
+**Hardening (2026-06-24, v2 review):**
+- **Startup probe (M4):** Add cheap FTS5 probe at STARTUP (after version check) via `SELECT 1 FROM messages_fts LIMIT 0`, complements migration-boundary probe. Catches later bundled→system-sqlite swap. Probe order: startup check if migrated DB → fast-path normal; migration-boundary check if schema change needed.

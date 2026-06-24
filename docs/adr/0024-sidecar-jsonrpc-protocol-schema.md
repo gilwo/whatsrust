@@ -66,3 +66,6 @@ Batch embed request. Response vectors in input order.
 **Deferred:**
 - Streaming embed (send texts incrementally, receive vectors as ready) — batch-oriented is simpler for v1
 - Sidecar authentication (shared secret, mTLS) — stdio child is trusted (no network exposure)
+
+**Hardening (2026-06-24, v2 review):**
+- **Loading timeout (B4):** Bridge tracks time-in-loading state; >60s (configurable) continuous loading → treat as error → FTS5 fallback (rows stay pending). >60s model load = misconfig. See ADR 0015.

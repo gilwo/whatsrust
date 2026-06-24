@@ -45,3 +45,9 @@ Two failure modes exist:
 
 **Deferred:**
 - Storage watchdog (ADR 0013) surfaces growth from unbounded `pending` accumulation; user investigates and fixes sidecar
+
+**Hardening (2026-06-24, v2 review):**
+- **Spawn location (B3):** Drain worker spawns as INDEPENDENT long-lived task in `WhatsAppBridge::start` alongside prune/backup tasks (bridge.rs:1956/1965), shares cancel token. NOT in `run_bot_session` (which restarts per reconnect). Rationale: connection-agnostic (DB+sidecar only, never WA).
+- **No-embedder idle (M2):** No embedder configured → DON'T spawn drain worker. Configured-but-persistently-failing → after N backoffs drop to Notify-only (no periodic poll).
+- **Loading timeout (B4):** Drain tracks time-in-loading; >60s (configurable) continuous loading → treat as error → FTS5 fallback (rows stay pending). >60s model load = misconfig.
+- **Decoupled from backfill (R3):** Embedding drain stays FULLY DECOUPLED from backfill in normal range. Set-difference (ADR 0017) remains durable source of truth; any "queue" is IN-MEMORY flow-control only (restart → re-derive, nothing lost). ONE bound: if pending-embedding count grows PATHOLOGICAL (>100k runaway) → pause backfill ENQUEUE until drained (circuit-breaker on runaway, NOT lockstep sync). Rationale: anti-ban pacing makes backfill ~16 msg/s vs embedding ~32-128 msg/s (2-8× headroom) → lag is a tail case.

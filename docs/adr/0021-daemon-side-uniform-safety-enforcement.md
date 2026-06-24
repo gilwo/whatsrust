@@ -57,3 +57,6 @@ Three access paths: CLI (direct), REST API, MCP (proxies to REST). Safety must b
 
 **Deferred:**
 - Daemon-level agent identification (track which MCP client is making calls) for better error messages / per-agent quotas — requires MCP context propagation through HTTP layer
+
+**Hardening (2026-06-24, v2 review):**
+- **Global backfill queue-depth limit (R5):** Apply the queue-depth concept to backfill queue (small, e.g. 3-5 pending; excess → 429 "backfill queue full"). Prevents N-chat marathon scenario.
