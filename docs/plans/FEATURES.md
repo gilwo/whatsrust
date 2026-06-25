@@ -2,11 +2,12 @@
 
 **Type:** Live document — kept up to date as features land. Update the **Status** of an
 item when work starts/completes; add a dated note in its row's detail.
-**Last updated:** 2026-06-17
+**Last updated:** 2026-06-25
 
 This is the single tracking surface for in-flight and planned work on this experimental
 fork. The *why* for each design lives in the ADRs (`docs/adr/`); the *what/how* blueprints
-live in `docs/plans/*-design.md`. This file tracks *status*.
+live in `docs/plans/*-design.md`; the *execution order* lives in
+`docs/plans/IMPLEMENTATION-ROADMAP.md`. This file tracks *status*.
 
 **Status legend:** 🟢 Done · 🟡 In progress · 🔵 Designed (not started) · ⚪ Planned (not designed) · ⏸️ Deferred
 
@@ -14,20 +15,16 @@ live in `docs/plans/*-design.md`. This file tracks *status*.
 
 ## Major Features
 
-### F1 — Historical message fetch + semantic/lexical search 🔵 Designed
-Per-chat historical backfill (`all` / `since` / `max_messages`) + local FTS5 + vector search.
-- **Design:** `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md`; ADRs 0002–0025.
-- **First step:** wa-rs rebase spike (see F-prereq below / ADR 0002).
-- **Sub-tracking** (phases from the design doc §Implementation phasing):
-  - [ ] 0. wa-rs rebase spike (ADR 0002) — also resolves WebMessageInfo-plaintext question (ADR 0014)
-  - [ ] 1. Storage + migration: unified `messages` table, sibling tables, FTS5 + triggers (ADR 0009/0019)
-  - [ ] 2. Fetch worker: history-source trait, backfill-job queue, pagination loop, cursor, pacer (ADR 0003/0010/0020)
-  - [ ] 3. Search: FTS5 recall + BLOB cosine rerank (ADR 0008/0019)
-  - [ ] 4. Embedding sidecar + drain worker (see F2)
-  - [ ] 5. Safety + config: daemon-side guards, fail-closed config, `.env`/`dotenvy` (ADR 0021/0022/0023)
-  - [ ] 6. API/MCP: trigger/status/cancel, `whatsrust_fetch_history`, SSE progress (ADR 0011)
-  - [ ] 7. Storage watchdog (ADR 0012/0013)
-  - [ ] 8. Tests (ADR 0025)
+### F1 — Historical message fetch + semantic/lexical search 🔵 Designed (3 reviews, converged, implementation-ready)
+Per-chat historical backfill (`all` / `since:T` / `count:N`) + local FTS5 (lexical) + optional vector (semantic) search.
+- **Design:** `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md`; ADRs 0001–0036.
+- **Execution plan:** `docs/plans/IMPLEMENTATION-ROADMAP.md` (Phase 0 gate → M1 → M2).
+- **Reviews:** 3 cold passes (`_reviewer/design/`), 2026-06-18 / -23 / -24 → final verdict **implementation-ready, no blockers**.
+- **First step:** Phase 0 — wa-rs rebase, a HARD GO/NO-GO gate (ADR 0002).
+- **Milestone tracking** (detailed phase/task plans written at each milestone's start, not before — gate-gated):
+  - [ ] **Phase 0 — GATE:** wa-rs rebase v0.2→v0.6.0 + GO/NO-GO (compile + 89 tests + live smoke test). Spike: GO-leaning, MEDIUM. (ADR 0002)
+  - [ ] **M1 — fetch + lexical search** (ships independently, no sidecar): storage+migration ⚠️prune-removal · fetch worker (single-FIFO, 3-level abort, contained-C, safety built-in) · FTS5 search · API/MCP + watchdog. (ADR 0003/0009/0010/0011/0013/0019/0020/0026/0027/0028-0036)
+  - [ ] **M2 — semantic search** (layers on M1; = F2 below): sidecar + drain + cosine rerank. Phase breakdown deferred to M2 start. (ADR 0008/0015/0016/0017/0024)
 
 ### F2 — Embedder sidecar (implementation) 🔵 Designed
 Stateless separate binary, pure vectorizer; stdio JSON-RPC v1; transport-neutral
