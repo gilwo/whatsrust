@@ -3,18 +3,18 @@
 **Date:** 2026-06-25
 **Status:** Roadmap skeleton (pre-GO). Detailed per-milestone plans are written at each milestone's start, not now.
 **Design:** `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (3 cold reviews, converged, implementation-ready)
-**Why this is a skeleton:** Phase 0 is a hard GO/NO-GO gate (the wa-rs rebase). We do not write detailed phase/task plans behind an unvalidated gate — a NO-GO or a fallback-triggering result reshapes everything. Only Phase 0 is planned in detail below; M1/M2 phase detail is deferred to their starts.
+**Why this is a skeleton:** Phase 0 is a hard GO/NO-GO gate (the wa-rs v0.6.0 dependency adoption). We do not write detailed phase/task plans behind an unvalidated gate — a NO-GO or a fallback-triggering result reshapes everything. Only Phase 0 is planned in detail below; M1/M2 phase detail is deferred to their starts.
 
 ---
 
 ## Shape
 
 ```
-  Phase 0 ── GATE (wa-rs rebase) ──┬── GO ──► Milestone 1 ──► Milestone 2
+  Phase 0 ── GATE (wa-rs v0.6.0 adopt) ──┬── GO ──► Milestone 1 ──► Milestone 2
                                    └── NO-GO / fallback ──► pivot (see Phase 0)
 ```
 
-- **Phase 0 (gate):** rebase wa-rs fork v0.2→v0.6.0; GO/NO-GO decision. Detailed below — it's the next action.
+- **Phase 0 (gate):** adopt wa-rs upstream v0.6.0 (dependency bump, NOT a rebase — fork has zero custom commits); GO/NO-GO decision. Detailed below — it's the next action.
 - **Milestone 1 (M1):** historical fetch + lexical (FTS5) search. **Ships independently, no sidecar.** A complete, useful feature on its own.
 - **Milestone 2 (M2):** semantic search (embedder sidecar + vectors). Layers onto M1.
 
@@ -24,15 +24,14 @@ Tracking: this roadmap = the plan; `FEATURES.md` = live status; the design doc =
 
 ---
 
-## Phase 0 — wa-rs rebase (HARD GO/NO-GO GATE)  [ADR 0002]
+## Phase 0 — adopt wa-rs upstream v0.6.0 (HARD GO/NO-GO GATE)  [ADR 0002]
 
-The entire feature is conditional on this. Throwaway/exploratory until GO; the productionized rebase only proceeds on GO. Work happens in `../whatsapp-rust` (only the cargo git checkout exists locally today); bump the pinned `rev` in `Cargo.toml` after.
+The entire feature is conditional on this. **No rebase, no fork, no clone** — the `199-biotechnologies` pin has zero custom commits (it's just upstream frozen at v0.2). This is a **dependency bump**: point `Cargo.toml` at upstream and fix the breakage. **Upstream of record = `oxidezap/whatsapp-rust`** (byte-identical to `jlucaso1`; the project's active home). Done on a branch in THIS repo; the result is a normal committed dep change (no `rev` to push anywhere).
 
 **Steps:**
-1. Branch the fork; rebase/rev onto upstream `jlucaso1` v0.6.0 (tag `56ed1b09`).
-2. Point whatsrust at it (local path patch via `.cargo/config.toml`).
-3. Fix the mechanical breakage the spike predicted (~15-20 sites): `Event::Message(Box,_)` → `(Arc,Arc)`, `.on_event` closure → `Fn(Arc<Event>,_)`, exhaustive match (+4 new variants, −JoinedGroup), `HistorySync` → `Box<LazyHistorySync>`.
-4. Resolve the JoinedGroup handler (bridge.rs:2815): move the `group_cache.invalidate` to wherever group-join now surfaces in v0.6, or accept stale-until-refresh. **Verify group_cache on-demand population still works** (review I1).
+1. On a branch, edit `Cargo.toml`: repoint all 6 wa-rs deps to `git = "https://github.com/oxidezap/whatsapp-rust", tag = "v0.6.0"` (drop the `199-biotechnologies` rev). `cargo update`. (Verified: all 6 crates + all 7 requested features exist at v0.6.0.)
+2. Fix the mechanical breakage the spike predicted (~15-20 sites): `Event::Message(Box,_)` → `(Arc,Arc)`, `.on_event` closure → `Fn(Arc<Event>,_)`, exhaustive match (+4 new variants, −JoinedGroup), `HistorySync` → `Box<LazyHistorySync>`.
+3. Resolve the JoinedGroup handler (bridge.rs:2815): move the `group_cache.invalidate` to wherever group-join now surfaces in v0.6, or accept stale-until-refresh. **Verify group_cache on-demand population still works** (review I1).
 
 **GO criteria (ALL must pass — fork R1 hardened):**
 - **G1:** whatsrust compiles **and the 89 existing tests pass** against v0.6.
@@ -47,7 +46,7 @@ The entire feature is conditional on this. Throwaway/exploratory until GO; the p
   - G2 encrypted → ADR 0014 fallback B (parallel extractor) — re-scope M1 with that cost.
   - G3 no correlation even single-flight → **F1 not viable on this protocol; STOP and reassess.**
 
-**Exit:** a written GO/NO-GO verdict + (on GO) the pinned `rev` bumped and whatsrust green on v0.6.
+**Exit:** a written GO/NO-GO verdict + (on GO) `Cargo.toml` pointed at `oxidezap` v0.6.0 and whatsrust green (build + 89 tests + live smoke test).
 
 ---
 

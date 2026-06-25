@@ -20,12 +20,12 @@ Where to look for what — read the relevant doc before changing related code.
 
 When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md`, MADR format) and link it from `docs/adr/0000-index.md`.
 
-## wa-rs Dependency (Separate Repository)
-- **Fork:** `199-biotechnologies/whatsapp-rust` (forked from jlucaso1/whatsapp-rust)
-- **Local clone:** `../whatsapp-rust` (sibling directory)
-- **Cargo.toml** points at the fork with pinned `rev`. `.cargo/config.toml` (gitignored) patches to local path for dev.
-- **DO NOT** modify wa-rs files from this project. If a feature requires wa-rs changes, work in `../whatsapp-rust` instead.
-- After pushing wa-rs changes, bump the `rev` in this project's `Cargo.toml`.
+## wa-rs Dependency (Separate Library, consumed upstream)
+- **Upstream of record:** `oxidezap/whatsapp-rust` (byte-identical to `jlucaso1/whatsapp-rust`; the project's active home). The WhatsApp protocol library whatsrust builds on.
+- **Cargo.toml** points the 6 wa-rs crates (whatsapp-rust, wacore, wacore-binary, waproto, whatsapp-rust-tokio-transport, whatsapp-rust-ureq-http-client) at upstream by git tag.
+- **It is a plain pinned dependency, NOT a fork we maintain.** The old `199-biotechnologies` "fork" was just upstream frozen at the v0.2 era with zero custom commits (see ADR 0002, 2026-06-25 correction). There is no sibling clone, no local `rev` to push, no `.cargo/config.toml` path-patch by default.
+- **To upgrade wa-rs:** bump the tag in `Cargo.toml`, `cargo update`, fix any API breakage, run tests + a live smoke test. (As of the F1 effort: adopting `oxidezap` v0.6.0 — Phase 0 of `docs/plans/IMPLEMENTATION-ROADMAP.md`.)
+- If a feature ever genuinely needs wa-rs *source* changes, fork `oxidezap`, point Cargo.toml at your fork, and upstream the change — but the default posture is consume-upstream-as-is.
 
 ## Key Files
 - `src/bridge.rs` — core bridge: events, all message types, typing, groups, polls, presence, delivery receipts, group cache

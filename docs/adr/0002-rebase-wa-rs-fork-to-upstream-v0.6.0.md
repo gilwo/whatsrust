@@ -1,8 +1,19 @@
-# 0002. Rebase wa-rs fork onto upstream v0.6.0 before building history features
+# 0002. Adopt wa-rs upstream v0.6.0 directly before building history features
 
 **Status:** Accepted  
 **Date:** 2026-06-17  
-**Updated:** 2026-06-22 — Added GO/NO-GO gate criteria + minimal spike result
+**Updated:** 2026-06-22 — Added GO/NO-GO gate criteria + minimal spike result  
+**Updated:** 2026-06-25 — NO REBASE NEEDED (fork has zero custom commits); adopt upstream v0.6.0 directly. Upstream of record = `oxidezap/whatsapp-rust`.
+
+## Correction (2026-06-25) — "rebase" was a misnomer; this is a dependency bump
+
+Investigation showed the `199-biotechnologies/whatsapp-rust` fork pinned at `9fb13a7` is a **pure ancestor** of upstream v0.6.0 with **0 custom commits** (138 commits behind). It is not a fork carrying local changes — it is upstream *frozen at the v0.2 era*. Therefore **there is nothing to rebase, nothing to clone, no `../whatsapp-rust` sibling, no `rev` to push.**
+
+`oxidezap/whatsapp-rust` and `jlucaso1/whatsapp-rust` are byte-identical (same `main` `302d4787`, same tags). **`oxidezap` is adopted as the upstream of record** (the project's active home). Verified at v0.6.0 (tag `56ed1b09`): all 6 consumed crates exist (whatsapp-rust, wacore, wacore-binary, waproto, whatsapp-rust-tokio-transport, whatsapp-rust-ureq-http-client) and all 7 requested features still exist (tokio-runtime, tokio-transport, ureq-client, moka-cache, simd, signal, tokio-native).
+
+**So Phase 0 collapses from "rebase a fork" to:** edit `Cargo.toml` to point all 6 wa-rs deps at `github.com/oxidezap/whatsapp-rust` tag `v0.6.0` → `cargo update` → fix the ~15-20 mechanical API breakages (Spike Result below) → pass the GO gate. The gate criteria, spike findings, and pivot paths below ALL STILL APPLY unchanged — only the mechanism (dep bump, not rebase) changed.
+
+The original fork-rebase framing is preserved below for history.
 
 ## Context
 
@@ -42,12 +53,14 @@ Rebase the `199-biotechnologies/whatsapp-rust` fork onto upstream v0.6.0 as **st
 - Adds rebase-spike step before feature work begins
 - Risk of regressions if upstream introduced breaking assumptions
 
-**Plan:**
-1. Rebase spike in `../whatsapp-rust` (branch `rebase-v0.6.0`)
-2. Evaluate against G1/G2/G3 → GO or pivot
-3. If GO: update whatsrust to fix breakage
-4. Verify existing features (send, receive, groups, polls) still work
-5. Then proceed with on-demand fetch implementation
+**Plan (revised 2026-06-25 — dep bump, not rebase):**
+1. On a branch, edit `Cargo.toml`: repoint the 6 wa-rs deps `git = "https://github.com/oxidezap/whatsapp-rust", tag = "v0.6.0"` (drop the `199-biotechnologies` rev). `cargo update`.
+2. Fix the ~15-20 mechanical breakages (Spike Result below) until `cargo build` + 89 tests pass.
+3. Evaluate against G1/G2/G3 + run the live smoke test → GO or pivot.
+4. Verify existing features (send, receive, groups, polls) still work (the live smoke test).
+5. If GO: commit the dep bump + fixes. Then proceed with on-demand fetch implementation (M1).
+
+(No fork, no `../whatsapp-rust` clone, no `rev` to push — see Correction above.)
 
 ---
 
