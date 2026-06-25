@@ -71,10 +71,17 @@ FTS5 + embed-pending path; backfill is enrichment, not a separate pipeline.
 
 ---
 
-## Prerequisite: wa-rs rebase (implementation step 0)
+## Prerequisite: adopt wa-rs v0.6.0 (implementation step 0)
 
-The pinned fork (`199-biotechnologies/whatsapp-rust` @ `9fb13a7`) is ~v0.2-era.
-Upstream (`jlucaso1`) is at **v0.6.0** with a heavily-reworked history-sync/PDO
+> **2026-06-25 correction:** This is a **dependency bump, not a rebase.** The
+> `199-biotechnologies` pin is just upstream frozen at v0.2 with **zero custom
+> commits** — nothing to rebase, no fork to clone. Repoint `Cargo.toml` at the
+> upstream of record **`oxidezap/whatsapp-rust`** (byte-identical to `jlucaso1`),
+> tag `v0.6.0`. The gate criteria + spike result + pivot paths below are unchanged.
+> See ADR 0002 (2026-06-25 correction).
+
+The current pin (`199-biotechnologies/whatsapp-rust` @ `9fb13a7`) is ~v0.2-era.
+Upstream is at **v0.6.0** with a heavily-reworked history-sync/PDO
 subsystem (`pdo.rs` 501→870, `history_sync.rs` 281→1066) — exactly what we build on.
 
 **Rebase spike is a HARD GO/NO-GO GATE** (ADR 0002). Must resolve criteria before any F1 implementation:
@@ -93,7 +100,7 @@ subsystem (`pdo.rs` 501→870, `history_sync.rs` 281→1066) — exactly what we
 
 **Hardened (v2, fork R1):** GO requires ACTUAL compile + 89 unit tests + ~15-30min LIVE smoke test (connect, send, receive, verify group-sender parsing, small history fetch) against a real account. Folds in M1 (spike must compile+test, not static-predict). Rationale: unit tests are pure-logic/no-live-WA; runtime breakage (decryption, media, JID/LID) is what they miss.
 
-Per CLAUDE.md: work in `../whatsapp-rust`, push, bump the pinned `rev`.
+Mechanism: edit `Cargo.toml` to point the 6 wa-rs crates at `oxidezap/whatsapp-rust` tag `v0.6.0`, `cargo update`, fix breakage, commit. No fork, no sibling clone, no `rev` to push (see ADR 0002 + CLAUDE.md wa-rs section).
 
 ---
 
