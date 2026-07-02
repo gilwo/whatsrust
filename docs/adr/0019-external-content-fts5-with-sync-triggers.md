@@ -1,7 +1,8 @@
 # 0019. External-content FTS5 with sync triggers
 
 **Status:** Accepted  
-**Date:** 2026-06-17
+**Date:** 2026-06-17  
+**Updated:** 2026-07-02 — Added the Ranking (BM25) subsection (verified against the bundled SQLite 3.50.2).
 
 ## Context
 
@@ -54,6 +55,18 @@ INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
 **Index REAL natural-language text ONLY** (same surface as ADR 0016 embeddable set: bodies/captions/poll/contact/location). Non-content rows have `body_text` = NULL → nothing indexed (no FTS hits on synthetic labels like `[sticker 40KB]`).
 
 **Tokenizer = `unicode61 remove_diacritics 2`** (from ADR 0018).
+
+### Ranking (BM25)
+
+**Rank with FTS5's built-in BM25 via `ORDER BY rank` — no enable step, no config.** Verified against our actual dependency: bundled SQLite **3.50.2** (rusqlite `bundled` → libsqlite3-sys 0.35.0, `-DSQLITE_ENABLE_FTS5` set). BM25 has been FTS5's default `rank` since SQLite 3.20.0 (`#define FTS5_DEFAULT_RANK "bm25"`), so it is available unconditionally — there is no separate "enable BM25" step beyond having FTS5 compiled (which ADR 0032 probes for).
+
+Rules for the M1.3 search query:
+- Use `... WHERE messages_fts MATCH ?1 ... ORDER BY rank` (ascending). `bm25()` returns a **negated** score (`-1.0 * score` in the source), so **most-relevant = most-negative → ascending `ORDER BY rank` is best-first. Never `ORDER BY rank DESC`.**
+- **Column weights (`bm25(messages_fts, w1, ...)`) add no value with the current single-indexed-column schema** (`body_text` only). Defer explicit weights until/unless a later revision indexes multiple columns (e.g. sender name, poll question); only then does weighting body vs. metadata become meaningful.
+- For the M2 semantic path (ADR 0007/0008), FTS5 is the candidate-recall stage before the Rust cosine rerank: use a larger, configurable recall `LIMIT` (default ~200), still `ORDER BY rank`, distinct from the final result `LIMIT`.
+- **`rank` only exists on `MATCH` queries.** Chat-scoped / time-filtered search combines `MATCH` with base-table predicates; verify the plan with `EXPLAIN QUERY PLAN` at implementation time (a `body_text:term` column filter is a fallback if a JOIN predicate doesn't push down well at scale).
+
+**Open (M1.3):** MATCH-query input sanitization is a separate concern — FTS5 `MATCH` has its own syntax (phrase / `OR` / `NOT` / `*` prefix / column filters), unlike the current `LIKE` path. M1.3 must pick a policy (simplest: quote user input as a phrase, escaping `"`→`""`) to avoid parse errors / unintended query semantics. Not decided here.
 
 ## Consequences
 
