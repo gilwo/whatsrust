@@ -412,9 +412,9 @@ pub async fn execute_job(
                     jpeg_thumbnail: meta.as_ref().map(|m| m.thumbnail.clone()),
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
-                    media_key: Some(upload.media_key),
-                    file_enc_sha256: Some(upload.file_enc_sha256),
-                    file_sha256: Some(upload.file_sha256),
+                    media_key: Some(upload.media_key.to_vec()),
+                    file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                    file_sha256: Some(upload.file_sha256.to_vec()),
                     file_length: Some(upload.file_length),
                     view_once: if kind == OutboundOpKind::ViewOnceImage { Some(true) } else { None },
                     ..Default::default()
@@ -439,9 +439,9 @@ pub async fn execute_job(
                     seconds: p.seconds,
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
-                    media_key: Some(upload.media_key),
-                    file_enc_sha256: Some(upload.file_enc_sha256),
-                    file_sha256: Some(upload.file_sha256),
+                    media_key: Some(upload.media_key.to_vec()),
+                    file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                    file_sha256: Some(upload.file_sha256.to_vec()),
                     file_length: Some(upload.file_length),
                     view_once: if kind == OutboundOpKind::ViewOnceVideo { Some(true) } else { None },
                     ..Default::default()
@@ -476,9 +476,9 @@ pub async fn execute_job(
                     waveform,
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
-                    media_key: Some(upload.media_key),
-                    file_enc_sha256: Some(upload.file_enc_sha256),
-                    file_sha256: Some(upload.file_sha256),
+                    media_key: Some(upload.media_key.to_vec()),
+                    file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                    file_sha256: Some(upload.file_sha256.to_vec()),
                     file_length: Some(upload.file_length),
                     ..Default::default()
                 })),
@@ -506,9 +506,9 @@ pub async fn execute_job(
                     caption: p.caption,
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
-                    media_key: Some(upload.media_key),
-                    file_enc_sha256: Some(upload.file_enc_sha256),
-                    file_sha256: Some(upload.file_sha256),
+                    media_key: Some(upload.media_key.to_vec()),
+                    file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                    file_sha256: Some(upload.file_sha256.to_vec()),
                     file_length: Some(upload.file_length),
                     ..Default::default()
                 })),
@@ -535,9 +535,9 @@ pub async fn execute_job(
                     height: Some(512),
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
-                    media_key: Some(upload.media_key),
-                    file_enc_sha256: Some(upload.file_enc_sha256),
-                    file_sha256: Some(upload.file_sha256),
+                    media_key: Some(upload.media_key.to_vec()),
+                    file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                    file_sha256: Some(upload.file_sha256.to_vec()),
                     file_length: Some(upload.file_length),
                     ..Default::default()
                 })),
@@ -592,7 +592,7 @@ pub async fn execute_job(
                 None
             };
             let msg = wa::Message {
-                reaction_message: Some(wa::message::ReactionMessage {
+                reaction_message: Some(Box::new(wa::message::ReactionMessage {
                     key: Some(wa::MessageKey {
                         remote_jid: Some(target.to_string()),
                         id: Some(p.target_message_id),
@@ -602,7 +602,7 @@ pub async fn execute_job(
                     text: Some(emoji),
                     sender_timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let result = client.send_message(target.clone(), msg).await
@@ -694,7 +694,7 @@ pub async fn execute_job(
             };
             let upload = client.upload(data, MediaType::Image, UploadOptions::default()).await
                 .map_err(|e| anyhow::anyhow!("status image upload: {e}"))?;
-            let result = client.status().send_image(&upload, vec![], p.caption.as_deref(), &recipients, opts).await
+            let result = client.status().send_image(upload, vec![], p.caption.as_deref(), &recipients, opts).await
                 .map_err(|e| anyhow::anyhow!("send status image: {e}"))?;
             Ok(ExecOutcome { wa_message_id: Some(result.message_id), poll_key: None })
         }
@@ -709,7 +709,7 @@ pub async fn execute_job(
             };
             let upload = client.upload(data, MediaType::Video, UploadOptions::default()).await
                 .map_err(|e| anyhow::anyhow!("status video upload: {e}"))?;
-            let result = client.status().send_video(&upload, vec![], p.seconds, p.caption.as_deref(), &recipients, opts).await
+            let result = client.status().send_video(upload, vec![], p.seconds, p.caption.as_deref(), &recipients, opts).await
                 .map_err(|e| anyhow::anyhow!("send status video: {e}"))?;
             Ok(ExecOutcome { wa_message_id: Some(result.message_id), poll_key: None })
         }

@@ -681,7 +681,11 @@ pub struct BridgeConfig {
     pub pair_phone: Option<String>,
     /// Maximum reconnection delay (caps exponential backoff)
     pub max_reconnect_delay: Duration,
-    /// Skip history sync on connect (prevents "deaf client" bug with large offline queues)
+    /// Skip history sync on connect. Default false (history sync ON): the bootstrap
+    /// delivers the trusted-contact tokens WhatsApp requires for 1:1 DMs (token-less
+    /// DMs are nacked `463 MissingTcToken`) + pushname/nct_salt. The legacy "deaf
+    /// client" rationale for skipping is obsolete on current wa-rs (history is
+    /// processed on a dedicated worker, off the live path). See ADR 0037.
     pub skip_history_sync: bool,
     /// Automatically send read receipts for inbound messages after enqueue.
     pub auto_mark_read: bool,
@@ -720,7 +724,7 @@ impl Default for BridgeConfig {
             db_path: PathBuf::from("whatsapp.db"),
             pair_phone: None,
             max_reconnect_delay: Duration::from_secs(60),
-            skip_history_sync: true,
+            skip_history_sync: false, // history sync ON by default (needed for 1:1 DM tctokens); see ADR 0037
             auto_mark_read: true,
             allowed_numbers: Vec::new(),
             min_send_interval_ms: 400,
@@ -954,8 +958,8 @@ impl WhatsAppBridge {
                 .into_iter()
                 .map(|p| GroupParticipantInfo {
                     jid: p.jid.to_string(),
-                    phone: p.phone_number.map(|pn| pn.to_string()),
-                    is_admin: p.is_admin,
+                    phone: p.phone_number.as_ref().map(|pn| pn.to_string()),
+                    is_admin: p.is_admin(),
                 })
                 .collect(),
         };
@@ -977,8 +981,8 @@ impl WhatsAppBridge {
                     .into_iter()
                     .map(|p| GroupParticipantInfo {
                         jid: p.jid.to_string(),
-                        phone: p.phone_number.map(|pn| pn.to_string()),
-                        is_admin: p.is_admin,
+                        phone: p.phone_number.as_ref().map(|pn| pn.to_string()),
+                        is_admin: p.is_admin(),
                     })
                     .collect(),
             })
@@ -1005,7 +1009,7 @@ impl WhatsAppBridge {
             .collect::<Result<Vec<_>>>()?;
         let opts = GroupCreateOptions::new(name).with_participants(participant_opts);
         let result = client.groups().create_group(opts).await?;
-        Ok(result.gid.to_string())
+        Ok(result.metadata.id.to_string())
     }
 
     /// Set the subject (title) of a group.
@@ -2161,7 +2165,7 @@ async fn run_bot_session(
 
     // Build the Bot
     let mut builder = Bot::builder()
-        .with_backend(Arc::new(store.clone()))
+        .with_backend(store.clone())
         .with_transport_factory(TokioWebSocketTransportFactory::new())
         .with_http_client(UreqHttpClient::new())
         .with_runtime(whatsapp_rust::TokioRuntime)
@@ -2186,21 +2190,23 @@ async fn run_bot_session(
             let etx = event_tx_for_events.clone();
             let gc = gc_for_events.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, &srr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &etx, &gc)
+                let event_owned = (*event).clone();
+                handle_event(event_owned, client, &ch, &itx, &stx, &qtx, &store, &sr, &srr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &etx, &gc)
                     .await;
             }
         });
 
-    // Skip history sync to avoid the "deaf client" bug (Issue #125)
+    // Honor skip_history_sync (default false = ON). History sync delivers the
+    // trusted-contact tokens WhatsApp requires for 1:1 DMs; see ADR 0037. The legacy
+    // "deaf client" concern (Issue #125) is obsolete on current wa-rs (dedicated worker).
     if config.skip_history_sync {
         builder = builder.skip_history_sync();
     }
 
     // Set device name shown in WhatsApp's "Linked Devices" list
+    use wacore::store::device::DevicePropsOverride;
     builder = builder.with_device_props(
-        Some(config.device_name.clone()),
-        None,
-        None,
+        DevicePropsOverride::new().with_os(config.device_name.clone())
     );
 
     if let Some(ref phone) = config.pair_phone {
@@ -2212,28 +2218,21 @@ async fn run_bot_session(
         });
     }
 
-    let mut bot = builder
+    let bot = builder
         .build()
         .await
         .context("failed to build WhatsApp bot")?;
-    let bot_task = bot.run().await.context("failed to start WhatsApp bot")?;
+    let bot_handle = bot.spawn();
 
     // Run bot + outbound handler + cancellation in parallel
     tokio::select! {
-        result = bot_task => {
-            match result {
-                Ok(()) => {
-                    if stream_replaced.load(Ordering::Relaxed) {
-                        Ok(SessionAction::StreamReplaced)
-                    } else if stop_reconnect.load(Ordering::Relaxed) {
-                        Ok(SessionAction::Stop)
-                    } else {
-                        Ok(SessionAction::Retry)
-                    }
-                }
-                Err(e) => {
-                    Err(anyhow::anyhow!("WhatsApp bot task join error: {e}"))
-                }
+        _ = bot_handle => {
+            if stream_replaced.load(Ordering::Relaxed) {
+                Ok(SessionAction::StreamReplaced)
+            } else if stop_reconnect.load(Ordering::Relaxed) {
+                Ok(SessionAction::Stop)
+            } else {
+                Ok(SessionAction::Retry)
             }
         }
         _ = handle_outbound(&client_handle, cancel, store, config.max_outbound_retries, metrics, send_pacer, outbound_notify, event_tx) => {
@@ -2812,14 +2811,8 @@ async fn handle_event(
             // Invalidate cache so next query fetches fresh data
             group_cache.lock().invalidate(&update.group_jid.to_string());
         }
-        Event::JoinedGroup(lazy) => {
-            if let Some(conv) = lazy.get() {
-                info!(group = %conv.id, "joined new group");
-                group_cache.lock().invalidate(&conv.id);
-            } else {
-                info!("joined new group (could not decode conversation)");
-            }
-        }
+        // Event::JoinedGroup removed in wa-rs v0.6.0 — low-stakes: group cache
+        // will lazily refresh on next access; no correctness break.
         Event::DeleteChatUpdate(update) => {
             let jid = update.jid.to_string();
             info!(chat = %jid, "chat deleted — removing inbound history");
@@ -2896,6 +2889,18 @@ async fn handle_event(
         }
         Event::NewsletterLiveUpdate(update) => {
             debug!(newsletter = %update.newsletter_jid, messages = update.messages.len(), "newsletter live update");
+        }
+        Event::IncomingCall(call) => {
+            debug!(from = %call.from, "incoming call");
+        }
+        Event::IdentityChange(change) => {
+            debug!(user = %change.user, "identity change detected");
+        }
+        Event::RawNode(_) => {
+            debug!("raw node received");
+        }
+        Event::MexNotification(_) => {
+            debug!("mex notification received");
         }
 
         // Catch-all for future variants we haven't mapped yet
@@ -3512,7 +3517,7 @@ async fn resolve_sender(sender_raw: &str, sender_alt: Option<&wacore_binary::jid
     // 1. Try sender_alt (inline PN from wa-rs)
     if let Some(alt) = sender_alt {
         if alt.server == "s.whatsapp.net" {
-            return alt.user.clone();
+            return alt.user.to_string();
         }
     }
 

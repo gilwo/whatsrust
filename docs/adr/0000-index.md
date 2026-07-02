@@ -49,6 +49,7 @@ This directory contains Architecture Decision Records (ADRs) for the whatsrust p
 | [0034](0034-fuzzy-progress-for-auto-continuing-fetch.md) | Fuzzy progress for auto-continuing fetch targets | 2026-06-22 | Accepted |
 | [0035](0035-cooldown-and-dedup-via-single-frontier.md) | Cooldown and dedup via single frontier model | 2026-06-22 | Accepted |
 | [0036](0036-metadata-kv-table.md) | Generic metadata KV table for singleton scalars | 2026-06-22 | Accepted |
+| [0037](0037-enable-history-sync-for-dm-tctokens.md) | Enable history sync by default to obtain 1:1-DM trusted-contact tokens | 2026-07-01 | Accepted |
 
 ## Revised ADRs
 
@@ -76,4 +77,4 @@ The following ADRs received hardening notes during the 2026-06-23 v2 design revi
 
 ## Future ADRs
 
-Start numbering at 0037. Follow the established format. Keep each ADR focused on one decision.
+Start numbering at 0038. Follow the established format. Keep each ADR focused on one decision.
