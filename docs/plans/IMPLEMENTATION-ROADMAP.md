@@ -1,7 +1,7 @@
 # Implementation Roadmap — Historical Fetch + Semantic/Lexical Search
 
-**Date:** 2026-06-25
-**Status:** Roadmap skeleton (pre-GO). Detailed per-milestone plans are written at each milestone's start, not now.
+**Date:** 2026-06-25 (updated 2026-07-01)
+**Status:** **Phase 0 GATE PASSED — GO** (2026-07-01, commit 615d185). M1 is now unblocked; its detailed phase/task plan is written at M1 start (not yet). M2 detail deferred to M2 start.
 **Design:** `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (3 cold reviews, converged, implementation-ready)
 **Why this is a skeleton:** Phase 0 is a hard GO/NO-GO gate (the wa-rs v0.6.0 dependency adoption). We do not write detailed phase/task plans behind an unvalidated gate — a NO-GO or a fallback-triggering result reshapes everything. Only Phase 0 is planned in detail below; M1/M2 phase detail is deferred to their starts.
 
@@ -46,7 +46,20 @@ The entire feature is conditional on this. **No rebase, no fork, no clone** — 
   - G2 encrypted → ADR 0014 fallback B (parallel extractor) — re-scope M1 with that cost.
   - G3 no correlation even single-flight → **F1 not viable on this protocol; STOP and reassess.**
 
-**Exit:** a written GO/NO-GO verdict + (on GO) `Cargo.toml` pointed at `oxidezap` v0.6.0 and whatsrust green (build + 89 tests + live smoke test).
+**Exit:** a written GO/NO-GO verdict + (on GO) `Cargo.toml` pointed at upstream and whatsrust green (build + tests + live smoke test).
+
+---
+
+### ✅ VERDICT: GO — 2026-07-01 (commit 615d185)
+
+- **Pinned to wa-rs `oxidezap` main HEAD `9e8c70e2`, NOT the v0.6.0 tag.** The tag (pinned first) compiled + passed 150 tests, but live testing showed **1:1 DM sends failed** with the server nack `463 MissingTcToken`. Root cause traced to upstream bug #730/#731, whose fix (`09a3b0c1`) landed **after** the v0.6.0 tag. Scope-analyzed HEAD (+315, incl. #852 bot API / #866 Message boxing / #893 typed errors — all handled; #911 bincode→prost doesn't affect us; #853 history-sync verified F1-safe) and pinned there.
+- **G1 ✅** compile + **150 tests**. **G2 ✅** history `WebMessageInfo` plaintext (bootstrap decoded). **G3 ✅** `peer_data_request_session_id` + `fetch_message_history` intact at HEAD.
+- **Live smoke test ✅** connect / receive / **group send (delivered+read)** / **1:1 send (delivered)** / history bootstrap processed.
+- **DM fix:** the `463` was resolved by **enabling history sync** (delivers trusted-contact tokens) — see **ADR 0037**. `skip_history_sync` default flipped to `false`; opt-out via `WHATSRUST_SKIP_HISTORY_SYNC=1`.
+- **Known limitation (not a blocker):** cold-outreach to non-contacts may still `463` — `nct_salt` (the cstoken path) is WhatsApp-account-gated, not code-fixable.
+- **Deferred to M1:** `MsgSecretStore` currently stubbed no-op (can't decrypt history-delivered edits/reactions/poll-votes).
+
+**Next:** M1 — write its detailed phase/task plan, then begin M1.1 (storage + migration). ⚠️ Fold in the reviews' I-items (esp. removing the prune age-DELETE, review I2).
 
 ---
 
