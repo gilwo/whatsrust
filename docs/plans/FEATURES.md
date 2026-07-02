@@ -2,7 +2,7 @@
 
 **Type:** Live document — kept up to date as features land. Update the **Status** of an
 item when work starts/completes; add a dated note in its row's detail.
-**Last updated:** 2026-06-25
+**Last updated:** 2026-07-01
 
 This is the single tracking surface for in-flight and planned work on this experimental
 fork. The *why* for each design lives in the ADRs (`docs/adr/`); the *what/how* blueprints
@@ -15,14 +15,14 @@ live in `docs/plans/*-design.md`; the *execution order* lives in
 
 ## Major Features
 
-### F1 — Historical message fetch + semantic/lexical search 🔵 Designed (3 reviews, converged, implementation-ready)
+### F1 — Historical message fetch + semantic/lexical search 🟡 In progress (Phase 0 GATE passed — GO)
 Per-chat historical backfill (`all` / `since:T` / `count:N`) + local FTS5 (lexical) + optional vector (semantic) search.
 - **Design:** `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md`; ADRs 0001–0036.
 - **Execution plan:** `docs/plans/IMPLEMENTATION-ROADMAP.md` (Phase 0 gate → M1 → M2).
 - **Reviews:** 3 cold passes (`_reviewer/design/`), 2026-06-18 / -23 / -24 → final verdict **implementation-ready, no blockers**.
-- **First step:** Phase 0 — wa-rs rebase, a HARD GO/NO-GO gate (ADR 0002).
+- **First step:** Phase 0 — wa-rs adoption, a HARD GO/NO-GO gate (ADR 0002). **✅ PASSED (GO).**
 - **Milestone tracking** (detailed phase/task plans written at each milestone's start, not before — gate-gated):
-  - [ ] **Phase 0 — GATE:** wa-rs rebase v0.2→v0.6.0 + GO/NO-GO (compile + 89 tests + live smoke test). Spike: GO-leaning, MEDIUM. (ADR 0002)
+  - [x] **Phase 0 — GATE: GO** (2026-07-01, commit 615d185). Adopted wa-rs **main HEAD `9e8c70e2`** (not the v0.6.0 tag — the tag lacked the DM-send fix #731; HEAD is +315, all breaking changes handled). Verified: compile + **150 tests** + live smoke test (connect / receive / group send delivered+read / **1:1 send delivered** / history bootstrap). Live testing surfaced + fixed a `463 MissingTcToken` DM failure by **enabling history sync** (delivers trusted-contact tokens; ADR 0037). Known limitation: cold-outreach to non-contacts is WhatsApp-account-gated (`nct_salt`), not code-fixable. (ADR 0002/0037)
   - [ ] **M1 — fetch + lexical search** (ships independently, no sidecar): storage+migration ⚠️prune-removal · fetch worker (single-FIFO, 3-level abort, contained-C, safety built-in) · FTS5 search · API/MCP + watchdog. (ADR 0003/0009/0010/0011/0013/0019/0020/0026/0027/0028-0036)
   - [ ] **M2 — semantic search** (layers on M1; = F2 below): sidecar + drain + cosine rerank. Phase breakdown deferred to M2 start. (ADR 0008/0015/0016/0017/0024)
 
@@ -84,7 +84,7 @@ now** to preserve focus on F1/F2. Pick up opportunistically or schedule delibera
 
 ## Prerequisites
 
-- **wa-rs fork rebase v0.2 → v0.6.0** (ADR 0002) — gates F1/F2. Tracked as F1 phase 0.
+- ✅ **wa-rs adoption (v0.2 → upstream main HEAD `9e8c70e2`)** (ADR 0002/0037) — gated F1/F2; **DONE 2026-07-01 (commit 615d185)**. History sync enabled by default for 1:1-DM tctokens.
 
 ---
 
