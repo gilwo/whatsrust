@@ -19,16 +19,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use prost::Message as ProstMessage;
+use tokio_util::bytes::Bytes;
 use rusqlite::{params, Connection, OptionalExtension};
 use wacore::appstate::hash::HashState;
 use wacore::appstate::processor::AppStateMutationMAC;
 use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
 use wacore::store::device::DEVICE_PROPS;
-use wacore::store::error::{db_err, Result, StoreError};
+use wacore::store::error::{Result, StoreError};
 use wacore::store::traits::*;
 use wacore::store::Device;
 use wacore_binary::jid::Jid;
 use waproto::whatsapp as wa;
+
+// ---------------------------------------------------------------------------
+// Helper to convert rusqlite errors to StoreError::Database
+// ---------------------------------------------------------------------------
+
+fn db_err(e: rusqlite::Error) -> StoreError {
+    StoreError::Database(Box::new(e))
+}
 
 // ---------------------------------------------------------------------------
 // Schema — 15 tables, no device_id column (single-device design)
@@ -219,12 +228,12 @@ fn secure_backup_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let meta = std::fs::metadata(path)
-        .map_err(|e| StoreError::Database(format!("stat {}: {e}", path.display())))?;
+        .map_err(|e| StoreError::Database(format!("stat {}: {e}", path.display()).into()))?;
     let mut perms = meta.permissions();
     let mode = if meta.is_dir() { 0o700 } else { 0o600 };
     perms.set_mode(mode);
     std::fs::set_permissions(path, perms)
-        .map_err(|e| StoreError::Database(format!("chmod {}: {e}", path.display())))?;
+        .map_err(|e| StoreError::Database(format!("chmod {}: {e}", path.display()).into()))?;
     Ok(())
 }
 
@@ -301,7 +310,7 @@ impl Store {
             f(&guard)
         })
         .await
-        .map_err(db_err)?
+        .map_err(|e| StoreError::Database(format!("spawn_blocking join error: {e}").into()))?
     }
 
     /// Create a hot backup of the database using SQLite's backup API.
@@ -392,7 +401,7 @@ impl Store {
                 )
                 .map_err(db_err)?;
             u32::try_from(count).map_err(|_| {
-                StoreError::Database(format!("requeue count {count} out of u32 range"))
+                StoreError::Database(format!("requeue count {count} out of u32 range").into())
             })
         })
         .await
@@ -688,7 +697,7 @@ impl Store {
     pub fn perform_backup(&self, backup_dir: &Path, max_backups: usize) -> Result<PathBuf> {
         // Ensure backup directory exists
         std::fs::create_dir_all(backup_dir)
-            .map_err(|e| StoreError::Database(format!("create backup dir: {e}")))?;
+            .map_err(|e| StoreError::Database(format!("create backup dir: {e}").into()))?;
         secure_backup_permissions(backup_dir)?;
 
         // Generate timestamped filename
@@ -743,7 +752,7 @@ impl Store {
         let poll_id = poll_id.to_string();
         let enc_key = enc_key.to_vec();
         let options_json = serde_json::to_string(options).map_err(|e| {
-            StoreError::Serialization(format!("poll options: {e}"))
+            StoreError::Serialization(format!("poll options: {e}").into())
         })?;
         self.run(move |c| {
             let now = SystemTime::now()
@@ -781,7 +790,7 @@ impl Store {
             match result {
                 Some((enc_key, options_json)) => {
                     let options: Vec<String> = serde_json::from_str(&options_json)
-                        .map_err(|e| StoreError::Serialization(format!("poll options: {e}")))?;
+                        .map_err(|e| StoreError::Serialization(format!("poll options: {e}").into()))?;
                     Ok(Some((enc_key, options)))
                 }
                 None => Ok(None),
@@ -795,7 +804,7 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
     if from_version > CURRENT_SCHEMA_VERSION {
         return Err(StoreError::Database(format!(
             "database schema version {from_version} is newer than supported {CURRENT_SCHEMA_VERSION}"
-        )));
+        ).into()));
     }
 
     if from_version >= CURRENT_SCHEMA_VERSION {
@@ -980,12 +989,12 @@ fn deserialize_keypair(bytes: &[u8]) -> Result<KeyPair> {
         return Err(StoreError::Serialization(format!(
             "keypair: expected 64 bytes, got {}",
             bytes.len()
-        )));
+        ).into()));
     }
     let private = PrivateKey::deserialize(&bytes[..32])
-        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        .map_err(|e| StoreError::Serialization(e.to_string().into()))?;
     let public = PublicKey::from_djb_public_key_bytes(&bytes[32..])
-        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        .map_err(|e| StoreError::Serialization(e.to_string().into()))?;
     Ok(KeyPair::new(public, private))
 }
 
@@ -1126,7 +1135,7 @@ fn load_device_from_db(conn: &Connection) -> Result<Option<Device>> {
 
     let to_u32 = |v: i64, field: &str| -> Result<u32> {
         u32::try_from(v)
-            .map_err(|_| StoreError::Serialization(format!("{field}: value {v} out of u32 range")))
+            .map_err(|_| StoreError::Serialization(format!("{field}: value {v} out of u32 range").into()))
     };
     let to_fixed = |v: Vec<u8>, field: &str, expected: usize| -> Result<Vec<u8>> {
         if v.len() == expected {
@@ -1135,11 +1144,23 @@ fn load_device_from_db(conn: &Connection) -> Result<Option<Device>> {
             Err(StoreError::Serialization(format!(
                 "{field}: expected {expected} bytes, got {}",
                 v.len()
-            )))
+            ).into()))
         }
     };
     let npk_id = to_u32(npk_id_raw, "next_pre_key_id")?;
     let nct = nct_raw;
+
+    // server_has_prekeys is a v0.6 login optimization: when true, the client skips
+    // re-uploading prekeys at login. It has no dedicated column (Phase 0 keeps schema
+    // at v7), so derive it from whether any prekeys are already marked uploaded —
+    // equivalent to "the server already has our prekeys".
+    let server_has_prekeys: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM prekeys WHERE uploaded = 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
 
     Ok(Some(Device {
         pn: if pn_s.is_empty() {
@@ -1172,18 +1193,24 @@ fn load_device_from_db(conn: &Connection) -> Result<Option<Device>> {
         account: account_b
             .map(|b| wa::AdvSignedDeviceIdentity::decode(b.as_slice()))
             .transpose()
-            .map_err(|e| StoreError::Serialization(e.to_string()))?,
+            .map_err(|e| StoreError::Serialization(e.to_string().into()))?
+            .map(Arc::new),
         push_name,
         app_version_primary: to_u32(v1, "app_version_primary")?,
         app_version_secondary: to_u32(v2, "app_version_secondary")?,
         app_version_tertiary: to_u32(v3, "app_version_tertiary")?,
         app_version_last_fetched_ms: v_ts,
-        device_props: DEVICE_PROPS.clone(),
+        device_props: Arc::new(DEVICE_PROPS.clone()),
+        client_profile: Default::default(),
         edge_routing_info: eri,
         props_hash: ph,
         next_pre_key_id: npk_id,
+        first_unupload_pre_key_id: 0,
+        server_has_prekeys,
         nct_salt: nct,
         nct_salt_sync_seen: false,
+        server_cert_chain: None,
+        login_counter: 0,
     }))
 }
 
@@ -1207,16 +1234,24 @@ impl SignalStore for Store {
         .await
     }
 
-    async fn load_identity(&self, address: &str) -> Result<Option<Vec<u8>>> {
+    async fn load_identity(&self, address: &str) -> Result<Option<[u8; 32]>> {
         let addr = address.to_owned();
         self.run(move |c| {
-            c.query_row(
+            let opt: Option<Vec<u8>> = c.query_row(
                 "SELECT key FROM identities WHERE address = ?1",
                 params![addr],
                 |row| row.get(0),
             )
             .optional()
-            .map_err(db_err)
+            .map_err(db_err)?;
+            opt.map(|v| {
+                if v.len() != 32 {
+                    return Err(StoreError::Serialization(format!("identity key: expected 32 bytes, got {}", v.len()).into()));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&v);
+                Ok(arr)
+            }).transpose()
         })
         .await
     }
@@ -1231,16 +1266,17 @@ impl SignalStore for Store {
         .await
     }
 
-    async fn get_session(&self, address: &str) -> Result<Option<Vec<u8>>> {
+    async fn get_session(&self, address: &str) -> Result<Option<Bytes>> {
         let addr = address.to_owned();
         self.run(move |c| {
-            c.query_row(
+            let opt: Option<Vec<u8>> = c.query_row(
                 "SELECT record FROM sessions WHERE address = ?1",
                 params![addr],
                 |row| row.get(0),
             )
             .optional()
-            .map_err(db_err)
+            .map_err(db_err)?;
+            Ok(opt.map(Bytes::from))
         })
         .await
     }
@@ -1284,15 +1320,31 @@ impl SignalStore for Store {
         .await
     }
 
-    async fn load_prekey(&self, id: u32) -> Result<Option<Vec<u8>>> {
+    async fn load_prekey(&self, id: u32) -> Result<Option<Bytes>> {
         self.run(move |c| {
-            c.query_row(
+            let opt: Option<Vec<u8>> = c.query_row(
                 "SELECT key FROM prekeys WHERE id = ?1",
                 params![id],
                 |row| row.get(0),
             )
             .optional()
-            .map_err(db_err)
+            .map_err(db_err)?;
+            Ok(opt.map(Bytes::from))
+        })
+        .await
+    }
+
+    async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> Result<()> {
+        let ids_vec = ids.to_vec();
+        self.run(move |c| {
+            for id in &ids_vec {
+                c.execute(
+                    "UPDATE prekeys SET uploaded = 1 WHERE id = ?1",
+                    params![id],
+                )
+                .map_err(db_err)?;
+            }
+            Ok(())
         })
         .await
     }
@@ -1469,7 +1521,7 @@ impl AppSyncStore for Store {
                 .map_err(db_err)?;
             match opt {
                 Some(data) => serde_json::from_slice(&data)
-                    .map_err(|e| StoreError::Serialization(e.to_string())),
+                    .map_err(|e| StoreError::Serialization(e.to_string().into())),
                 None => Ok(HashState::default()),
             }
         })
@@ -1479,7 +1531,7 @@ impl AppSyncStore for Store {
     async fn set_version(&self, name: &str, state: HashState) -> Result<()> {
         let n = name.to_owned();
         let data =
-            serde_json::to_vec(&state).map_err(|e| StoreError::Serialization(e.to_string()))?;
+            serde_json::to_vec(&state).map_err(|e| StoreError::Serialization(e.to_string().into()))?;
         self.run(move |c| {
             c.execute(
                 "INSERT INTO app_state_versions (name, state_data) VALUES (?1, ?2)
@@ -1553,6 +1605,19 @@ impl AppSyncStore for Store {
         .await
     }
 
+    async fn clear_mutation_macs(&self, name: &str) -> Result<()> {
+        let n = name.to_owned();
+        self.run(move |c| {
+            c.execute(
+                "DELETE FROM app_state_mutation_macs WHERE name = ?1",
+                params![n],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>> {
         self.run(|c| {
             c.query_row(
@@ -1564,6 +1629,37 @@ impl AppSyncStore for Store {
             .map_err(db_err)
         })
         .await
+    }
+}
+
+// ===========================================================================
+// MsgSecretStore — message edit/reaction secrets (stub: returns empty/no-op)
+// ===========================================================================
+// wa-rs HEAD requires this trait for Backend. We don't persist msg secrets yet
+// (no table, no retention policy), so stub with no-op/in-memory-only semantics:
+// put succeeds silently, get always returns None. This keeps the trait satisfied
+// without changing the schema or adding a migration. Real persistence TBD.
+
+#[async_trait]
+impl wacore::store::traits::MsgSecretStore for Store {
+    async fn put_msg_secrets(&self, _entries: Vec<wacore::store::traits::MsgSecretEntry>) -> Result<usize> {
+        // No-op: we don't persist msg secrets yet
+        Ok(0)
+    }
+
+    async fn get_msg_secret(
+        &self,
+        _chat: &str,
+        _sender: &str,
+        _msg_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        // Always returns None: no persistence
+        Ok(None)
+    }
+
+    async fn delete_expired_msg_secrets(&self, _cutoff_timestamp: i64) -> Result<u32> {
+        // No-op: nothing to delete
+        Ok(0)
     }
 }
 
@@ -1618,6 +1714,28 @@ impl ProtocolStore for Store {
                 params![gj],
             )
             .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_sender_key_device_rows(&self, device_jids: &[&str]) -> Result<()> {
+        let jids: Vec<String> = device_jids.iter().map(|s| s.to_string()).collect();
+        self.run(move |c| {
+            let placeholders = (0..jids.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+            let sql = format!("DELETE FROM sender_key_devices WHERE device_jid IN ({})", placeholders);
+            let params: Vec<&dyn rusqlite::ToSql> = jids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            c.execute(&sql, params.as_slice())
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn clear_all_sender_key_devices(&self) -> Result<()> {
+        self.run(move |c| {
+            c.execute("DELETE FROM sender_key_devices", [])
+                .map_err(db_err)?;
             Ok(())
         })
         .await
@@ -1767,7 +1885,7 @@ impl ProtocolStore for Store {
 
     async fn update_device_list(&self, record: DeviceListRecord) -> Result<()> {
         let devices_json = serde_json::to_string(&record.devices)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            .map_err(|e| StoreError::Serialization(e.to_string().into()))?;
         self.run(move |c| {
             c.execute(
                 "INSERT INTO device_registry (user_id, devices_json, timestamp, phash)
@@ -1803,15 +1921,26 @@ impl ProtocolStore for Store {
             .map_err(db_err)?
             .map(|(user, dj, ts, ph)| {
                 let devices = serde_json::from_str(&dj)
-                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                    .map_err(|e| StoreError::Serialization(e.to_string().into()))?;
                 Ok(DeviceListRecord {
                     user,
                     devices,
                     timestamp: ts,
                     phash: ph,
+                    raw_id: None,
                 })
             })
             .transpose()
+        })
+        .await
+    }
+
+    async fn delete_devices(&self, user: &str) -> Result<()> {
+        let u = user.to_owned();
+        self.run(move |c| {
+            c.execute("DELETE FROM device_registry WHERE user_id = ?1", params![u])
+                .map_err(db_err)?;
+            Ok(())
         })
         .await
     }
@@ -1872,7 +2001,7 @@ impl ProtocolStore for Store {
                 )
                 .map_err(db_err)?;
             u32::try_from(count)
-                .map_err(|_| StoreError::Database(format!("delete count {count} out of u32 range")))
+                .map_err(|_| StoreError::Database(format!("delete count {count} out of u32 range").into()))
         })
         .await
     }
@@ -1943,7 +2072,7 @@ impl ProtocolStore for Store {
                 )
                 .map_err(db_err)?;
             u32::try_from(count)
-                .map_err(|_| StoreError::Database(format!("delete count {count} out of u32 range")))
+                .map_err(|_| StoreError::Database(format!("delete count {count} out of u32 range").into()))
         })
         .await
     }

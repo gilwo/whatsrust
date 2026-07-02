@@ -161,8 +161,9 @@ async fn send_receipt(
         }
     };
     let group_sender = participant.and_then(|p| wacore_binary::jid::Jid::from_str(p).ok());
+    let msg_id_refs: Vec<&str> = msg_ids.iter().map(|s| s.as_str()).collect();
     if let Err(e) = client
-        .mark_as_read(&chat, group_sender.as_ref(), msg_ids)
+        .mark_as_read(&chat, group_sender.as_ref(), &msg_id_refs)
         .await
     {
         warn!(error = %e, chat = chat_jid, "failed to send batched read receipt");

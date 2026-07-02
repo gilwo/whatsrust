@@ -38,16 +38,15 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# whatsapp-rust — 199-biotechnologies fork, rev-pinned
+# whatsapp-rust — oxidezap upstream main HEAD (rev 9e8c70e2, fixes #731 DM-send bug + post-v0.6.0 improvements)
 # We skip the default sqlite-storage feature to avoid Diesel/libsqlite3-sys conflicts.
 # Our own rusqlite backend (src/storage.rs) replaces it.
-# For local dev, .cargo/config.toml patches these to ../whatsapp-rust path deps.
-whatsapp-rust = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33", default-features = false, features = ["tokio-runtime", "tokio-transport", "ureq-client", "moka-cache", "simd", "signal", "tokio-native"] }
-wacore = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }
-wacore-binary = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }
-waproto = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }
-whatsapp-rust-tokio-transport = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }
-whatsapp-rust-ureq-http-client = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9e8c70e2fcadc8f52246c8336243504fea89edf6", default-features = false, features = ["tokio-runtime", "tokio-transport", "ureq-client", "simd", "signal", "tokio-native"] }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9e8c70e2fcadc8f52246c8336243504fea89edf6" }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9e8c70e2fcadc8f52246c8336243504fea89edf6" }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9e8c70e2fcadc8f52246c8336243504fea89edf6" }
+whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9e8c70e2fcadc8f52246c8336243504fea89edf6" }
+whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9e8c70e2fcadc8f52246c8336243504fea89edf6" }
 
 [profile.release]
 opt-level = "z"

@@ -113,6 +113,15 @@ async fn async_main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
+    // History sync is ENABLED by default: it delivers the trusted-contact tokens
+    // (tctokens) that WhatsApp requires to send 1:1 DMs (server nacks token-less
+    // DMs with `463 MissingTcToken`), plus pushname/nct_salt. The old "deaf client"
+    // rationale for skipping it is obsolete on the current wa-rs (history is processed
+    // on a dedicated worker off the live path). Set WHATSRUST_SKIP_HISTORY_SYNC=1 to
+    // opt out (leaner initial pairing; but 1:1 DMs will fail with 463). See ADR 0037.
+    let skip_history_sync = std::env::var("WHATSRUST_SKIP_HISTORY_SYNC")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let config = BridgeConfig {
         db_path: PathBuf::from("whatsapp.db"),
         pair_phone: std::env::var("WHATSAPP_PAIR_PHONE").ok(),
@@ -120,6 +129,7 @@ async fn async_main() -> Result<()> {
         health_port: api_port,
         backup_dir,
         send_burst,
+        skip_history_sync,
         ..Default::default()
     };
 
@@ -1549,6 +1559,7 @@ fn print_cli_help() {
     println!("  WHATSRUST_ALLOW_REMOTE=1  Permit non-loopback API binds");
     println!("  WHATSRUST_API_TOKEN  Optional API bearer token; required for remote binds");
     println!("  WHATSRUST_SEND_BURST     Max burst size before rate limit (default: 5)");
+    println!("  WHATSRUST_SKIP_HISTORY_SYNC=1  Skip history sync (leaner pairing, but 1:1 DMs fail with 463; default: off)");
     println!();
     println!("JID FORMAT:");
     println!("  Phone number: 15551234567 or 15551234567@s.whatsapp.net");
