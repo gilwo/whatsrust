@@ -2,7 +2,7 @@
 
 **Type:** Live document — kept up to date as features land. Update the **Status** of an
 item when work starts/completes; add a dated note in its row's detail.
-**Last updated:** 2026-07-01
+**Last updated:** 2026-07-03
 
 This is the single tracking surface for in-flight and planned work on this experimental
 fork. The *why* for each design lives in the ADRs (`docs/adr/`); the *what/how* blueprints
@@ -23,7 +23,11 @@ Per-chat historical backfill (`all` / `since:T` / `count:N`) + local FTS5 (lexic
 - **First step:** Phase 0 — wa-rs adoption, a HARD GO/NO-GO gate (ADR 0002). **✅ PASSED (GO).**
 - **Milestone tracking** (detailed phase/task plans written at each milestone's start, not before — gate-gated):
   - [x] **Phase 0 — GATE: GO** (2026-07-01, commit 615d185). Adopted wa-rs **main HEAD `9e8c70e2`** (not the v0.6.0 tag — the tag lacked the DM-send fix #731; HEAD is +315, all breaking changes handled). Verified: compile + **150 tests** + live smoke test (connect / receive / group send delivered+read / **1:1 send delivered** / history bootstrap). Live testing surfaced + fixed a `463 MissingTcToken` DM failure by **enabling history sync** (delivers trusted-contact tokens; ADR 0037). Known limitation: cold-outreach to non-contacts is WhatsApp-account-gated (`nct_salt`), not code-fixable. (ADR 0002/0037)
-  - [ ] **M1 — fetch + lexical search** (ships independently, no sidecar): storage+migration ⚠️prune-removal · fetch worker (single-FIFO, 3-level abort, contained-C, safety built-in) · FTS5 search · API/MCP + watchdog. (ADR 0003/0009/0010/0011/0013/0019/0020/0026/0027/0028-0036)
+  - [ ] **M1 — fetch + lexical search** (ships independently, no sidecar). Detailed plan: `docs/plans/2026-07-02-M1-detailed-plan.md`.
+    - [x] **M1.1 storage + migration** — DONE 2026-07-03. v8 `messages` table + FTS5 (external-content, BM25) + `'delete'`-command sync triggers; sibling tables (`media_refs`, `embeddings`, `backfill_cursor`, `backfill_jobs`, `metadata`); copy-then-drop v7→v8 migration; staged ceremony (fail-closed backup → FTS5 probe → migrate-in-TX → post-commit validation → circuit-breaker pin + `--rollback`/`--migrate` → watchdog baseline seed); **I2 age-prune removed**. 168 tests + real-data dry-run (Hebrew/Arabic FTS verified). (ADR 0009/0019/0027/0028-0032/0036)
+    - [ ] M1.2 fetch worker + safety/config (single-FIFO, 3-level abort, contained-C, dedicated pacer, daemon-side guards, dotenvy). (ADR 0003/0010/0020/0021/0022/0023/0026/0033/0035)
+    - [ ] M1.3 FTS5 lexical search (MATCH + BM25 `ORDER BY rank`, sanitization). (ADR 0019)
+    - [ ] M1.4 API/MCP trigger + watchdog (`/api/history-fetch`, `whatsrust_fetch_history`, SSE, growth watchdog). (ADR 0011/0013/0034/0036)
   - [ ] **M2 — semantic search** (layers on M1; = F2 below): sidecar + drain + cosine rerank. Phase breakdown deferred to M2 start. (ADR 0008/0015/0016/0017/0024)
 
 ### F2 — Embedder sidecar (implementation) 🔵 Designed

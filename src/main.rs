@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use bridge::{BridgeConfig, WhatsAppBridge};
+use storage::{MigrationMode, open_with_mode};
 use whatsrust::mcp;
 
 const MAX_LOCAL_MEDIA_READ_BYTES: u64 = 50 * 1024 * 1024;
@@ -71,6 +72,16 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // --rollback and --migrate are maintenance subcommands that operate on the DB
+    // directly (they must run BEFORE the daemon's instance lock and before cli_main,
+    // which would forward the command to a running daemon via HTTP).
+    if args.get(1).map(|s| s.as_str()) == Some("--rollback") {
+        return do_rollback(&args).await;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("--migrate") {
+        return do_force_migrate().await;
+    }
 
     // CLI mode: fire request to running daemon
     if args.len() > 1 {
@@ -1006,6 +1017,146 @@ async fn async_main() -> Result<()> {
     // parked in a read() syscall whenever stdin is an open terminal/pipe. The
     // runtime's drop would block forever waiting on that thread, so exit
     // explicitly instead of returning and hanging.
+    std::process::exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance subcommands: --rollback and --migrate
+// ---------------------------------------------------------------------------
+
+/// `whatsrust --rollback [--bak <path>]`
+///
+/// Acquires the instance lock, restores `whatsapp.db` from a `.bak` file,
+/// deletes stale WAL/SHM sidecars, and updates the migration pin to `rolled_back`.
+/// EXITS (does not start the daemon).
+async fn do_rollback(args: &[String]) -> Result<()> {
+    let db_path = PathBuf::from("whatsapp.db");
+
+    // Parse optional --bak <path>
+    let bak_path: Option<PathBuf> = {
+        let mut found = None;
+        let mut i = 2usize; // args[0]=binary, args[1]="--rollback"
+        while i < args.len() {
+            if args[i] == "--bak" {
+                if i + 1 < args.len() {
+                    found = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else {
+                    anyhow::bail!("--bak requires a path argument");
+                }
+            } else {
+                i += 1;
+            }
+        }
+        found
+    };
+
+    // Acquire instance lock (prevents concurrent daemon)
+    let _lock = instance_lock::InstanceLock::acquire(&db_path, Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("cannot acquire instance lock (daemon running?): {e}"))?;
+
+    // Verify migration pin exists
+    let pin = storage::read_migration_pin_pub(&db_path);
+    if pin.is_none() {
+        anyhow::bail!(
+            "--rollback is only valid after a failed migration (no migration-pin found at {}).\n\
+             Use --rollback only when a previous migration failed.",
+            storage::pin_path_pub(&db_path).display()
+        );
+    }
+
+    // Find backup file
+    let bak = match bak_path {
+        Some(p) => {
+            if !p.exists() {
+                anyhow::bail!("specified backup file does not exist: {}", p.display());
+            }
+            p
+        }
+        None => {
+            storage::find_newest_bak_pub(&db_path)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "no pre-migration backup found next to {}; specify one with --bak <path>",
+                    db_path.display()
+                ))?
+        }
+    };
+
+    eprintln!("whatsrust --rollback: restoring from {}", bak.display());
+
+    // Copy .bak → whatsapp.db
+    std::fs::copy(&bak, &db_path)
+        .map_err(|e| anyhow::anyhow!("failed to copy {} → {}: {e}", bak.display(), db_path.display()))?;
+
+    // Delete WAL and SHM sidecars (CRITICAL: stale post-migration WAL replaying onto
+    // restored old DB would corrupt it — treat NotFound as success).
+    for ext in &["-wal", "-shm"] {
+        let sidecar = {
+            let mut p = db_path.clone();
+            let name = format!(
+                "{}{}",
+                p.file_name().and_then(|n| n.to_str()).unwrap_or("whatsapp.db"),
+                ext
+            );
+            p.set_file_name(name);
+            p
+        };
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => eprintln!("whatsrust --rollback: deleted {}", sidecar.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("whatsrust --rollback: warning: failed to delete {}: {e}", sidecar.display()),
+        }
+    }
+
+    // Determine restored version by opening the restored DB
+    let restored_version: i64 = {
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| anyhow::anyhow!("cannot open restored DB to read version: {e}"))?;
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("cannot read user_version from restored DB: {e}"))?
+    };
+
+    // Update pin to state=rolled_back
+    storage::write_migration_pin_pub(&db_path, "rolled_back", restored_version)?;
+
+    eprintln!(
+        "whatsrust --rollback: DONE. DB restored to v{restored_version} from {}.\n\
+         \n\
+         WARNING: Any messages received after the failed migration upgrade are LOST.\n\
+         Run with the OLD binary (v{restored_version}) to continue, or use `whatsrust --migrate` \n\
+         to re-attempt migration with the current binary.",
+        bak.display()
+    );
+
+    std::process::exit(0);
+}
+
+/// `whatsrust --migrate`
+///
+/// Clears the circuit-breaker pin and starts the daemon normally (force migration retry).
+/// This is equivalent to normal daemon startup with `MigrationMode::ForceMigrate`.
+async fn do_force_migrate() -> Result<()> {
+    let db_path = PathBuf::from("whatsapp.db");
+
+    // Acquire instance lock
+    let _lock = instance_lock::InstanceLock::acquire(&db_path, Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("cannot acquire instance lock (daemon running?): {e}"))?;
+
+    eprintln!("whatsrust --migrate: clearing migration circuit-breaker pin and retrying...");
+
+    // open_with_mode with ForceMigrate clears the pin and proceeds normally
+    match open_with_mode(&db_path, MigrationMode::ForceMigrate) {
+        Ok(_store) => {
+            eprintln!("whatsrust --migrate: migration succeeded. Starting daemon normally...");
+        }
+        Err(e) => {
+            eprintln!("whatsrust --migrate: migration failed again: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // After successful forced migration, the DB is ready — exit (caller restarts daemon normally)
+    eprintln!("whatsrust --migrate: done. Restart without --migrate to run as daemon.");
     std::process::exit(0);
 }
 
