@@ -27,6 +27,18 @@ ALTER TABLE messages ADD COLUMN embed_status TEXT; -- NULL | 'pending' | 'embedd
 ALTER TABLE messages ADD COLUMN media_ref_id INTEGER REFERENCES media_refs(id);
 ```
 
+> **2026-07-02 correction (M1.1) — copy-then-drop, not RENAME.** `Store::new`
+> (`src/storage.rs`) runs the unconditional `CREATE TABLE IF NOT EXISTS …` SCHEMA blob
+> **before** `run_schema_migrations`. A literal `ALTER TABLE inbound_messages RENAME TO
+> messages` therefore collides with SCHEMA-first ordering: either the old table is silently
+> re-created empty on the next open, or the RENAME fails because SCHEMA already created
+> `messages`. **Resolution:** SCHEMA declares the v8 target (`messages` + siblings + FTS5,
+> all `IF NOT EXISTS`); the v7→v8 migration performs a guarded **copy-then-drop** —
+> `INSERT INTO messages (…) SELECT … FROM inbound_messages` (only if `inbound_messages`
+> exists and hasn't been copied), then `DROP TABLE inbound_messages`. Fresh-DB and upgrade
+> paths converge on one shape. The column set below is unchanged; only the mechanism differs.
+> See `docs/plans/2026-07-02-M1-detailed-plan.md` §0 F-A.
+
 **Live ingest becomes full writer:** persist media refs + mark embed_status=pending for new live messages (same path as backfill).
 
 **New sibling tables:**

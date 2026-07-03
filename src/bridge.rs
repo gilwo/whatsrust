@@ -1977,10 +1977,10 @@ async fn run_bridge(
                 tokio::select! {
                     _ = interval.tick() => {
                         // Prune sent/failed messages older than 24 hours
-                        match prune_store.prune_old_data(86400, 30 * 86400).await {
+                        match prune_store.prune_old_data(86400).await {
                             Ok(stats) => {
-                                if stats.sent_deleted > 0 || stats.inbound_deleted > 0 {
-                                    info!(sent = stats.sent_deleted, inbound = stats.inbound_deleted, "database pruned");
+                                if stats.sent_deleted > 0 {
+                                    info!(sent = stats.sent_deleted, "database pruned");
                                 }
                             }
                             Err(e) => warn!(error = %e, "database prune failed"),

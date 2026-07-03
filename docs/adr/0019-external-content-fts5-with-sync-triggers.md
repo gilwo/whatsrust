@@ -20,28 +20,42 @@ The unified `messages` table (ADR 0009) is the single source of truth for all me
 CREATE VIRTUAL TABLE messages_fts USING fts5(
     body_text,
     content='messages',
-    content_rowid='message_id',
+    content_rowid='id',
     tokenize='unicode61 remove_diacritics 2'
 );
 ```
 
 FTS index points at `messages.body_text`, no text duplication.
 
+> **2026-07-02 correction (M1.1):** Two fixes to the DDL below.
+> 1. `content_rowid` must be the table's **INTEGER** `PRIMARY KEY` alias (`id`), not the
+>    TEXT `message_id` column — an FTS5 external-content rowid is a rowid. Earlier drafts
+>    used `message_id`; the implementer spec (`docs/plans/2026-06-17-...-design.md`) already
+>    uses `id`, which is correct.
+> 2. The DELETE/UPDATE triggers must use the FTS5 **`'delete'` special-insert command with
+>    the *old* column values** — `INSERT INTO messages_fts(messages_fts, rowid, body_text)
+>    VALUES('delete', old.id, old.body_text)` — **not** a plain `DELETE FROM messages_fts` /
+>    `UPDATE messages_fts`. External-content tables don't store the indexed text, so FTS5
+>    needs the old values to reverse the index entries; a plain delete/update silently
+>    corrupts the index (the `rebuild` repair exists for exactly this failure). This is the
+>    canonical pattern from the SQLite FTS5 docs (§ "External Content Tables").
+
 **Maintained by standard AFTER INSERT/UPDATE/DELETE sync-trigger trio** on `messages`:
 ```sql
 -- INSERT: add to FTS
 CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, body_text) VALUES (new.message_id, new.body_text);
+    INSERT INTO messages_fts(rowid, body_text) VALUES (new.id, new.body_text);
 END;
 
--- UPDATE: update FTS
+-- UPDATE: reverse the OLD index entry, then insert the NEW one
 CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages BEGIN
-    UPDATE messages_fts SET body_text = new.body_text WHERE rowid = old.message_id;
+    INSERT INTO messages_fts(messages_fts, rowid, body_text) VALUES('delete', old.id, old.body_text);
+    INSERT INTO messages_fts(rowid, body_text) VALUES (new.id, new.body_text);
 END;
 
--- DELETE: remove from FTS
+-- DELETE: reverse the OLD index entry
 CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
-    DELETE FROM messages_fts WHERE rowid = old.message_id;
+    INSERT INTO messages_fts(messages_fts, rowid, body_text) VALUES('delete', old.id, old.body_text);
 END;
 ```
 
