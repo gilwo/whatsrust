@@ -1055,14 +1055,20 @@ async fn do_rollback(args: &[String]) -> Result<()> {
     let _lock = instance_lock::InstanceLock::acquire(&db_path, Duration::from_secs(2))
         .map_err(|e| anyhow::anyhow!("cannot acquire instance lock (daemon running?): {e}"))?;
 
-    // Verify migration pin exists
+    // Verify migration pin exists and is in "failed" state
     let pin = storage::read_migration_pin_pub(&db_path);
-    if pin.is_none() {
-        anyhow::bail!(
-            "--rollback is only valid after a failed migration (no migration-pin found at {}).\n\
-             Use --rollback only when a previous migration failed.",
+    match pin.as_ref().and_then(|p| p.get("state")).and_then(|s| s.as_str()) {
+        None => anyhow::bail!(
+            "--rollback is only valid after a failed migration (no migration-pin found at {}).",
             storage::pin_path_pub(&db_path).display()
-        );
+        ),
+        Some("failed") => { /* proceed */ }
+        Some(other) => anyhow::bail!(
+            "--rollback is only valid after a FAILED migration, but the pin state is '{other}'. \
+             If the DB was already rolled back, start normally or use `whatsrust --migrate` to retry; \
+             do not roll back a healthy database. Pin: {}",
+            storage::pin_path_pub(&db_path).display()
+        ),
     }
 
     // Find backup file

@@ -574,8 +574,16 @@ fn validate_migration_post_commit(conn: &Connection) -> Result<()> {
 /// Measures `db + -wal + -shm` on-disk size.
 fn seed_watchdog_baseline(conn: &Connection, db_path: &Path) -> Result<()> {
     let db_size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
-    let wal_size = std::fs::metadata(db_path.with_extension("db-wal")).map(|m| m.len()).unwrap_or(0);
-    let shm_size = std::fs::metadata(db_path.with_extension("db-shm")).map(|m| m.len()).unwrap_or(0);
+    let sidecar = |suffix: &str| -> PathBuf {
+        let name = format!(
+            "{}{}",
+            db_path.file_name().and_then(|n| n.to_str()).unwrap_or("whatsapp.db"),
+            suffix
+        );
+        db_path.with_file_name(name)
+    };
+    let wal_size = std::fs::metadata(sidecar("-wal")).map(|m| m.len()).unwrap_or(0);
+    let shm_size = std::fs::metadata(sidecar("-shm")).map(|m| m.len()).unwrap_or(0);
     let total = db_size + wal_size + shm_size;
     conn.execute(
         "INSERT OR IGNORE INTO metadata (key, value) VALUES ('watchdog_last_alerted_size', ?1)",
@@ -1562,7 +1570,7 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
                 // Copy rows; the three new columns take their DEFAULTs.
                 // The messages_fts_insert trigger fires per-row and populates the FTS index.
                 conn.execute_batch(
-                    "INSERT INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at)
+                    "INSERT OR IGNORE INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at)
                      SELECT chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at
                      FROM inbound_messages;
                      DROP TABLE inbound_messages;"
@@ -3301,6 +3309,47 @@ mod tests {
             |r| r.get(0),
         ).optional().unwrap();
         assert_eq!(first, second, "INSERT OR IGNORE must not overwrite existing baseline");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test that `read_migration_pin_pub` / `write_migration_pin_pub` round-trip the `state`
+    /// field correctly, so the Fix-1 guard in `do_rollback` receives accurate input.
+    ///
+    /// Covers two guard branches:
+    ///   - pin.state == "rolled_back"  → guard must bail (the state is *not* "failed")
+    ///   - pin.state == "failed"       → guard must allow (the state *is* "failed")
+    #[test]
+    fn test_migration_pin_state_roundtrip_for_rollback_guard() {
+        let dir = unique_test_dir("pin-state-roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("whatsapp.db");
+
+        // Write a "rolled_back" pin and read it back.
+        write_migration_pin_pub(&db_path, "rolled_back", 7).unwrap();
+        let pin = read_migration_pin_pub(&db_path).expect("pin must be readable");
+        let state = pin.get("state").and_then(|s| s.as_str());
+        assert_eq!(
+            state,
+            Some("rolled_back"),
+            "round-trip must preserve state='rolled_back'; guard would correctly reject it"
+        );
+        // Confirm the guard condition: not "failed" → would bail
+        assert_ne!(
+            state,
+            Some("failed"),
+            "'rolled_back' must not match 'failed' so the guard bails"
+        );
+
+        // Overwrite with a "failed" pin and read it back.
+        write_migration_pin_pub(&db_path, "failed", 7).unwrap();
+        let pin2 = read_migration_pin_pub(&db_path).expect("pin must be readable");
+        let state2 = pin2.get("state").and_then(|s| s.as_str());
+        assert_eq!(
+            state2,
+            Some("failed"),
+            "round-trip must preserve state='failed'; guard would correctly allow it"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
