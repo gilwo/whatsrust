@@ -908,6 +908,46 @@ pub struct PruneStats {
     pub sent_deleted: u32,
 }
 
+// ---------------------------------------------------------------------------
+// Backfill row structs
+// ---------------------------------------------------------------------------
+
+/// A row from the `backfill_jobs` table.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackfillJobRow {
+    pub id: i64,
+    pub chat_jid: String,
+    pub target_kind: String,
+    pub target_value: Option<i64>,
+    pub status: String,
+    pub fetched: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// A row from the `backfill_cursor` table.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackfillCursorRow {
+    pub chat_jid: String,
+    pub oldest_msg_id: Option<String>,
+    pub oldest_msg_from_me: Option<bool>,
+    pub oldest_msg_timestamp_ms: Option<i64>,
+    pub more_remain: bool,
+    pub exhausted: bool,
+    pub last_backfill_at: Option<i64>,
+}
+
+/// Outcome of `enqueue_backfill_job`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    /// Job was accepted; `job_id` is the new row's id.
+    Accepted { job_id: i64 },
+    /// A job for this chat is already active (queued/running/paused); `job_id` is the existing one.
+    AlreadyActive { job_id: i64 },
+    /// The chat's last backfill completed within the cooldown window.
+    Cooldown { retry_after_secs: i64 },
+}
+
 impl Store {
     /// Open (or create) the database at `path` and initialize the schema.
     /// Delegates to `open_with_mode(path, MigrationMode::Normal)`.
@@ -1404,6 +1444,321 @@ impl Store {
                 }
                 None => Ok(None),
             }
+        })
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Backfill job queue (ADR 0010/0033/0035)
+    // -----------------------------------------------------------------------
+
+    /// Atomically enqueue a backfill job for `chat_jid` with the given target.
+    ///
+    /// The entire check-and-insert runs in ONE `unchecked_transaction` closure
+    /// (ADR 0035 B5 — TOCTOU fix; mirrors `claim_next_job` atomicity):
+    ///
+    ///   BEGIN → check for active job → check cooldown → INSERT-or-reject → COMMIT
+    ///
+    /// Returns a structured `EnqueueOutcome` instead of an error for the two
+    /// rejection cases — they are normal back-pressure, not faults.
+    pub async fn enqueue_backfill_job(
+        &self,
+        chat_jid: &str,
+        target_kind: &str,
+        target_value: Option<i64>,
+        cooldown_secs: i64,
+    ) -> Result<EnqueueOutcome> {
+        let jid = chat_jid.to_owned();
+        let kind = target_kind.to_owned();
+        let ts = now_secs();
+        self.run(move |c| {
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+
+            // Check for an already-active job for this chat
+            let active: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM backfill_jobs
+                     WHERE chat_jid = ?1 AND status IN ('queued', 'running', 'paused')
+                     ORDER BY id LIMIT 1",
+                    params![jid],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_err)?;
+
+            if let Some(existing_id) = active {
+                tx.commit().map_err(db_err)?;
+                return Ok(EnqueueOutcome::AlreadyActive { job_id: existing_id });
+            }
+
+            // Check per-chat cooldown via backfill_cursor.last_backfill_at
+            if cooldown_secs > 0 {
+                let last_at: Option<i64> = tx
+                    .query_row(
+                        "SELECT last_backfill_at FROM backfill_cursor WHERE chat_jid = ?1",
+                        params![jid],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(db_err)?
+                    .flatten();
+
+                if let Some(last) = last_at {
+                    let elapsed = ts - last;
+                    if elapsed < cooldown_secs {
+                        let retry_after_secs = cooldown_secs - elapsed;
+                        tx.commit().map_err(db_err)?;
+                        return Ok(EnqueueOutcome::Cooldown { retry_after_secs });
+                    }
+                }
+            }
+
+            // Insert the new job
+            tx.execute(
+                "INSERT INTO backfill_jobs (chat_jid, target_kind, target_value, status, fetched, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?4)",
+                params![jid, kind, target_value, ts],
+            )
+            .map_err(db_err)?;
+
+            let job_id = tx.last_insert_rowid();
+            tx.commit().map_err(db_err)?;
+            Ok(EnqueueOutcome::Accepted { job_id })
+        })
+        .await
+    }
+
+    /// Atomically claim the next queued backfill job (FIFO by id), flipping it to `running`.
+    ///
+    /// Mirrors `claim_next_job` for the outbound queue.
+    pub async fn claim_next_backfill_job(&self) -> Result<Option<BackfillJobRow>> {
+        let ts = now_secs();
+        self.run(move |c| {
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            let row = tx
+                .query_row(
+                    "SELECT id, chat_jid, target_kind, target_value, status, fetched, created_at, updated_at
+                     FROM backfill_jobs
+                     WHERE status = 'queued'
+                     ORDER BY id LIMIT 1",
+                    [],
+                    |row| {
+                        Ok(BackfillJobRow {
+                            id: row.get(0)?,
+                            chat_jid: row.get(1)?,
+                            target_kind: row.get(2)?,
+                            target_value: row.get(3)?,
+                            status: row.get(4)?,
+                            fetched: row.get(5)?,
+                            created_at: row.get(6)?,
+                            updated_at: row.get(7)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(db_err)?;
+            if let Some(ref r) = row {
+                tx.execute(
+                    "UPDATE backfill_jobs SET status = 'running', updated_at = ?1 WHERE id = ?2",
+                    params![ts, r.id],
+                )
+                .map_err(db_err)?;
+            }
+            tx.commit().map_err(db_err)?;
+            Ok(row)
+        })
+        .await
+    }
+
+    /// Update the status of a backfill job.
+    ///
+    /// For terminal statuses (`done`, `failed`, `cancelled`) a CASE-guarded conditional
+    /// update is used so that a `cancelled` job cannot be silently overwritten to `done`
+    /// (ADR 0026 I6). Specifically: setting `done` or `failed` only applies if the
+    /// current status is still `running`; `cancelled` is always written (it may arrive
+    /// from any non-terminal state).
+    pub async fn mark_backfill_job(&self, id: i64, status: &str) -> Result<()> {
+        let st = status.to_owned();
+        let ts = now_secs();
+        self.run(move |c| {
+            // CASE guard: terminal "done"/"failed" must not overwrite "cancelled".
+            // "paused" and "cancelled" are written unconditionally within running jobs.
+            let sql = match st.as_str() {
+                "done" | "failed" => {
+                    "UPDATE backfill_jobs
+                     SET status = ?1, updated_at = ?2
+                     WHERE id = ?3 AND status != 'cancelled'"
+                }
+                _ => {
+                    "UPDATE backfill_jobs
+                     SET status = ?1, updated_at = ?2
+                     WHERE id = ?3"
+                }
+            };
+            c.execute(sql, params![st, ts, id]).map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Update the `fetched` counter and `updated_at` for a backfill job.
+    pub async fn update_backfill_fetched(&self, id: i64, fetched: u32) -> Result<()> {
+        let ts = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "UPDATE backfill_jobs SET fetched = ?1, updated_at = ?2 WHERE id = ?3",
+                params![fetched as i64, ts, id],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Fetch a single backfill job row by id.
+    pub async fn get_backfill_job(&self, id: i64) -> Result<Option<BackfillJobRow>> {
+        self.run(move |c| {
+            c.query_row(
+                "SELECT id, chat_jid, target_kind, target_value, status, fetched, created_at, updated_at
+                 FROM backfill_jobs WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(BackfillJobRow {
+                        id: row.get(0)?,
+                        chat_jid: row.get(1)?,
+                        target_kind: row.get(2)?,
+                        target_value: row.get(3)?,
+                        status: row.get(4)?,
+                        fetched: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    /// List backfill jobs. If `active_only` is true, only returns jobs with
+    /// status in (`queued`, `running`, `paused`).
+    pub async fn list_backfill_jobs(&self, active_only: bool) -> Result<Vec<BackfillJobRow>> {
+        self.run(move |c| {
+            let sql = if active_only {
+                "SELECT id, chat_jid, target_kind, target_value, status, fetched, created_at, updated_at
+                 FROM backfill_jobs
+                 WHERE status IN ('queued', 'running', 'paused')
+                 ORDER BY id"
+            } else {
+                "SELECT id, chat_jid, target_kind, target_value, status, fetched, created_at, updated_at
+                 FROM backfill_jobs
+                 ORDER BY id"
+            };
+            let mut stmt = c.prepare(sql).map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(BackfillJobRow {
+                        id: row.get(0)?,
+                        chat_jid: row.get(1)?,
+                        target_kind: row.get(2)?,
+                        target_value: row.get(3)?,
+                        status: row.get(4)?,
+                        fetched: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                })
+                .map_err(db_err)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)
+        })
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Backfill cursor
+    // -----------------------------------------------------------------------
+
+    /// Get the backfill cursor for a chat, if one exists.
+    pub async fn get_backfill_cursor(&self, chat_jid: &str) -> Result<Option<BackfillCursorRow>> {
+        let jid = chat_jid.to_owned();
+        self.run(move |c| {
+            c.query_row(
+                "SELECT chat_jid, oldest_msg_id, oldest_msg_from_me, oldest_msg_timestamp_ms,
+                        more_remain, exhausted, last_backfill_at
+                 FROM backfill_cursor WHERE chat_jid = ?1",
+                params![jid],
+                |row| {
+                    let from_me_raw: Option<i64> = row.get(2)?;
+                    let exhausted_raw: i64 = row.get(5)?;
+                    let more_remain_raw: i64 = row.get(4)?;
+                    Ok(BackfillCursorRow {
+                        chat_jid: row.get(0)?,
+                        oldest_msg_id: row.get(1)?,
+                        oldest_msg_from_me: from_me_raw.map(|v| v != 0),
+                        oldest_msg_timestamp_ms: row.get(3)?,
+                        more_remain: more_remain_raw != 0,
+                        exhausted: exhausted_raw != 0,
+                        last_backfill_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    /// Insert or update the backfill cursor for a chat.
+    ///
+    /// Anchor fields are passed separately (matching DB columns) so this method
+    /// has no dependency on the `backfill` module — keeping the storage layer lean.
+    ///
+    /// - `oldest_msg_id` / `oldest_msg_from_me` / `oldest_msg_timestamp_ms`: the pagination
+    ///   anchor (pass `None` for all three when creating a placeholder before the first batch).
+    /// - `more_remain`: whether more history is available (phone's signal).
+    /// - `exhausted`: whether history is fully exhausted.
+    /// - `last_backfill_at`: unix seconds of last completed job; pass `None` to leave unchanged.
+    pub async fn upsert_backfill_cursor(
+        &self,
+        chat_jid: &str,
+        oldest_msg_id: Option<&str>,
+        oldest_msg_from_me: Option<bool>,
+        oldest_msg_timestamp_ms: Option<i64>,
+        more_remain: bool,
+        exhausted: bool,
+        last_backfill_at: Option<i64>,
+    ) -> Result<()> {
+        let jid = chat_jid.to_owned();
+        let mid = oldest_msg_id.map(|s| s.to_owned());
+        let from_me = oldest_msg_from_me.map(|v| if v { 1i64 } else { 0i64 });
+        let more_remain_i = if more_remain { 1i64 } else { 0i64 };
+        let exhausted_i = if exhausted { 1i64 } else { 0i64 };
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO backfill_cursor
+                     (chat_jid, oldest_msg_id, oldest_msg_from_me, oldest_msg_timestamp_ms,
+                      more_remain, exhausted, last_backfill_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(chat_jid) DO UPDATE SET
+                     oldest_msg_id           = excluded.oldest_msg_id,
+                     oldest_msg_from_me      = excluded.oldest_msg_from_me,
+                     oldest_msg_timestamp_ms = excluded.oldest_msg_timestamp_ms,
+                     more_remain             = excluded.more_remain,
+                     exhausted               = excluded.exhausted,
+                     last_backfill_at        = COALESCE(excluded.last_backfill_at, last_backfill_at)",
+                params![
+                    jid,
+                    mid,
+                    from_me,
+                    oldest_msg_timestamp_ms,
+                    more_remain_i,
+                    exhausted_i,
+                    last_backfill_at,
+                ],
+            )
+            .map_err(db_err)?;
+            Ok(())
         })
         .await
     }
@@ -3350,6 +3705,353 @@ mod tests {
             Some("failed"),
             "round-trip must preserve state='failed'; guard would correctly allow it"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // Backfill storage tests (Wave A — ADR 0010/0033/0035)
+    // -------------------------------------------------------------------------
+
+    /// Helper: open a fresh temp Store for backfill tests.
+    fn open_backfill_store(name: &str) -> (Store, std::path::PathBuf) {
+        let dir = unique_test_dir(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("wa.db");
+        let store = Store::new(&db_path).unwrap();
+        (store, dir)
+    }
+
+    /// (bf-1) First enqueue is accepted; second enqueue for same chat returns AlreadyActive.
+    #[tokio::test]
+    async fn test_backfill_enqueue_first_accepted_second_already_active() {
+        let (store, dir) = open_backfill_store("bf-enqueue-dedup");
+
+        let outcome1 = store
+            .enqueue_backfill_job("chat1@s.whatsapp.net", "all", None, 0)
+            .await
+            .unwrap();
+        let job_id = match outcome1 {
+            EnqueueOutcome::Accepted { job_id } => job_id,
+            other => panic!("expected Accepted, got {:?}", other),
+        };
+        assert!(job_id > 0);
+
+        // Second enqueue for same chat → AlreadyActive
+        let outcome2 = store
+            .enqueue_backfill_job("chat1@s.whatsapp.net", "count", Some(50), 0)
+            .await
+            .unwrap();
+        match outcome2 {
+            EnqueueOutcome::AlreadyActive { job_id: existing_id } => {
+                assert_eq!(existing_id, job_id, "AlreadyActive must report the existing job id");
+            }
+            other => panic!("expected AlreadyActive, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-2) Enqueue within cooldown window → Cooldown.
+    #[tokio::test]
+    async fn test_backfill_enqueue_cooldown() {
+        let (store, dir) = open_backfill_store("bf-cooldown");
+
+        // Seed a cursor with last_backfill_at = now (simulating just-finished job)
+        let ts = now_secs();
+        store
+            .upsert_backfill_cursor("chat2@s.whatsapp.net", None, None, None, false, true, Some(ts))
+            .await
+            .unwrap();
+
+        // Enqueue with cooldown_secs = 3600 (1 hour)
+        let outcome = store
+            .enqueue_backfill_job("chat2@s.whatsapp.net", "all", None, 3600)
+            .await
+            .unwrap();
+        match outcome {
+            EnqueueOutcome::Cooldown { retry_after_secs } => {
+                // retry_after_secs should be close to 3600 (we just set last_backfill_at = now)
+                assert!(retry_after_secs > 0 && retry_after_secs <= 3600,
+                    "retry_after_secs={} expected in (0, 3600]", retry_after_secs);
+            }
+            other => panic!("expected Cooldown, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-3) Cooldown is not triggered after the window expires.
+    #[tokio::test]
+    async fn test_backfill_enqueue_after_cooldown_expired() {
+        let (store, dir) = open_backfill_store("bf-cooldown-expired");
+
+        // Seed a cursor with last_backfill_at far in the past
+        let old_ts = now_secs() - 7200; // 2 hours ago
+        store
+            .upsert_backfill_cursor("chat3@s.whatsapp.net", None, None, None, false, true, Some(old_ts))
+            .await
+            .unwrap();
+
+        // Enqueue with cooldown_secs = 3600 (1 hour) — should pass
+        let outcome = store
+            .enqueue_backfill_job("chat3@s.whatsapp.net", "all", None, 3600)
+            .await
+            .unwrap();
+        match outcome {
+            EnqueueOutcome::Accepted { .. } => {}
+            other => panic!("expected Accepted after cooldown expired, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-4) claim_next_backfill_job: FIFO order, flips to running.
+    #[tokio::test]
+    async fn test_backfill_claim_fifo_and_running() {
+        let (store, dir) = open_backfill_store("bf-claim");
+
+        // Enqueue two jobs for different chats
+        let out1 = store
+            .enqueue_backfill_job("chatA@s.whatsapp.net", "all", None, 0)
+            .await
+            .unwrap();
+        let id1 = match out1 {
+            EnqueueOutcome::Accepted { job_id } => job_id,
+            other => panic!("{:?}", other),
+        };
+
+        let out2 = store
+            .enqueue_backfill_job("chatB@s.whatsapp.net", "count", Some(100), 0)
+            .await
+            .unwrap();
+        let id2 = match out2 {
+            EnqueueOutcome::Accepted { job_id } => job_id,
+            other => panic!("{:?}", other),
+        };
+
+        // Claim first → should get job with smaller id (FIFO)
+        let claimed1 = store.claim_next_backfill_job().await.unwrap().unwrap();
+        assert_eq!(claimed1.id, id1, "FIFO: first claimed must be the first enqueued");
+        // Re-fetch to verify the DB was updated to 'running'
+        let row1 = store.get_backfill_job(claimed1.id).await.unwrap().unwrap();
+        assert_eq!(row1.status, "running", "claimed job must be running in DB");
+
+        // Claim second → should get job id2
+        let claimed2 = store.claim_next_backfill_job().await.unwrap().unwrap();
+        assert_eq!(claimed2.id, id2);
+        let row2 = store.get_backfill_job(claimed2.id).await.unwrap().unwrap();
+        assert_eq!(row2.status, "running");
+
+        // No more queued jobs
+        let none = store.claim_next_backfill_job().await.unwrap();
+        assert!(none.is_none(), "no more queued jobs to claim");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-5) cursor upsert + get round-trip, including advancing anchor + setting exhausted.
+    #[tokio::test]
+    async fn test_backfill_cursor_upsert_and_get() {
+        let (store, dir) = open_backfill_store("bf-cursor");
+
+        // Initial insert — no anchor yet
+        store
+            .upsert_backfill_cursor(
+                "chatX@s.whatsapp.net",
+                None,
+                None,
+                None,
+                true,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let row1 = store
+            .get_backfill_cursor("chatX@s.whatsapp.net")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row1.chat_jid, "chatX@s.whatsapp.net");
+        assert!(row1.oldest_msg_id.is_none());
+        assert!(row1.more_remain);
+        assert!(!row1.exhausted);
+        assert!(row1.last_backfill_at.is_none());
+
+        // Advance anchor
+        let ts = now_secs();
+        store
+            .upsert_backfill_cursor(
+                "chatX@s.whatsapp.net",
+                Some("msg-oldest-123"),
+                Some(false),
+                Some(1_700_000_000_000),
+                false,
+                true,
+                Some(ts),
+            )
+            .await
+            .unwrap();
+
+        let row2 = store
+            .get_backfill_cursor("chatX@s.whatsapp.net")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row2.oldest_msg_id.as_deref(), Some("msg-oldest-123"));
+        assert_eq!(row2.oldest_msg_from_me, Some(false));
+        assert_eq!(row2.oldest_msg_timestamp_ms, Some(1_700_000_000_000));
+        assert!(!row2.more_remain);
+        assert!(row2.exhausted);
+        assert_eq!(row2.last_backfill_at, Some(ts));
+
+        // Missing chat → None
+        let missing = store.get_backfill_cursor("nobody@s.whatsapp.net").await.unwrap();
+        assert!(missing.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-6) CASE guard: a cancelled job must not be overwritten to done.
+    #[tokio::test]
+    async fn test_backfill_mark_job_case_guard_cancelled_not_overwritten() {
+        let (store, dir) = open_backfill_store("bf-case-guard");
+
+        let out = store
+            .enqueue_backfill_job("chatGuard@g.us", "all", None, 0)
+            .await
+            .unwrap();
+        let job_id = match out {
+            EnqueueOutcome::Accepted { job_id } => job_id,
+            other => panic!("{:?}", other),
+        };
+
+        // Claim it (flips to running)
+        let _claimed = store.claim_next_backfill_job().await.unwrap().unwrap();
+
+        // Cancel it
+        store.mark_backfill_job(job_id, "cancelled").await.unwrap();
+        let row_after_cancel = store.get_backfill_job(job_id).await.unwrap().unwrap();
+        assert_eq!(row_after_cancel.status, "cancelled");
+
+        // Attempt to mark it done — CASE guard must block this
+        store.mark_backfill_job(job_id, "done").await.unwrap();
+        let row_after_done = store.get_backfill_job(job_id).await.unwrap().unwrap();
+        assert_eq!(
+            row_after_done.status, "cancelled",
+            "cancelled job must not be overwritten to done (CASE guard)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-7) mark_backfill_job: failed also obeys CASE guard vs cancelled.
+    #[tokio::test]
+    async fn test_backfill_mark_job_failed_case_guard() {
+        let (store, dir) = open_backfill_store("bf-case-guard-failed");
+
+        let out = store
+            .enqueue_backfill_job("chatFail@g.us", "count", Some(100), 0)
+            .await
+            .unwrap();
+        let job_id = match out {
+            EnqueueOutcome::Accepted { job_id } => job_id,
+            other => panic!("{:?}", other),
+        };
+        let _claimed = store.claim_next_backfill_job().await.unwrap().unwrap();
+
+        // Cancel, then try to mark failed
+        store.mark_backfill_job(job_id, "cancelled").await.unwrap();
+        store.mark_backfill_job(job_id, "failed").await.unwrap();
+        let row = store.get_backfill_job(job_id).await.unwrap().unwrap();
+        assert_eq!(row.status, "cancelled", "failed must not overwrite cancelled");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-8) update_backfill_fetched advances the counter correctly.
+    #[tokio::test]
+    async fn test_backfill_update_fetched() {
+        let (store, dir) = open_backfill_store("bf-fetched");
+
+        let out = store
+            .enqueue_backfill_job("chatFetch@s.whatsapp.net", "count", Some(500), 0)
+            .await
+            .unwrap();
+        let job_id = match out {
+            EnqueueOutcome::Accepted { job_id } => job_id,
+            other => panic!("{:?}", other),
+        };
+
+        store.update_backfill_fetched(job_id, 250).await.unwrap();
+        let row = store.get_backfill_job(job_id).await.unwrap().unwrap();
+        assert_eq!(row.fetched, 250);
+
+        store.update_backfill_fetched(job_id, 500).await.unwrap();
+        let row2 = store.get_backfill_job(job_id).await.unwrap().unwrap();
+        assert_eq!(row2.fetched, 500);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-9) list_backfill_jobs: active_only vs all.
+    #[tokio::test]
+    async fn test_backfill_list_jobs() {
+        let (store, dir) = open_backfill_store("bf-list");
+
+        // Two chats, two jobs
+        let out1 = store
+            .enqueue_backfill_job("listA@s.whatsapp.net", "all", None, 0)
+            .await
+            .unwrap();
+        let id1 = match out1 {
+            EnqueueOutcome::Accepted { job_id } => job_id,
+            other => panic!("{:?}", other),
+        };
+        store
+            .enqueue_backfill_job("listB@s.whatsapp.net", "count", Some(50), 0)
+            .await
+            .unwrap();
+
+        // Mark first job done
+        let _claimed = store.claim_next_backfill_job().await.unwrap();
+        store.mark_backfill_job(id1, "done").await.unwrap();
+
+        // active_only should return only the queued job (listB)
+        let active = store.list_backfill_jobs(true).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].chat_jid, "listB@s.whatsapp.net");
+
+        // all should return both
+        let all = store.list_backfill_jobs(false).await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-10) upsert_backfill_cursor: last_backfill_at=None does not overwrite existing value.
+    #[tokio::test]
+    async fn test_backfill_cursor_none_last_backfill_at_preserves_existing() {
+        let (store, dir) = open_backfill_store("bf-cursor-preserve-ts");
+
+        let ts = now_secs();
+        // Insert with a known last_backfill_at
+        store
+            .upsert_backfill_cursor("chatP@s.whatsapp.net", None, None, None, true, false, Some(ts))
+            .await
+            .unwrap();
+
+        // Update with None for last_backfill_at — must keep the existing value
+        store
+            .upsert_backfill_cursor("chatP@s.whatsapp.net", Some("msg-x"), Some(true), Some(999), false, false, None)
+            .await
+            .unwrap();
+
+        let row = store.get_backfill_cursor("chatP@s.whatsapp.net").await.unwrap().unwrap();
+        assert_eq!(row.last_backfill_at, Some(ts), "last_backfill_at must be preserved when None is passed");
+        assert_eq!(row.oldest_msg_id.as_deref(), Some("msg-x"), "anchor must be updated");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

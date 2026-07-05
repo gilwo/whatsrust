@@ -1,4 +1,5 @@
 pub mod api;
+pub mod backfill;
 pub mod bridge;
 pub mod bridge_events;
 pub mod dedup;
