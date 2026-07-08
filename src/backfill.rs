@@ -31,10 +31,15 @@ use waproto::whatsapp as wa;
 
 /// The oldest known message position for a chat — used as the pagination anchor
 /// when requesting history older than what we have.
+///
+/// `oldest_msg_timestamp_ms` is Unix **milliseconds** (proto `messageTimestamp`
+/// is seconds; `oldest_anchor()` scales by ×1000). This matches the wa-rs
+/// `oldestMsgTimestampMs` fetch field and `FetchTarget::Since(ts_ms)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
     pub oldest_msg_id: String,
     pub oldest_msg_from_me: bool,
+    /// Unix timestamp of the oldest known message in **milliseconds**.
     pub oldest_msg_timestamp_ms: i64,
 }
 
@@ -157,6 +162,7 @@ impl HistorySource for FakeHistorySource {
 ///
 /// Exactly ONE kind per job (clean discriminator, not ambiguous composition):
 /// - `Since(ts_ms)` — fetch until oldest message crosses `ts_ms` OR phone exhausted.
+///   `ts_ms` is Unix **milliseconds** — consistent with `Anchor.oldest_msg_timestamp_ms`.
 ///   Auto-continues across paged segments.
 /// - `All`          — fetch until phone exhausted. Auto-continues.
 /// - `Count(n)`     — fetch until `n` messages fetched. Does NOT auto-continue.
@@ -166,7 +172,8 @@ impl HistorySource for FakeHistorySource {
 /// `Count` is already bounded and never parks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchTarget {
-    Since(i64 /* ts_ms */),
+    /// Fetch until the oldest seen message timestamp is at or before this value (ms).
+    Since(i64 /* ts_ms — Unix milliseconds */),
     All,
     Count(u32),
 }
@@ -237,7 +244,8 @@ pub enum BackfillStep {
 /// # Parameters
 /// - `target`            — the job's fetch target
 /// - `fetched`           — total messages fetched so far (including this batch)
-/// - `batch_oldest_ts_ms`— timestamp of the oldest message in the batch, if any
+/// - `batch_oldest_ts_ms`— timestamp (Unix **milliseconds**) of the oldest message in the
+///                         batch, if any. Must be consistent with `FetchTarget::Since(ts_ms)`.
 /// - `more_remain`       — whether the phone indicated more history is available
 /// - `backstop`          — autonomy backstop (global config, max messages for Since/All);
 ///                         `0` means "no backstop — never park"
@@ -491,22 +499,28 @@ pub enum JobEnd {
 /// time). If two messages share the same timestamp, ties are broken by lowest
 /// key.id (lexicographic) — deterministic but arbitrary.
 ///
+/// `WebMessageInfo.messageTimestamp` is Unix **seconds** (proto `uint64`).
+/// The returned `Anchor.oldest_msg_timestamp_ms` is scaled to **milliseconds**
+/// (multiply by 1000) because `FetchTarget::Since(ts_ms)` and the wa-rs
+/// fetch request field `oldestMsgTimestampMs` are millisecond-based.
+///
 /// Returns `None` if the batch has no messages or none have a key.
 fn oldest_anchor(batch: &HistoryBatch) -> Option<Anchor> {
     batch
         .messages
         .iter()
         .filter_map(|m| {
-            let ts = m.message_timestamp? as i64;
+            // message_timestamp is seconds — scale to ms for the anchor.
+            let ts_ms = (m.message_timestamp? as i64).saturating_mul(1000);
             let id = m.key.id.clone()?;
             let from_me = m.key.from_me.unwrap_or(false);
-            Some((ts, id, from_me))
+            Some((ts_ms, id, from_me))
         })
-        .min_by_key(|(ts, id, _)| (*ts, id.clone()))
-        .map(|(ts, id, from_me)| Anchor {
+        .min_by_key(|(ts_ms, id, _)| (*ts_ms, id.clone()))
+        .map(|(ts_ms, id, from_me)| Anchor {
             oldest_msg_id: id,
             oldest_msg_from_me: from_me,
-            oldest_msg_timestamp_ms: ts,
+            oldest_msg_timestamp_ms: ts_ms,
         })
 }
 
@@ -524,8 +538,12 @@ fn oldest_anchor(batch: &HistoryBatch) -> Option<Anchor> {
 /// this default is sufficient — `FakeHistorySource` ignores the anchor value.
 ///
 /// # Cancel semantics (ADR 0026)
-/// `cancel` here is a per-job cancellation token (API-cancel). The outer
-/// shutdown token is handled by `run_worker_loop` at the job-dispatch level.
+/// In B1, `cancel` is the **single shutdown token** (passed through from
+/// `run_worker_loop`). When it fires, `process_job` returns `Cancelled` and
+/// the worker requeues the job for resumption after restart.
+/// Wave B2 will add a separate per-job API-cancel token so that an operator
+/// `DELETE /backfill/{id}` can permanently cancel a job without affecting the
+/// shutdown path.
 /// When this cancel fires, the job is marked `Cancelled`.
 pub async fn process_job(
     job: &crate::storage::BackfillJobRow,
@@ -537,6 +555,11 @@ pub async fn process_job(
     backstop: u32,
     cancel: &CancellationToken,
 ) -> anyhow::Result<JobEnd> {
+    // --- 0. Validate inputs ---
+    if batch_size <= 0 {
+        return Ok(JobEnd::Failed(format!("invalid batch_size: {batch_size}")));
+    }
+
     // --- 1. Parse the target ---
     let target = match FetchTarget::parse(&job.target_kind, job.target_value) {
         Ok(t) => t,
@@ -626,12 +649,39 @@ pub async fn process_job(
         // 3d. Update fetched count (use batch.messages.len() not inserted, to count toward target)
         fetched = fetched.saturating_add(batch_msg_count as u32);
 
-        // 3e. Compute new anchor from the oldest message in this batch
+        // 3e. Compute new anchor from the oldest message in this batch.
+        //
+        // NOTE (Wave B2): before calling process_job the caller must seed a real
+        // initial anchor from the live message frontier. The sentinel anchor
+        // ("", ts 0) used when no cursor exists is only safe for FakeHistorySource
+        // tests where the anchor value is ignored.
         let new_anchor = oldest_anchor(&batch);
 
-        // 3f. Stuck-anchor guard (R2, ADR 0026)
+        // 3e-i. No-progress terminal: if the batch yielded no derivable anchor
+        // (empty batch or all messages lack a key/timestamp), there is nothing to
+        // page further — mark exhausted and return Done.  This avoids a spin on
+        // repeated empty batches and the all-key-less case (Fix 4a).
+        if new_anchor.is_none() {
+            let _ = store
+                .upsert_backfill_cursor(
+                    &job.chat_jid,
+                    Some(&anchor.oldest_msg_id),
+                    Some(anchor.oldest_msg_from_me),
+                    Some(anchor.oldest_msg_timestamp_ms),
+                    false,
+                    true, // exhausted — nothing to page further
+                    Some(now_unix_secs()),
+                )
+                .await;
+            return Ok(JobEnd::Done);
+        }
+
+        // 3f. Stuck-anchor guard (R2, ADR 0026).
+        // With Fix 4a handling the None case above, we only reach here with a
+        // Some anchor, so the empty-id special-case is removed: any repeated
+        // anchor id (including "") triggers the K=2 stuck guard.
         let anchor_id_for_check = new_anchor.as_ref().map(|a| a.oldest_msg_id.as_str()).unwrap_or("");
-        if anchor_id_for_check == last_anchor_id.as_str() && !anchor_id_for_check.is_empty() {
+        if anchor_id_for_check == last_anchor_id.as_str() {
             consecutive_same_anchor += 1;
             if consecutive_same_anchor >= STUCK_K {
                 return Ok(JobEnd::Failed("anchor not advancing".to_string()));
@@ -649,21 +699,21 @@ pub async fn process_job(
             anchor = na.clone();
         }
 
-        // 3h. Persist progress: cursor + fetched counter in one logical step
-        {
-            let _ = store
-                .upsert_backfill_cursor(
-                    &job.chat_jid,
-                    Some(&anchor.oldest_msg_id),
-                    Some(anchor.oldest_msg_from_me),
-                    Some(anchor.oldest_msg_timestamp_ms),
-                    more_remain,
-                    exhausted,
-                    None,
-                )
-                .await;
-            let _ = store.update_backfill_fetched(job.id, fetched).await;
-        }
+        // 3h. Persist progress: cursor UPSERT + fetched counter in one atomic TX
+        // (Fix 7 — record_backfill_progress wraps both in unchecked_transaction).
+        let _ = store
+            .record_backfill_progress(
+                job.id,
+                &job.chat_jid,
+                Some(&anchor.oldest_msg_id),
+                Some(anchor.oldest_msg_from_me),
+                Some(anchor.oldest_msg_timestamp_ms),
+                more_remain,
+                exhausted,
+                None,
+                fetched,
+            )
+            .await;
 
         // 3i. Evaluate the target
         let batch_oldest_ts = new_anchor.as_ref().map(|a| a.oldest_msg_timestamp_ms);
@@ -671,20 +721,21 @@ pub async fn process_job(
 
         match step {
             BackfillStep::Done => {
-                // Mark exhausted if history is fully consumed
-                if !more_remain {
-                    let _ = store
-                        .upsert_backfill_cursor(
-                            &job.chat_jid,
-                            Some(&anchor.oldest_msg_id),
-                            Some(anchor.oldest_msg_from_me),
-                            Some(anchor.oldest_msg_timestamp_ms),
-                            false,
-                            true, // exhausted
-                            Some(now_unix_secs()),
-                        )
-                        .await;
-                }
+                // Stamp last_backfill_at on every Done exit (ADR 0035) so that
+                // Count(n) and Since-crossing completions also trigger the cooldown.
+                // exhausted is true only when the phone signals no more history.
+                let exhausted = !more_remain;
+                let _ = store
+                    .upsert_backfill_cursor(
+                        &job.chat_jid,
+                        Some(&anchor.oldest_msg_id),
+                        Some(anchor.oldest_msg_from_me),
+                        Some(anchor.oldest_msg_timestamp_ms),
+                        more_remain,
+                        exhausted,
+                        Some(now_unix_secs()),
+                    )
+                    .await;
                 return Ok(JobEnd::Done);
             }
             BackfillStep::Parked => {
@@ -1219,6 +1270,8 @@ mod tests {
 
     #[test]
     fn test_oldest_anchor_picks_smallest_timestamp() {
+        // make_msg uses ts_secs; oldest_anchor scales to ms (×1000).
+        // msg-old has ts_secs=1_000 → expected oldest_msg_timestamp_ms = 1_000_000 ms.
         let batch = HistoryBatch {
             messages: vec![
                 make_msg("msg-old", false, 1_000),
@@ -1230,7 +1283,8 @@ mod tests {
         };
         let a = oldest_anchor(&batch).expect("should find oldest");
         assert_eq!(a.oldest_msg_id, "msg-old");
-        assert_eq!(a.oldest_msg_timestamp_ms, 1_000);
+        // ts_secs=1_000 → ms=1_000_000 (oldest_anchor scales seconds→ms)
+        assert_eq!(a.oldest_msg_timestamp_ms, 1_000_000);
     }
 
     #[test]
@@ -1338,9 +1392,10 @@ mod tests {
     #[tokio::test]
     async fn test_process_job_since_target() {
         let (store, dir) = open_b1_store("since-target");
-        // Target: fetch until oldest message is at or before ts=1000
-        // Batch 1 oldest ts=3000 (> 1000) → Continue
-        // Batch 2 oldest ts=800 (< 1000) → Done
+        // Target: fetch until oldest message is at or before ts_ms = 1_000_000 ms (= 1000 secs).
+        // make_msg produces messageTimestamp in seconds; oldest_anchor scales to ms (×1000).
+        // Batch 1: oldest ts_secs=3_000 → anchor_ms=3_000_000 > 1_000_000 → Continue
+        // Batch 2: oldest ts_secs=800   → anchor_ms=  800_000 < 1_000_000 → Done
         let source = FakeHistorySource::new(vec![
             FakeResponse::Batch {
                 messages: vec![make_msg("s2", false, 3_000), make_msg("s3", false, 5_000)],
@@ -1354,7 +1409,8 @@ mod tests {
             },
         ]);
         let sink = FakeBatchSink::always_ok();
-        let job = enqueue_and_claim(&store, "since-chat@s.whatsapp.net", "since", Some(1000)).await;
+        // Since target value is milliseconds: 1000 secs × 1000 = 1_000_000 ms
+        let job = enqueue_and_claim(&store, "since-chat@s.whatsapp.net", "since", Some(1_000_000)).await;
         let cancel = CancellationToken::new();
 
         let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
@@ -1821,6 +1877,204 @@ mod tests {
 
         assert_eq!(end, JobEnd::Done);
         assert!(sink.recorded_calls().is_empty(), "no batch must be persisted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
+    // New tests for Fix 2, Fix 3, Fix 4, Fix 5, Fix 7
+    // =========================================================================
+
+    // --- Fix 2: mark_backfill_job must not overwrite 'cancelled' with 'paused'/'queued' ---
+
+    #[tokio::test]
+    async fn test_mark_backfill_job_paused_queued_do_not_overwrite_cancelled() {
+        let (store, dir) = open_b1_store("cancel-guard");
+
+        // Enqueue and claim a job, then manually set it to 'cancelled'
+        let outcome = store.enqueue_backfill_job("guard-chat@s.whatsapp.net", "all", None, 0)
+            .await.unwrap();
+        let job_id = match outcome {
+            EnqueueOutcome::Accepted { job_id } => job_id,
+            other => panic!("expected Accepted, got {:?}", other),
+        };
+        // Claim it (→ running)
+        store.claim_next_backfill_job().await.unwrap().expect("must claim");
+        // Cancel it
+        store.mark_backfill_job(job_id, "cancelled").await.unwrap();
+
+        // Attempt to write 'paused' — must be a no-op (job stays 'cancelled')
+        store.mark_backfill_job(job_id, "paused").await.unwrap();
+        let row = store.get_backfill_job(job_id).await.unwrap().unwrap();
+        assert_eq!(row.status, "cancelled",
+            "paused must not overwrite cancelled, got '{}'", row.status);
+
+        // Attempt to write 'queued' — must also be a no-op
+        store.mark_backfill_job(job_id, "queued").await.unwrap();
+        let row = store.get_backfill_job(job_id).await.unwrap().unwrap();
+        assert_eq!(row.status, "cancelled",
+            "queued must not overwrite cancelled, got '{}'", row.status);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Fix 3: last_backfill_at is stamped on Count(n) completion (more_remain=true) ---
+
+    #[tokio::test]
+    async fn test_process_job_count_completion_stamps_last_backfill_at() {
+        let (store, dir) = open_b1_store("count-cooldown");
+
+        // Count(2): two messages in one batch → Done with more_remain=true
+        let source = FakeHistorySource::new(vec![FakeResponse::Batch {
+            messages: vec![make_msg("c1", false, 1_000), make_msg("c2", false, 2_000)],
+            more_remain: true, // history not exhausted — this is a Count(n) stop
+            progress: None,
+        }]);
+        let sink = FakeBatchSink::always_ok();
+        let job = enqueue_and_claim(&store, "count-cool@s.whatsapp.net", "count", Some(2)).await;
+        let cancel = CancellationToken::new();
+
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+            .await.unwrap();
+
+        assert_eq!(end, JobEnd::Done);
+
+        // Cursor must have last_backfill_at set (Fix 3: always stamp on Done)
+        let cursor = store.get_backfill_cursor("count-cool@s.whatsapp.net").await.unwrap().unwrap();
+        assert!(
+            cursor.last_backfill_at.is_some(),
+            "last_backfill_at must be set on Count(n) Done with more_remain=true"
+        );
+        // exhausted must be false — more_remain=true means history is not exhausted
+        assert!(!cursor.exhausted, "cursor must NOT be exhausted when more_remain=true");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Fix 4: batch with no derivable anchor → Done + exhausted (not a spin) ---
+
+    #[tokio::test]
+    async fn test_process_job_no_derivable_anchor_returns_done_exhausted() {
+        let (store, dir) = open_b1_store("no-anchor");
+
+        // Batch where all messages lack a key.id → oldest_anchor returns None
+        let mut keyless_msg = wa::WebMessageInfo {
+            key: wa::MessageKey {
+                id: None, // no id → filtered out by oldest_anchor
+                from_me: Some(false),
+                remote_jid: None,
+                participant: None,
+            },
+            message_timestamp: Some(9_999),
+            ..Default::default()
+        };
+        // Add a second keyless message for good measure
+        let keyless_msg2 = keyless_msg.clone();
+        keyless_msg.message_timestamp = Some(1_000);
+
+        let source = FakeHistorySource::new(vec![FakeResponse::Batch {
+            messages: vec![keyless_msg, keyless_msg2],
+            more_remain: true, // source claims more, but we can't page further
+            progress: None,
+        }]);
+        let sink = FakeBatchSink::always_ok();
+        let job = enqueue_and_claim(&store, "noanchor-chat@s.whatsapp.net", "all", None).await;
+        let cancel = CancellationToken::new();
+
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+            .await.unwrap();
+
+        // Must be Done (not spin, not stuck-anchor Failed)
+        assert_eq!(end, JobEnd::Done, "no-anchor batch must terminate with Done");
+
+        // Cursor must be exhausted
+        let cursor = store.get_backfill_cursor("noanchor-chat@s.whatsapp.net").await.unwrap().unwrap();
+        assert!(cursor.exhausted, "cursor must be exhausted when no anchor is derivable");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Fix 5: invalid batch_size → Failed ---
+
+    #[tokio::test]
+    async fn test_process_job_invalid_batch_size_zero() {
+        let (store, dir) = open_b1_store("batch-zero");
+        let source = FakeHistorySource::exhausted();
+        let sink = FakeBatchSink::always_ok();
+        let job = enqueue_and_claim(&store, "bz-chat@s.whatsapp.net", "all", None).await;
+        let cancel = CancellationToken::new();
+
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 0, 0, &cancel)
+            .await.unwrap();
+
+        match end {
+            JobEnd::Failed(reason) => {
+                assert!(reason.contains("invalid batch_size"), "got: {reason}");
+            }
+            other => panic!("expected Failed(invalid batch_size), got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_process_job_invalid_batch_size_negative() {
+        let (store, dir) = open_b1_store("batch-neg");
+        let source = FakeHistorySource::exhausted();
+        let sink = FakeBatchSink::always_ok();
+        let job = enqueue_and_claim(&store, "bn-chat@s.whatsapp.net", "all", None).await;
+        let cancel = CancellationToken::new();
+
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), -1, 0, &cancel)
+            .await.unwrap();
+
+        match end {
+            JobEnd::Failed(reason) => {
+                assert!(reason.contains("invalid batch_size"), "got: {reason}");
+            }
+            other => panic!("expected Failed(invalid batch_size), got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Fix 7: record_backfill_progress updates both cursor and fetched atomically ---
+
+    #[tokio::test]
+    async fn test_record_backfill_progress_updates_cursor_and_fetched() {
+        let (store, dir) = open_b1_store("atomic-progress");
+
+        // Enqueue a job so we have a valid job_id
+        let outcome = store.enqueue_backfill_job("atomic-chat@s.whatsapp.net", "all", None, 0)
+            .await.unwrap();
+        let job_id = match outcome {
+            EnqueueOutcome::Accepted { job_id } => job_id,
+            other => panic!("expected Accepted, got {:?}", other),
+        };
+
+        // Call record_backfill_progress directly
+        store.record_backfill_progress(
+            job_id,
+            "atomic-chat@s.whatsapp.net",
+            Some("msg-abc"),
+            Some(false),
+            Some(1_700_000_000_000i64), // ms
+            true,
+            false,
+            None,
+            42,
+        ).await.unwrap();
+
+        // Verify cursor was written
+        let cursor = store.get_backfill_cursor("atomic-chat@s.whatsapp.net").await.unwrap().unwrap();
+        assert_eq!(cursor.oldest_msg_id, Some("msg-abc".to_owned()));
+        assert_eq!(cursor.oldest_msg_timestamp_ms, Some(1_700_000_000_000i64));
+        assert!(cursor.more_remain);
+        assert!(!cursor.exhausted);
+
+        // Verify fetched was updated
+        let row = store.get_backfill_job(job_id).await.unwrap().unwrap();
+        assert_eq!(row.fetched, 42);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

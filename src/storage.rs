@@ -1572,27 +1572,28 @@ impl Store {
 
     /// Update the status of a backfill job.
     ///
-    /// For terminal statuses (`done`, `failed`, `cancelled`) a CASE-guarded conditional
-    /// update is used so that a `cancelled` job cannot be silently overwritten to `done`
-    /// (ADR 0026 I6). Specifically: setting `done` or `failed` only applies if the
-    /// current status is still `running`; `cancelled` is always written (it may arrive
-    /// from any non-terminal state).
+    /// A CASE-guarded conditional update ensures a `cancelled` job is never
+    /// silently overwritten (ADR 0026 I6 — "worker never downgrades a cancel").
+    /// The guard `AND status != 'cancelled'` applies to ALL non-cancel writes:
+    ///   - `done` / `failed` — terminal completions (must not resurrect cancel)
+    ///   - `paused` / `queued` — park and shutdown-requeue (must not resurrect cancel)
+    /// Only `cancelled` itself is written unconditionally (it is the upgrade path
+    /// from any live state, including `running`).
     pub async fn mark_backfill_job(&self, id: i64, status: &str) -> Result<()> {
         let st = status.to_owned();
         let ts = now_secs();
         self.run(move |c| {
-            // CASE guard: terminal "done"/"failed" must not overwrite "cancelled".
-            // "paused" and "cancelled" are written unconditionally within running jobs.
+            // Guard: any write except "cancelled" must not overwrite a cancelled job.
             let sql = match st.as_str() {
-                "done" | "failed" => {
+                "cancelled" => {
                     "UPDATE backfill_jobs
                      SET status = ?1, updated_at = ?2
-                     WHERE id = ?3 AND status != 'cancelled'"
+                     WHERE id = ?3"
                 }
                 _ => {
                     "UPDATE backfill_jobs
                      SET status = ?1, updated_at = ?2
-                     WHERE id = ?3"
+                     WHERE id = ?3 AND status != 'cancelled'"
                 }
             };
             c.execute(sql, params![st, ts, id]).map_err(db_err)?;
@@ -1705,6 +1706,77 @@ impl Store {
             )
             .optional()
             .map_err(db_err)
+        })
+        .await
+    }
+
+    /// Atomically record per-batch backfill progress: cursor UPSERT + fetched counter update.
+    ///
+    /// Both writes execute inside a single `unchecked_transaction`, making them
+    /// one logical step (ADR 0035 Fix 7). The cursor and fetched count are always
+    /// consistent — a partial write (e.g. crash after cursor but before fetched)
+    /// is impossible.
+    ///
+    /// Parameters mirror `upsert_backfill_cursor` plus `job_id` and `fetched`:
+    /// - `job_id`                 — the backfill job whose fetched counter to update.
+    /// - `fetched`                — new cumulative fetched count.
+    /// - other fields             — same semantics as `upsert_backfill_cursor`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_backfill_progress(
+        &self,
+        job_id: i64,
+        chat_jid: &str,
+        oldest_msg_id: Option<&str>,
+        oldest_msg_from_me: Option<bool>,
+        oldest_msg_timestamp_ms: Option<i64>,
+        more_remain: bool,
+        exhausted: bool,
+        last_backfill_at: Option<i64>,
+        fetched: u32,
+    ) -> Result<()> {
+        let jid = chat_jid.to_owned();
+        let mid = oldest_msg_id.map(|s| s.to_owned());
+        let from_me = oldest_msg_from_me.map(|v| if v { 1i64 } else { 0i64 });
+        let more_remain_i = if more_remain { 1i64 } else { 0i64 };
+        let exhausted_i = if exhausted { 1i64 } else { 0i64 };
+        let ts = now_secs();
+        self.run(move |c| {
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+
+            // 1. Cursor UPSERT
+            tx.execute(
+                "INSERT INTO backfill_cursor
+                     (chat_jid, oldest_msg_id, oldest_msg_from_me, oldest_msg_timestamp_ms,
+                      more_remain, exhausted, last_backfill_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(chat_jid) DO UPDATE SET
+                     oldest_msg_id           = excluded.oldest_msg_id,
+                     oldest_msg_from_me      = excluded.oldest_msg_from_me,
+                     oldest_msg_timestamp_ms = excluded.oldest_msg_timestamp_ms,
+                     more_remain             = excluded.more_remain,
+                     exhausted               = excluded.exhausted,
+                     last_backfill_at        = COALESCE(excluded.last_backfill_at, last_backfill_at)",
+                params![
+                    jid,
+                    mid,
+                    from_me,
+                    oldest_msg_timestamp_ms,
+                    more_remain_i,
+                    exhausted_i,
+                    last_backfill_at,
+                ],
+            )
+            .map_err(db_err)?;
+
+            // 2. Fetched counter update
+            tx.execute(
+                "UPDATE backfill_jobs SET fetched = ?1, updated_at = ?2 WHERE id = ?3",
+                params![fetched as i64, ts, job_id],
+            )
+            .map_err(db_err)?;
+
+            tx.commit().map_err(db_err)?;
+            Ok(())
         })
         .await
     }
