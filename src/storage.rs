@@ -902,6 +902,14 @@ pub struct InboundRow {
     pub timestamp: i64,
 }
 
+/// The oldest stored message for a chat — used to seed the initial backfill anchor.
+/// `timestamp_secs` is Unix seconds (raw storage value — do NOT assume milliseconds).
+pub struct OldestMessageRow {
+    pub message_id: String,
+    pub from_me: bool,
+    pub timestamp_secs: i64,
+}
+
 /// Statistics from a prune operation.
 #[derive(Debug, Clone)]
 pub struct PruneStats {
@@ -1204,7 +1212,44 @@ impl Store {
     // Inbound message history
     // -----------------------------------------------------------------------
 
+    /// Insert a message into the history table with explicit source and from_me flag.
+    /// Duplicates (by message_id) are silently ignored (INSERT OR IGNORE).
+    ///
+    /// `timestamp_secs` is Unix seconds — consistent with the `messages.timestamp` column.
+    /// `source` distinguishes live inbound messages (`"live"`) from backfilled ones (`"backfill"`).
+    pub async fn insert_message(
+        &self,
+        chat_jid: &str,
+        sender_jid: &str,
+        message_id: &str,
+        content_kind: &str,
+        body_text: Option<&str>,
+        timestamp_secs: i64,
+        from_me: bool,
+        source: &str,
+    ) -> Result<()> {
+        let cj = chat_jid.to_owned();
+        let sj = sender_jid.to_owned();
+        let mid = message_id.to_owned();
+        let ck = content_kind.to_owned();
+        let bt = body_text.map(|s| s.to_owned());
+        let src = source.to_owned();
+        let from_me_i = if from_me { 1i64 } else { 0i64 };
+        let created = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "INSERT OR IGNORE INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at, from_me, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![cj, sj, mid, ck, bt, timestamp_secs, created, from_me_i, src],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Insert an inbound message into the history table. Duplicates (by message_id) are ignored.
+    /// Delegates to `insert_message` with `from_me=false` and `source="live"`.
     pub async fn insert_inbound(
         &self,
         chat_jid: &str,
@@ -1214,20 +1259,30 @@ impl Store {
         body_text: Option<&str>,
         timestamp: i64,
     ) -> Result<()> {
-        let cj = chat_jid.to_owned();
-        let sj = sender_jid.to_owned();
-        let mid = message_id.to_owned();
-        let ck = content_kind.to_owned();
-        let bt = body_text.map(|s| s.to_owned());
-        let ts = now_secs();
+        self.insert_message(chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, false, "live").await
+    }
+
+    /// Return the oldest stored message for a chat (by timestamp ASC), or None if no messages exist.
+    ///
+    /// Used to seed the initial backfill anchor: the frontier starts just older than what we have.
+    /// `OldestMessageRow.timestamp_secs` is raw Unix seconds — callers scale to ms as needed.
+    pub async fn get_oldest_message(&self, chat_jid: &str) -> Result<Option<OldestMessageRow>> {
+        let jid = chat_jid.to_owned();
         self.run(move |c| {
-            c.execute(
-                "INSERT OR IGNORE INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'live')",
-                params![cj, sj, mid, ck, bt, timestamp, ts],
+            c.query_row(
+                "SELECT message_id, from_me, timestamp FROM messages WHERE chat_jid = ?1 ORDER BY timestamp ASC LIMIT 1",
+                params![jid],
+                |row| {
+                    let from_me_i: i64 = row.get(1)?;
+                    Ok(OldestMessageRow {
+                        message_id: row.get(0)?,
+                        from_me: from_me_i != 0,
+                        timestamp_secs: row.get(2)?,
+                    })
+                },
             )
-            .map_err(db_err)?;
-            Ok(())
+            .optional()
+            .map_err(db_err)
         })
         .await
     }
@@ -4124,6 +4179,112 @@ mod tests {
         let row = store.get_backfill_cursor("chatP@s.whatsapp.net").await.unwrap().unwrap();
         assert_eq!(row.last_backfill_at, Some(ts), "last_backfill_at must be preserved when None is passed");
         assert_eq!(row.oldest_msg_id.as_deref(), Some("msg-x"), "anchor must be updated");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
+    // Wave B2a storage tests
+    // =========================================================================
+
+    fn open_b2a_store(name: &str) -> (Store, PathBuf) {
+        let dir = unique_test_dir(&format!("b2a-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("wa.db");
+        let store = Store::new(&db_path).unwrap();
+        (store, dir)
+    }
+
+    /// (b2a-1) get_oldest_message: returns the message with the smallest timestamp.
+    #[tokio::test]
+    async fn test_get_oldest_message_returns_smallest_timestamp() {
+        let (store, dir) = open_b2a_store("get-oldest");
+
+        // Insert three messages with timestamps 300, 100, 200 (out of order)
+        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "mid-300", "text", Some("c"), 300, false, "live").await.unwrap();
+        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "mid-100", "text", Some("a"), 100, false, "live").await.unwrap();
+        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "mid-200", "text", Some("b"), 200, false, "live").await.unwrap();
+
+        let row = store.get_oldest_message("chat@s.whatsapp.net").await.unwrap().unwrap();
+        assert_eq!(row.message_id, "mid-100", "must return message with ts=100");
+        assert_eq!(row.timestamp_secs, 100);
+        assert!(!row.from_me);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b2a-2) get_oldest_message: returns None for a chat with no messages.
+    #[tokio::test]
+    async fn test_get_oldest_message_empty_chat_returns_none() {
+        let (store, dir) = open_b2a_store("get-oldest-empty");
+
+        let row = store.get_oldest_message("nobody@s.whatsapp.net").await.unwrap();
+        assert!(row.is_none(), "empty chat must return None");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b2a-3) insert_message: stores source and from_me correctly.
+    #[tokio::test]
+    async fn test_insert_message_stores_source_and_from_me() {
+        let (store, dir) = open_b2a_store("insert-msg");
+
+        store.insert_message(
+            "chat@s.whatsapp.net",
+            "me@s.whatsapp.net",
+            "back-001",
+            "text",
+            Some("hello"),
+            1_700_000_000,
+            true,
+            "backfill",
+        ).await.unwrap();
+
+        // Verify via get_oldest_message (returns raw values from DB)
+        let row = store.get_oldest_message("chat@s.whatsapp.net").await.unwrap().unwrap();
+        assert_eq!(row.message_id, "back-001");
+        assert!(row.from_me, "from_me must be true");
+        assert_eq!(row.timestamp_secs, 1_700_000_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b2a-4) insert_message: duplicate message_id is silently ignored (INSERT OR IGNORE).
+    #[tokio::test]
+    async fn test_insert_message_duplicate_ignored() {
+        let (store, dir) = open_b2a_store("insert-dup");
+
+        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "dup-id", "text", Some("first"), 1000, false, "backfill").await.unwrap();
+        // Second insert with same message_id — must not error and must not overwrite
+        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "dup-id", "text", Some("second"), 9999, true, "live").await.unwrap();
+
+        // Only one row with ts=1000 (the first insert)
+        let row = store.get_oldest_message("chat@s.whatsapp.net").await.unwrap().unwrap();
+        assert_eq!(row.timestamp_secs, 1000, "duplicate must be ignored, first row preserved");
+        assert!(!row.from_me, "first row from_me=false must be preserved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b2a-5) insert_inbound still writes source='live' and from_me=0.
+    #[tokio::test]
+    async fn test_insert_inbound_still_writes_live_source_from_me_false() {
+        let (store, dir) = open_b2a_store("insert-inbound-compat");
+
+        store.insert_inbound(
+            "chat@s.whatsapp.net",
+            "sender@s.whatsapp.net",
+            "live-msg-1",
+            "text",
+            Some("body"),
+            500,
+        ).await.unwrap();
+
+        // Verify via get_oldest_message: from_me must be false
+        let row = store.get_oldest_message("chat@s.whatsapp.net").await.unwrap().unwrap();
+        assert_eq!(row.message_id, "live-msg-1");
+        assert!(!row.from_me, "insert_inbound must write from_me=false");
+        assert_eq!(row.timestamp_secs, 500);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

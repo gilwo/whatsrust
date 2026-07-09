@@ -525,6 +525,97 @@ fn oldest_anchor(batch: &HistoryBatch) -> Option<Anchor> {
 }
 
 // ---------------------------------------------------------------------------
+// drain_history_sync — extract a HistoryBatch for one chat from a HistorySync
+// ---------------------------------------------------------------------------
+
+/// Extract the messages for `chat_jid` from a decoded `HistorySync` into a `HistoryBatch`.
+///
+/// The live source (Wave B2b) calls `lazy.get()` then passes the decoded `&wa::HistorySync` here.
+///
+/// ## Selection
+/// All `Conversation`s whose `id == chat_jid` are selected. Every `HistorySyncMsg.message`
+/// (dereffing the `Box<WebMessageInfo>`) is collected into `messages` (cloned, order preserved).
+/// If no conversation matches, `messages` is empty.
+///
+/// ## `more_remain`
+/// Derived from the matched conversation's `end_of_history_transfer_type`:
+/// - `Some(0) | Some(2)` → `true` (more available)
+/// - `Some(1) | Some(3)` → `false` (no more)
+/// - `None` → fall back to `hs.progress`: more_remain = `hs.progress.map_or(true, |p| p < 100)`
+///   (conservative: uncertain → assume more, so we never silently stop early)
+///
+/// When multiple conversations match, their `more_remain` signals are OR'd.
+///
+/// ## Timestamps
+/// Raw `WebMessageInfo` values are returned unmodified — `message_timestamp` is seconds.
+/// Do NOT scale here; `oldest_anchor` handles ×1000 when computing the next anchor.
+pub fn drain_history_sync(hs: &wa::HistorySync, chat_jid: &str) -> HistoryBatch {
+    let mut messages: Vec<wa::WebMessageInfo> = Vec::new();
+    let mut found_any = false;
+    let mut more_remain = false;
+
+    for conv in &hs.conversations {
+        if conv.id != chat_jid {
+            continue;
+        }
+        found_any = true;
+
+        // Collect all messages from this conversation (message is Box<WebMessageInfo>)
+        for hsm in &conv.messages {
+            if let Some(boxed) = &hsm.message {
+                messages.push((**boxed).clone());
+            }
+        }
+
+        // Determine more_remain from end_of_history_transfer_type
+        let conv_more = match conv.end_of_history_transfer_type {
+            Some(0) | Some(2) => true,
+            Some(1) | Some(3) => false,
+            _ => {
+                // Conservative fallback: uncertain → assume more
+                hs.progress.map_or(true, |p| p < 100)
+            }
+        };
+        more_remain = more_remain || conv_more;
+    }
+
+    // If no matching conversation, apply the progress-based fallback conservatively
+    if !found_any {
+        more_remain = hs.progress.map_or(true, |p| p < 100);
+    }
+
+    HistoryBatch {
+        messages,
+        more_remain,
+        progress: hs.progress,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// initial_anchor — seed the starting anchor from the oldest stored message
+// ---------------------------------------------------------------------------
+
+/// Seed the starting anchor for a chat from its oldest already-stored message
+/// ("older than what I have", ADR 0003).
+///
+/// - `Some(row)` → anchor at that message (seconds → milliseconds via `saturating_mul(1000)`).
+/// - `None` → empty anchor (phone returns most-recent history chunk).
+pub fn initial_anchor(oldest: Option<crate::storage::OldestMessageRow>) -> Anchor {
+    match oldest {
+        Some(row) => Anchor {
+            oldest_msg_id: row.message_id,
+            oldest_msg_from_me: row.from_me,
+            oldest_msg_timestamp_ms: row.timestamp_secs.saturating_mul(1000),
+        },
+        None => Anchor {
+            oldest_msg_id: String::new(),
+            oldest_msg_from_me: false,
+            oldest_msg_timestamp_ms: 0,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // process_job — the pagination loop (Wave B1 core)
 // ---------------------------------------------------------------------------
 
@@ -2077,5 +2168,208 @@ mod tests {
         assert_eq!(row.fetched, 42);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
+    // Wave B2a tests — drain_history_sync, initial_anchor
+    // =========================================================================
+
+    use crate::storage::OldestMessageRow;
+
+    /// Build a minimal HistorySyncMsg containing the given WebMessageInfo.
+    /// `HistorySyncMsg.message` is `Option<Box<WebMessageInfo>>` in the generated proto.
+    fn make_hsm(wmi: wa::WebMessageInfo) -> wa::HistorySyncMsg {
+        wa::HistorySyncMsg {
+            message: Some(Box::new(wmi)),
+            ..Default::default()
+        }
+    }
+
+    /// Build a WebMessageInfo with the given message-id (timestamp irrelevant for drain tests).
+    fn make_wmi(id: &str) -> wa::WebMessageInfo {
+        wa::WebMessageInfo {
+            key: wa::MessageKey {
+                id: Some(id.to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    // --- drain_history_sync: basic 3-message extraction ---
+
+    #[test]
+    fn test_drain_basic_three_messages_more_remain_type2() {
+        let conv = wa::Conversation {
+            id: "chat@s.whatsapp.net".to_owned(),
+            messages: vec![
+                make_hsm(make_wmi("m1")),
+                make_hsm(make_wmi("m2")),
+                make_hsm(make_wmi("m3")),
+            ],
+            end_of_history_transfer_type: Some(2),
+            ..Default::default()
+        };
+        let hs = wa::HistorySync {
+            conversations: vec![conv],
+            progress: Some(50),
+            ..Default::default()
+        };
+
+        let batch = drain_history_sync(&hs, "chat@s.whatsapp.net");
+        assert_eq!(batch.messages.len(), 3);
+        assert!(batch.more_remain, "type=2 → more_remain=true");
+        assert_eq!(batch.progress, Some(50));
+        // Message IDs preserved in order
+        assert_eq!(batch.messages[0].key.id.as_deref(), Some("m1"));
+        assert_eq!(batch.messages[1].key.id.as_deref(), Some("m2"));
+        assert_eq!(batch.messages[2].key.id.as_deref(), Some("m3"));
+    }
+
+    // --- drain_history_sync: end_of_history_transfer_type variants ---
+
+    #[test]
+    fn test_drain_type0_more_remain_true() {
+        let conv = wa::Conversation {
+            id: "c@s".to_owned(),
+            messages: vec![make_hsm(make_wmi("x"))],
+            end_of_history_transfer_type: Some(0),
+            ..Default::default()
+        };
+        let hs = wa::HistorySync { conversations: vec![conv], ..Default::default() };
+        let batch = drain_history_sync(&hs, "c@s");
+        assert!(batch.more_remain, "type=0 → more_remain=true");
+    }
+
+    #[test]
+    fn test_drain_type1_more_remain_false() {
+        let conv = wa::Conversation {
+            id: "c@s".to_owned(),
+            messages: vec![make_hsm(make_wmi("x"))],
+            end_of_history_transfer_type: Some(1),
+            ..Default::default()
+        };
+        let hs = wa::HistorySync { conversations: vec![conv], ..Default::default() };
+        let batch = drain_history_sync(&hs, "c@s");
+        assert!(!batch.more_remain, "type=1 → more_remain=false");
+    }
+
+    #[test]
+    fn test_drain_type2_more_remain_true() {
+        let conv = wa::Conversation {
+            id: "c@s".to_owned(),
+            messages: vec![make_hsm(make_wmi("x"))],
+            end_of_history_transfer_type: Some(2),
+            ..Default::default()
+        };
+        let hs = wa::HistorySync { conversations: vec![conv], ..Default::default() };
+        let batch = drain_history_sync(&hs, "c@s");
+        assert!(batch.more_remain, "type=2 → more_remain=true");
+    }
+
+    #[test]
+    fn test_drain_type3_more_remain_false() {
+        let conv = wa::Conversation {
+            id: "c@s".to_owned(),
+            messages: vec![make_hsm(make_wmi("x"))],
+            end_of_history_transfer_type: Some(3),
+            ..Default::default()
+        };
+        let hs = wa::HistorySync { conversations: vec![conv], ..Default::default() };
+        let batch = drain_history_sync(&hs, "c@s");
+        assert!(!batch.more_remain, "type=3 → more_remain=false");
+    }
+
+    // --- drain_history_sync: None type → progress fallback ---
+
+    #[test]
+    fn test_drain_none_type_progress_50_more_remain_true() {
+        let conv = wa::Conversation {
+            id: "c@s".to_owned(),
+            messages: vec![make_hsm(make_wmi("x"))],
+            end_of_history_transfer_type: None,
+            ..Default::default()
+        };
+        let hs = wa::HistorySync {
+            conversations: vec![conv],
+            progress: Some(50),
+            ..Default::default()
+        };
+        let batch = drain_history_sync(&hs, "c@s");
+        assert!(batch.more_remain, "None type + progress=50 → more_remain=true (50 < 100)");
+    }
+
+    #[test]
+    fn test_drain_none_type_progress_100_more_remain_false() {
+        let conv = wa::Conversation {
+            id: "c@s".to_owned(),
+            messages: vec![make_hsm(make_wmi("x"))],
+            end_of_history_transfer_type: None,
+            ..Default::default()
+        };
+        let hs = wa::HistorySync {
+            conversations: vec![conv],
+            progress: Some(100),
+            ..Default::default()
+        };
+        let batch = drain_history_sync(&hs, "c@s");
+        assert!(!batch.more_remain, "None type + progress=100 → more_remain=false");
+    }
+
+    // --- drain_history_sync: non-matching conversation → empty batch ---
+
+    #[test]
+    fn test_drain_different_jid_returns_empty() {
+        let conv = wa::Conversation {
+            id: "other@s.whatsapp.net".to_owned(),
+            messages: vec![make_hsm(make_wmi("x"))],
+            end_of_history_transfer_type: Some(1),
+            ..Default::default()
+        };
+        let hs = wa::HistorySync {
+            conversations: vec![conv],
+            progress: Some(100), // progress=100 → if no match, more_remain=false
+            ..Default::default()
+        };
+        let batch = drain_history_sync(&hs, "chat@s.whatsapp.net");
+        assert!(batch.messages.is_empty(), "non-matching JID → empty messages");
+    }
+
+    // --- drain_history_sync: empty conversations → empty batch ---
+
+    #[test]
+    fn test_drain_empty_conversations_returns_empty() {
+        let hs = wa::HistorySync {
+            conversations: vec![],
+            progress: Some(100),
+            ..Default::default()
+        };
+        let batch = drain_history_sync(&hs, "chat@s.whatsapp.net");
+        assert!(batch.messages.is_empty(), "empty HistorySync → empty batch");
+    }
+
+    // --- initial_anchor: Some(row) → scaled anchor ---
+
+    #[test]
+    fn test_initial_anchor_some_row_scales_to_ms() {
+        let row = OldestMessageRow {
+            message_id: "m1".to_owned(),
+            from_me: true,
+            timestamp_secs: 1_000,
+        };
+        let anchor = initial_anchor(Some(row));
+        assert_eq!(anchor.oldest_msg_id, "m1");
+        assert!(anchor.oldest_msg_from_me);
+        assert_eq!(anchor.oldest_msg_timestamp_ms, 1_000_000, "seconds must be scaled ×1000 to ms");
+    }
+
+    // --- initial_anchor: None → empty anchor ---
+
+    #[test]
+    fn test_initial_anchor_none_returns_empty() {
+        let anchor = initial_anchor(None);
+        assert_eq!(anchor.oldest_msg_id, "", "empty anchor id");
+        assert!(!anchor.oldest_msg_from_me);
+        assert_eq!(anchor.oldest_msg_timestamp_ms, 0, "empty anchor ts_ms = 0");
     }
 }
