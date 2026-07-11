@@ -4065,6 +4065,11 @@ impl LiveHistorySource {
 
 #[async_trait::async_trait]
 impl crate::backfill::HistorySource for LiveHistorySource {
+    /// Ready iff the WA client is currently connected. ADR 0026 connection-gating.
+    fn is_ready(&self) -> bool {
+        get_client_handle(&self.client_handle).is_some()
+    }
+
     async fn fetch_older(
         &self,
         chat_jid: &str,
