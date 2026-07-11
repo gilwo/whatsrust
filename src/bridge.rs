@@ -1992,6 +1992,100 @@ async fn run_bridge(
         });
     }
 
+    // Spawn backfill worker (Wave B2b) — connects the already-built process_job / run_worker_loop
+    // to the live WhatsApp client via LiveHistorySource + LiveBatchSink + HistoryCorrelator.
+    let correlator = Arc::new(crate::backfill::HistoryCorrelator::new());
+    let backfill_notify = Arc::new(tokio::sync::Notify::new());
+    {
+        let bf_source = Arc::new(LiveHistorySource::new(
+            client_handle.clone(),
+            correlator.clone(),
+        ));
+        let bf_sink = Arc::new(LiveBatchSink::new(
+            client_handle.clone(),
+            store.clone(),
+        ));
+        let bf_store = store.clone();
+        let bf_notify = backfill_notify.clone();
+        let bf_cancel = cancel.clone();
+        // Wave C: make configurable (WHATSRUST_*)
+        let bf_pacer = crate::backfill::BackfillPacer {
+            base_delay: Duration::from_secs(4),
+            jitter_frac: 0.4,
+        };
+        tokio::spawn(crate::backfill::run_worker_loop(
+            bf_source,
+            bf_sink,
+            bf_store,
+            bf_pacer,
+            50,      // batch_size — Wave C: make configurable (WHATSRUST_*)
+            20_000,  // backstop  — Wave C: make configurable (WHATSRUST_*)
+            bf_notify,
+            bf_cancel,
+        ));
+    }
+
+    // TEMPORARY smoke-test trigger — replaced by the API/MCP trigger in M1.4
+    //
+    // Set WHATSRUST_BACKFILL_TEST=<chat_jid>:<count> (e.g. 123@s.whatsapp.net:100)
+    // to immediately seed the backfill cursor for that chat and enqueue a Count job.
+    // Expected logs: "backfill smoke-test: seeded cursor and enqueued job"
+    // Expected DB: rows in backfill_jobs (status=queued→running→done) and backfill_cursors.
+    if let Ok(val) = std::env::var("WHATSRUST_BACKFILL_TEST") {
+        if let Some((chat, count_str)) = val.split_once(':') {
+            if let Ok(count) = count_str.parse::<i64>() {
+                let chat = chat.to_string();
+                let store_bt = store.clone();
+                let notify_bt = backfill_notify.clone();
+                tokio::spawn(async move {
+                    match store_bt.get_oldest_message(&chat).await {
+                        Ok(oldest) => {
+                            let anchor = crate::backfill::initial_anchor(oldest);
+                            if let Err(e) = store_bt
+                                .upsert_backfill_cursor(
+                                    &chat,
+                                    Some(&anchor.oldest_msg_id),
+                                    Some(anchor.oldest_msg_from_me),
+                                    Some(anchor.oldest_msg_timestamp_ms),
+                                    true,
+                                    false,
+                                    None,
+                                )
+                                .await
+                            {
+                                warn!(error = %e, "backfill smoke-test: upsert_backfill_cursor failed");
+                                return;
+                            }
+                            match store_bt
+                                .enqueue_backfill_job(&chat, "count", Some(count), 0)
+                                .await
+                            {
+                                Ok(_) => {
+                                    info!(
+                                        chat = %chat,
+                                        count,
+                                        "backfill smoke-test: seeded cursor and enqueued job"
+                                    );
+                                    notify_bt.notify_one();
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "backfill smoke-test: enqueue_backfill_job failed");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "backfill smoke-test: get_oldest_message failed");
+                        }
+                    }
+                });
+            } else {
+                warn!(val = %val, "WHATSRUST_BACKFILL_TEST: invalid count (expected <jid>:<number>)");
+            }
+        } else {
+            warn!(val = %val, "WHATSRUST_BACKFILL_TEST: expected format <jid>:<count>");
+        }
+    }
+
     let mut backoff = Duration::from_secs(1);
     // Track rapid StreamReplaced events to detect replacement loops.
     // If we get 3 replacements within 5 minutes, stop reconnecting.
@@ -2028,6 +2122,7 @@ async fn run_bridge(
             &outbound_notify,
             &event_tx,
             &group_cache,
+            &correlator,
         )
         .await;
 
@@ -2132,6 +2227,7 @@ async fn run_bot_session(
     outbound_notify: &Arc<tokio::sync::Notify>,
     event_tx: &tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
     group_cache: &GroupCacheHandle,
+    correlator: &Arc<crate::backfill::HistoryCorrelator>,
 ) -> Result<SessionAction> {
     // Clear stale handle from previous session
     set_client_handle(client_handle, None);
@@ -2160,6 +2256,7 @@ async fn run_bot_session(
     let sub_pres_for_events = subscribed_presence.clone();
     let event_tx_for_events = event_tx.clone();
     let gc_for_events = group_cache.clone();
+    let correlator_for_events = correlator.clone();
     // Track previous QR terminal height for in-place overwrite on refresh
     let prev_qr_lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -2189,9 +2286,10 @@ async fn run_bot_session(
             let spres = sub_pres_for_events.clone();
             let etx = event_tx_for_events.clone();
             let gc = gc_for_events.clone();
+            let corr = correlator_for_events.clone();
             async move {
                 let event_owned = (*event).clone();
-                handle_event(event_owned, client, &ch, &itx, &stx, &qtx, &store, &sr, &srr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &etx, &gc)
+                handle_event(event_owned, client, &ch, &itx, &stx, &qtx, &store, &sr, &srr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &etx, &gc, &corr)
                     .await;
             }
         });
@@ -2326,6 +2424,7 @@ async fn handle_event(
     subscribed_presence: &Arc<DashSet<String>>,
     event_tx: &tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
     group_cache: &GroupCacheHandle,
+    correlator: &Arc<crate::backfill::HistoryCorrelator>,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -2875,8 +2974,20 @@ async fn handle_event(
         Event::MarkChatAsReadUpdate(update) => {
             debug!(jid = %update.jid, "chat marked as read/unread");
         }
-        Event::HistorySync(_) => {
-            debug!("history sync chunk received (ignored — skip_history_sync active)");
+        Event::HistorySync(lazy) => {
+            // Copy the session-id to an owned String before moving `lazy` into fulfill,
+            // to satisfy borrow checker (peer_data_request_session_id borrows lazy).
+            let sid_owned: Option<String> = lazy.peer_data_request_session_id().map(|s| s.to_owned());
+            match sid_owned {
+                Some(sid) if correlator.fulfill(&sid, lazy) => {
+                    debug!("on-demand history sync routed to backfill worker");
+                }
+                _ => {
+                    // Unmatched: pairing-bootstrap history sync (ADR-0037) has no session-id.
+                    // MUST remain a no-op — do not break pairing.
+                    debug!("history sync chunk received (unsolicited bootstrap — ignored)");
+                }
+            }
         }
         Event::OfflineSyncPreview(_) => {
             debug!("offline sync preview received");
@@ -3930,6 +4041,173 @@ fn rand_jitter_ms(base_ms: u64) -> u64 {
     seed ^= seed >> 7;
     seed ^= seed << 17;
     seed % (base_ms / 2).max(1)
+}
+
+// ---------------------------------------------------------------------------
+// LiveHistorySource — real WhatsApp history fetch (Wave B2b)
+// ---------------------------------------------------------------------------
+
+/// Real `HistorySource` impl: issues `client.fetch_message_history`, registers a
+/// correlator entry, awaits the matching `Event::HistorySync`, then drains the batch.
+pub(crate) struct LiveHistorySource {
+    client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
+    correlator: Arc<crate::backfill::HistoryCorrelator>,
+}
+
+impl LiveHistorySource {
+    pub fn new(
+        client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
+        correlator: Arc<crate::backfill::HistoryCorrelator>,
+    ) -> Self {
+        Self { client_handle, correlator }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::backfill::HistorySource for LiveHistorySource {
+    async fn fetch_older(
+        &self,
+        chat_jid: &str,
+        anchor: &crate::backfill::Anchor,
+        count: i32,
+    ) -> anyhow::Result<crate::backfill::HistoryBatch> {
+        let jid = parse_jid(chat_jid)?;
+        let client = get_client_handle(&self.client_handle)
+            .ok_or_else(|| anyhow::anyhow!("LiveHistorySource: no active client"))?;
+
+        let sid = client
+            .fetch_message_history(
+                &jid,
+                &anchor.oldest_msg_id,
+                anchor.oldest_msg_from_me,
+                anchor.oldest_msg_timestamp_ms,
+                count,
+            )
+            .await?;
+
+        // NOTE: tiny register-after-sid window is acceptable — single in-flight fetch,
+        // seconds-scale latency; ADR 0026 single-flight.
+        let rx = self.correlator.register(sid);
+
+        let lazy = tokio::time::timeout(std::time::Duration::from_secs(60), rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("LiveHistorySource: history fetch timed out after 60s"))?
+            .map_err(|_| anyhow::anyhow!("LiveHistorySource: correlator sender dropped"))?;
+
+        let hs = lazy
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("LiveHistorySource: history sync decode failed"))?;
+
+        Ok(crate::backfill::drain_history_sync(hs, chat_jid))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LiveBatchSink — persist backfill batch via extract_content_inner (Wave B2b)
+// ---------------------------------------------------------------------------
+
+/// Real `BatchSink` impl: extracts content from `WebMessageInfo` via
+/// `extract_content_inner` (the single extraction path, ADR 0014) and persists
+/// via `Store::insert_message`. Media stays lazy (ADR 0005).
+pub(crate) struct LiveBatchSink {
+    client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
+    store: Store,
+    /// Small semaphore for the extract pipeline's download slot parameter.
+    /// Backfill uses a separate, tighter limit from the live-ingest semaphore.
+    dl_semaphore: Semaphore,
+}
+
+impl LiveBatchSink {
+    pub fn new(
+        client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
+        store: Store,
+    ) -> Self {
+        // Backfill: 2 concurrent download slots (smaller than live's MAX_CONCURRENT_DOWNLOADS=4)
+        Self { client_handle, store, dl_semaphore: Semaphore::new(2) }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::backfill::BatchSink for LiveBatchSink {
+    async fn persist_batch(
+        &self,
+        _chat_jid: &str,
+        batch: &crate::backfill::HistoryBatch,
+    ) -> anyhow::Result<usize> {
+        let client = get_client_handle(&self.client_handle)
+            .ok_or_else(|| anyhow::anyhow!("LiveBatchSink: no active client"))?;
+
+        let mut inserted = 0usize;
+
+        for web in &batch.messages {
+            // Skip messages with no payload
+            let msg = match web.message.as_deref() {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let chat_jid = match web.key.remote_jid.as_deref() {
+                Some(j) => j,
+                None => continue,
+            };
+            let msg_id = match web.key.id.as_deref() {
+                Some(id) => id,
+                None => continue,
+            };
+            let from_me = web.key.from_me.unwrap_or(false);
+            // messageTimestamp is Unix seconds in the proto
+            let ts_secs = web.message_timestamp.unwrap_or(0) as i64;
+            // For group messages the real sender is in `participant`; for DMs it's the remote JID.
+            let sender_jid = web.key.participant.as_deref()
+                .unwrap_or_else(|| web.key.remote_jid.as_deref().unwrap_or(""));
+
+            // Do NOT emit inbound events / mark-read / store poll keys (live-only).
+            // Media stays lazy (ADR 0005) — extract_content_inner handles download if needed.
+            let result = extract_content_inner(
+                msg,
+                &client,
+                &self.dl_semaphore,
+                0,
+                &self.store,
+                Some(sender_jid),
+            )
+            .await;
+
+            match result {
+                ExtractResult::Content(c) => {
+                    let body_str = c.display_text();
+                    let body_opt = if body_str.is_empty() { None } else { Some(body_str.as_str()) };
+                    match self
+                        .store
+                        .insert_message(
+                            chat_jid,
+                            sender_jid,
+                            msg_id,
+                            c.kind(),
+                            body_opt,
+                            ts_secs,
+                            from_me,
+                            "backfill",
+                        )
+                        .await
+                    {
+                        Ok(()) => inserted += 1,
+                        Err(e) => {
+                            tracing::debug!(
+                                msg_id,
+                                error = %e,
+                                "backfill sink: insert_message failed (may be duplicate)"
+                            );
+                        }
+                    }
+                }
+                // Unhandled or TransientFailure — skip; not an error for the batch
+                _ => {}
+            }
+        }
+
+        Ok(inserted)
+    }
 }
 
 // ---------------------------------------------------------------------------
