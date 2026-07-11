@@ -121,6 +121,14 @@ pub struct HistoryBatch {
 /// `#[async_trait]`, allowing `Box<dyn HistorySource>` injection in the worker (Wave B).
 #[async_trait::async_trait]
 pub trait HistorySource: Send + Sync {
+    /// Whether the source can currently fetch (live WA connection up). ADR 0026 connection-gating.
+    ///
+    /// The default is `true` so that `FakeHistorySource` and existing tests are unaffected
+    /// unless they explicitly opt out via `set_ready(false)`.
+    fn is_ready(&self) -> bool {
+        true
+    }
+
     /// Fetch a batch of messages OLDER than `anchor` for `chat_jid`, up to `count`.
     async fn fetch_older(
         &self,
@@ -155,8 +163,12 @@ pub enum FakeResponse {
 ///   - Normal pagination (sequences of `Batch` entries)
 ///   - Exhausted history (`more_remain = false`)
 ///   - Error / timeout paths (pacing, backoff, pause, cancel)
+///   - Connection-gating: call `set_ready(false)` to simulate a disconnected source.
 pub struct FakeHistorySource {
     responses: std::sync::Mutex<std::collections::VecDeque<FakeResponse>>,
+    /// Simulated connection readiness. Default: `true` (ready). Use `set_ready(false)` in
+    /// tests that exercise the ADR 0026 connection-gate path.
+    ready: std::sync::atomic::AtomicBool,
 }
 
 impl FakeHistorySource {
@@ -164,6 +176,7 @@ impl FakeHistorySource {
     pub fn new(responses: Vec<FakeResponse>) -> Self {
         Self {
             responses: std::sync::Mutex::new(responses.into()),
+            ready: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -180,10 +193,21 @@ impl FakeHistorySource {
     pub fn error(msg: impl Into<String>) -> Self {
         Self::new(vec![FakeResponse::Error(msg.into())])
     }
+
+    /// Set the simulated connection readiness. `false` causes `is_ready()` to return
+    /// `false`, triggering the ADR 0026 connection-gate in `process_job` /
+    /// `run_worker_loop`.
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[async_trait::async_trait]
 impl HistorySource for FakeHistorySource {
+    fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     async fn fetch_older(
         &self,
         _chat_jid: &str,
@@ -534,6 +558,12 @@ pub enum JobEnd {
     Cancelled,
     /// A fetch or sink error occurred, OR the anchor was not advancing. Job → 'failed'.
     Failed(String),
+    /// The source is not ready (WA not connected). Job → back to 'queued'. ADR 0026.
+    ///
+    /// This is a **non-terminal** outcome: the job cursor is not advanced and the job
+    /// is re-enqueued so it resumes once the connection is up. Distinct from `Parked`
+    /// (which is a user-facing "paused" state requiring an explicit re-trigger).
+    Deferred,
 }
 
 // ---------------------------------------------------------------------------
@@ -761,10 +791,35 @@ pub async fn process_job(
             return Ok(JobEnd::Cancelled);
         }
 
+        // 3a-i. Connection gate (ADR 0026): if the source is not ready (WA not connected),
+        // return Deferred immediately — the cursor is unchanged and the job stays resumable.
+        // This prevents a terminal Failed when the worker runs at startup before connect.
+        if !source.is_ready() {
+            tracing::debug!(
+                job_id = job.id,
+                chat_jid = %job.chat_jid,
+                "backfill process_job: source not ready — deferring job until connected",
+            );
+            return Ok(JobEnd::Deferred);
+        }
+
         // 3b. Fetch the next batch
         let batch = match source.fetch_older(&job.chat_jid, &anchor, batch_size).await {
             Ok(b) => b,
-            Err(e) => return Ok(JobEnd::Failed(e.to_string())),
+            Err(e) => {
+                // If the source is now not-ready (connection dropped mid-fetch), treat as
+                // transient: return Deferred so the job is requeued (not permanently failed).
+                if !source.is_ready() {
+                    tracing::debug!(
+                        job_id = job.id,
+                        chat_jid = %job.chat_jid,
+                        error = %e,
+                        "backfill process_job: fetch error while disconnected — deferring",
+                    );
+                    return Ok(JobEnd::Deferred);
+                }
+                return Ok(JobEnd::Failed(e.to_string()));
+            }
         };
 
         let more_remain = batch.more_remain;
@@ -942,6 +997,15 @@ pub async fn run_worker_loop(
             }
         }
 
+        // Connection gate (ADR 0026): do NOT claim a job when the source is not ready.
+        // If we claimed and ran, fetch_older would return Deferred and we'd requeue — but
+        // it's cleaner (and avoids a spurious state transition) to not claim at all.
+        // The existing periodic tick will retry once the connection is up.
+        if !source.is_ready() {
+            tracing::debug!("backfill worker: source not ready — skipping claim until connected");
+            continue;
+        }
+
         // Claim the next queued job
         let job = match store.claim_next_backfill_job().await {
             Ok(Some(j)) => j,
@@ -977,6 +1041,12 @@ pub async fn run_worker_loop(
             Ok(JobEnd::Cancelled) => {
                 // Shutdown cancel → requeue so it resumes after restart
                 ("queued", "cancelled (shutdown) → requeued")
+            }
+            Ok(JobEnd::Deferred) => {
+                // Source not ready (WA not connected) → requeue for retry once connected.
+                // ADR 0026: a not-connected condition is transient; never mark failed.
+                tracing::debug!(job_id = job.id, "backfill job deferred — waiting for connection");
+                ("queued", "deferred (not connected) → requeued")
             }
             Ok(JobEnd::Failed(reason)) => {
                 tracing::warn!(job_id = job.id, reason, "backfill job failed");
@@ -2418,5 +2488,257 @@ mod tests {
         assert_eq!(anchor.oldest_msg_id, "", "empty anchor id");
         assert!(!anchor.oldest_msg_from_me);
         assert_eq!(anchor.oldest_msg_timestamp_ms, 0, "empty anchor ts_ms = 0");
+    }
+
+    // =========================================================================
+    // ADR 0026 connection-gating tests
+    // =========================================================================
+
+    // --- process_job: not-ready source → Deferred, no fetch attempted, cursor unchanged ---
+
+    #[tokio::test]
+    async fn test_process_job_not_ready_returns_deferred_no_fetch() {
+        let (store, dir) = open_b1_store("gate-not-ready");
+
+        // Source starts not-ready; its fetch_older would fail if called.
+        let source = FakeHistorySource::error("must not be called — not ready");
+        source.set_ready(false);
+
+        let sink = FakeBatchSink::always_ok();
+        let job = enqueue_and_claim(&store, "gate-chat@s.whatsapp.net", "all", None).await;
+        let cancel = CancellationToken::new();
+
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+            .await
+            .unwrap();
+
+        assert_eq!(end, JobEnd::Deferred, "not-ready source must return Deferred");
+
+        // No fetch was attempted — sink has no calls
+        assert!(sink.recorded_calls().is_empty(), "no batch must be persisted when deferred");
+
+        // Cursor is unchanged (None — never written)
+        let cursor = store.get_backfill_cursor("gate-chat@s.whatsapp.net").await.unwrap();
+        assert!(cursor.is_none(), "cursor must not be written when deferred before first fetch");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- process_job: fetch error while not-ready → Deferred (not Failed) ---
+
+    #[tokio::test]
+    async fn test_process_job_fetch_error_while_disconnected_returns_deferred() {
+        let (store, dir) = open_b1_store("gate-fetch-err-disconnect");
+
+        // Source is initially ready (so the loop starts), then becomes not-ready
+        // before fetch_older returns an error (simulating a mid-fetch disconnect).
+        // We implement this with a custom source that flips ready=false on its first call.
+        struct DisconnectOnFetch {
+            inner: FakeHistorySource,
+        }
+        #[async_trait::async_trait]
+        impl HistorySource for DisconnectOnFetch {
+            fn is_ready(&self) -> bool {
+                self.inner.is_ready()
+            }
+            async fn fetch_older(&self, jid: &str, anchor: &Anchor, count: i32)
+                -> anyhow::Result<HistoryBatch>
+            {
+                // Simulate disconnect during the fetch
+                self.inner.set_ready(false);
+                self.inner.fetch_older(jid, anchor, count).await
+            }
+        }
+
+        let inner = FakeHistorySource::error("LiveHistorySource: no active client");
+        inner.set_ready(true); // ready at start; flip happens inside fetch_older
+        let source = DisconnectOnFetch { inner };
+
+        let sink = FakeBatchSink::always_ok();
+        let job = enqueue_and_claim(&store, "gate-mid@s.whatsapp.net", "all", None).await;
+        let cancel = CancellationToken::new();
+
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+            .await
+            .unwrap();
+
+        assert_eq!(end, JobEnd::Deferred,
+            "fetch error while disconnected must return Deferred, not Failed");
+
+        assert!(sink.recorded_calls().is_empty(), "no batch must be persisted when deferred");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- process_job: fetch error while ready → Failed (existing behaviour preserved) ---
+
+    #[tokio::test]
+    async fn test_process_job_fetch_error_while_ready_returns_failed() {
+        let (store, dir) = open_b1_store("gate-fetch-err-ready");
+
+        // Source is ready; fetch returns an error → should still be Failed (not Deferred)
+        let source = FakeHistorySource::error("network timeout");
+        // ready is true by default
+
+        let sink = FakeBatchSink::always_ok();
+        let job = enqueue_and_claim(&store, "ready-err@s.whatsapp.net", "all", None).await;
+        let cancel = CancellationToken::new();
+
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+            .await
+            .unwrap();
+
+        match end {
+            JobEnd::Failed(reason) => {
+                assert!(reason.contains("network timeout"), "got: {reason}");
+            }
+            other => panic!("expected Failed when ready+error, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- run_worker_loop: not-ready → job not claimed / not failed; ready → processed Done ---
+
+    #[tokio::test]
+    async fn test_run_worker_loop_defers_until_ready() {
+        let (store, dir) = open_b1_store("driver-gate");
+
+        // Source starts not-ready; one exhausted batch once ready
+        let source = Arc::new(FakeHistorySource::exhausted());
+        source.set_ready(false);
+
+        let sink = Arc::new(FakeBatchSink::always_ok());
+        let notify = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+
+        // Enqueue a job
+        store.enqueue_backfill_job("gate-driver@s.whatsapp.net", "all", None, 0)
+            .await.unwrap();
+
+        let store2 = store.clone();
+        let notify2 = notify.clone();
+        let cancel2 = cancel.clone();
+        let source2 = source.clone();
+        let sink2 = sink.clone();
+
+        let loop_handle = tokio::spawn(async move {
+            run_worker_loop(source2, sink2, store2, no_pacer(), 10, 0, notify2, cancel2).await;
+        });
+
+        // Trigger first tick — source not ready, job must NOT be claimed
+        notify.notify_one();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Job must still be queued (not claimed/failed)
+        let jobs = store.list_backfill_jobs(false).await.unwrap();
+        let job = jobs.iter().find(|j| j.chat_jid == "gate-driver@s.whatsapp.net")
+            .expect("job must exist");
+        assert_eq!(job.status, "queued",
+            "job must stay queued when source is not ready, got '{}'", job.status);
+
+        // Now flip to ready and notify — the job should be processed to Done
+        source.set_ready(true);
+        notify.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let jobs = store.list_backfill_jobs(false).await.unwrap();
+        let job = jobs.iter().find(|j| j.chat_jid == "gate-driver@s.whatsapp.net")
+            .expect("job must exist");
+        assert_eq!(job.status, "done",
+            "job must be done after source becomes ready, got '{}'", job.status);
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(200), loop_handle)
+            .await
+            .expect("loop should exit promptly after cancel")
+            .expect("loop task must not panic");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- run_worker_loop: Deferred → job back to queued (not failed) ---
+
+    #[tokio::test]
+    async fn test_run_worker_loop_deferred_maps_to_queued() {
+        let (store, dir) = open_b1_store("driver-deferred");
+
+        // Source starts ready so the job gets claimed, but returns Deferred from process_job.
+        // We achieve this by having is_ready() return true initially so the loop claims the job,
+        // but then have it return false inside the pagination loop when process_job checks.
+        // The simplest way: use a source whose is_ready() starts false but the claim-gate check
+        // passes because we're checking after the initial "ready" window.
+        //
+        // Actually: since run_worker_loop checks is_ready() before claiming, we need a source
+        // that is ready at claim time but becomes not-ready when process_job checks at loop start.
+        // We simulate this with an AtomicBool that flips after claim_next_backfill_job is called,
+        // i.e., the source becomes not-ready between the claim-guard check and the process_job
+        // readiness check. We'll just test that Deferred output → mark_backfill_job("queued").
+        //
+        // Simplest approach: set ready=false from the start and rely on the driver skipping the
+        // claim check (POLL_INTERVAL is 5s; we use notify to drive). But the claim-gate skips
+        // entirely. So let us drive a Deferred by having the source be ready=true at loop entry
+        // but not-ready by the time process_job's inner check runs.
+        //
+        // To avoid async races we use a custom source.
+        struct FlipAfterFirstIsReady {
+            calls: std::sync::atomic::AtomicU32,
+        }
+        #[async_trait::async_trait]
+        impl HistorySource for FlipAfterFirstIsReady {
+            fn is_ready(&self) -> bool {
+                // First call (from run_worker_loop claim-gate) returns true.
+                // Second call (from process_job loop) returns false → Deferred.
+                let prev = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                prev == 0
+            }
+            async fn fetch_older(&self, _jid: &str, _anchor: &Anchor, _count: i32)
+                -> anyhow::Result<HistoryBatch>
+            {
+                // Should not be reached because process_job returns Deferred before fetch
+                Err(anyhow::anyhow!("must not be called"))
+            }
+        }
+
+        let source = Arc::new(FlipAfterFirstIsReady {
+            calls: std::sync::atomic::AtomicU32::new(0),
+        });
+        let sink = Arc::new(FakeBatchSink::always_ok());
+        let notify = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+
+        // Enqueue a job
+        let outcome = store.enqueue_backfill_job("deferred-driver@s.whatsapp.net", "all", None, 0)
+            .await.unwrap();
+        let job_id = match outcome {
+            EnqueueOutcome::Accepted { job_id } => job_id,
+            other => panic!("expected Accepted, got {:?}", other),
+        };
+
+        let store2 = store.clone();
+        let notify2 = notify.clone();
+        let cancel2 = cancel.clone();
+        let source2 = source.clone();
+        let sink2 = sink.clone();
+
+        let loop_handle = tokio::spawn(async move {
+            run_worker_loop(source2, sink2, store2, no_pacer(), 10, 0, notify2, cancel2).await;
+        });
+
+        notify.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Job must be back to queued (Deferred → requeued), NOT failed
+        let row = store.get_backfill_job(job_id).await.unwrap().unwrap();
+        assert_eq!(row.status, "queued",
+            "Deferred must requeue the job, got '{}'", row.status);
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(200), loop_handle)
+            .await
+            .expect("loop should exit promptly after cancel")
+            .expect("loop task must not panic");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
