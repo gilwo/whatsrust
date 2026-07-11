@@ -9,6 +9,7 @@
 //!   whatsrust <command>    — CLI mode (sends HTTP to running daemon, prints JSON)
 
 mod api;
+mod backfill;
 mod bridge;
 mod bridge_events;
 mod dedup;

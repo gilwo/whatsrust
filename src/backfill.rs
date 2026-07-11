@@ -26,6 +26,53 @@ use tokio_util::sync::CancellationToken;
 use waproto::whatsapp as wa;
 
 // ---------------------------------------------------------------------------
+// HistoryCorrelator — session-id registry for on-demand fetch (Wave B2b)
+// ---------------------------------------------------------------------------
+
+/// Matches an outstanding on-demand history-fetch request to the arriving
+/// `Event::HistorySync` by `peer_data_request_session_id`.
+///
+/// Usage:
+///   1. Caller invokes `client.fetch_message_history(...)` → obtains a `session_id`.
+///   2. Caller calls `register(session_id)` → gets a `Receiver`.
+///   3. When `Event::HistorySync` arrives, `handle_event` calls `fulfill(sid, lazy)`.
+///   4. Caller awaits the `Receiver` to get the `LazyHistorySync`.
+pub struct HistoryCorrelator {
+    pending: dashmap::DashMap<String, tokio::sync::oneshot::Sender<Box<wacore::types::events::LazyHistorySync>>>,
+}
+
+impl HistoryCorrelator {
+    pub fn new() -> Self {
+        Self { pending: dashmap::DashMap::new() }
+    }
+
+    /// Register a pending fetch: insert a oneshot sender keyed by `session_id`.
+    /// Returns the receiver the caller should await.
+    pub fn register(
+        &self,
+        session_id: String,
+    ) -> tokio::sync::oneshot::Receiver<Box<wacore::types::events::LazyHistorySync>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending.insert(session_id, tx);
+        rx
+    }
+
+    /// Fulfill a pending fetch: remove the sender for `session_id` and send `lazy`.
+    /// Returns `true` if a matching pending entry was found and the send succeeded.
+    pub fn fulfill(
+        &self,
+        session_id: &str,
+        lazy: Box<wacore::types::events::LazyHistorySync>,
+    ) -> bool {
+        if let Some((_, tx)) = self.pending.remove(session_id) {
+            tx.send(lazy).is_ok()
+        } else {
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Anchor — the per-chat backward-pagination frontier
 // ---------------------------------------------------------------------------
 
