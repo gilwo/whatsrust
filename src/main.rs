@@ -121,6 +121,37 @@ pub fn validate_backfill_safety(
     Ok(warnings)
 }
 
+/// Parse a DANGEROUSLY_ALLOW_* flag: truthy = "1" or "true" (case-insensitive).
+/// If the var is set but not a recognised truthy value, warns and returns false (fail-safe).
+/// Requires tracing to be initialised before use.
+fn parse_dangerously_flag(key: &str) -> bool {
+    match std::env::var(key) {
+        Err(_) => false,
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+        Ok(v) if v.is_empty() => false,
+        Ok(v) => {
+            tracing::warn!(
+                var = key,
+                value = %v,
+                "unrecognised value for override flag — treating as false (use =1 to enable)"
+            );
+            false
+        }
+    }
+}
+
+/// Parse an env var into T, warning via tracing if the var is present but unparseable.
+/// Requires tracing to be initialised before use.
+fn parse_env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+    match std::env::var(key) {
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            tracing::warn!(var = key, value = %v, "unparseable env value; using default");
+            default
+        }),
+        Err(_) => default,
+    }
+}
+
 /// Read the API port from env, with fallback chain.
 fn get_port() -> u16 {
     std::env::var("WHATSRUST_PORT")
@@ -172,18 +203,8 @@ async fn async_main() -> Result<()> {
         return cli_main(&args[1..]).await;
     }
 
-    // Daemon mode
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "whatsrust=info,whatsapp_rust=info".parse().unwrap()),
-        )
-        .init();
-
-    info!("whatsrust v{}", env!("CARGO_PKG_VERSION"));
-
-    // --- dotenvy: load .env file BEFORE any env::var reads (ADR 0023) ---
-    // Absent file → silent no-op. Malformed entry → log warn + continue.
+    // --- dotenvy: load .env file BEFORE tracing init so RUST_LOG in .env takes effect (ADR 0023) ---
+    // Absent file → silent no-op. Malformed entry → eprintln! (tracing not yet initialised).
     // Real env vars take precedence (dotenvy fills unset vars only).
     {
         let env_path = std::env::var("WHATSRUST_ENV_FILE")
@@ -194,10 +215,20 @@ async fn async_main() -> Result<()> {
                 // absent file is a no-op
             }
             Err(e) => {
-                warn!(path = %env_path, error = %e, "dotenvy: malformed .env file, continuing with environment only");
+                eprintln!("whatsrust: dotenvy: malformed .env file at {env_path}: {e} — continuing with environment only");
             }
         }
     }
+
+    // Daemon mode
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "whatsrust=info,whatsapp_rust=info".parse().unwrap()),
+        )
+        .init();
+
+    info!("whatsrust v{}", env!("CARGO_PKG_VERSION"));
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel(256);
     let cancel = CancellationToken::new();
@@ -238,38 +269,14 @@ async fn async_main() -> Result<()> {
     // --- Backfill knobs (ADR 0021/0022/0023) ---
     let bf_default = bridge::BridgeConfig::default();
 
-    let backfill_interval_secs: u64 = std::env::var("WHATSRUST_BACKFILL_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(bf_default.backfill_interval_secs);
-    let backfill_max_concurrent: u32 = std::env::var("WHATSRUST_BACKFILL_MAX_CONCURRENT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(bf_default.backfill_max_concurrent);
-    let backfill_max_messages: i64 = std::env::var("WHATSRUST_BACKFILL_MAX_MESSAGES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(bf_default.backfill_max_messages);
-    let backfill_batch_size: i32 = std::env::var("WHATSRUST_BACKFILL_BATCH_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(bf_default.backfill_batch_size);
-    let backfill_backstop: u32 = std::env::var("WHATSRUST_BACKFILL_BACKSTOP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(bf_default.backfill_backstop);
-    let backfill_jitter_frac: f64 = std::env::var("WHATSRUST_BACKFILL_JITTER_FRAC")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(bf_default.backfill_jitter_frac);
-    let backfill_cooldown_secs: i64 = std::env::var("WHATSRUST_BACKFILL_COOLDOWN_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(bf_default.backfill_cooldown_secs);
-    let backfill_queue_depth: i64 = std::env::var("WHATSRUST_BACKFILL_QUEUE_DEPTH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(bf_default.backfill_queue_depth);
+    let backfill_interval_secs: u64 = parse_env_or("WHATSRUST_BACKFILL_INTERVAL_SECS", bf_default.backfill_interval_secs);
+    let backfill_max_concurrent: u32 = parse_env_or("WHATSRUST_BACKFILL_MAX_CONCURRENT", bf_default.backfill_max_concurrent);
+    let backfill_max_messages: i64 = parse_env_or("WHATSRUST_BACKFILL_MAX_MESSAGES", bf_default.backfill_max_messages);
+    let backfill_batch_size: i32 = parse_env_or("WHATSRUST_BACKFILL_BATCH_SIZE", bf_default.backfill_batch_size);
+    let backfill_backstop: u32 = parse_env_or("WHATSRUST_BACKFILL_BACKSTOP", bf_default.backfill_backstop);
+    let backfill_jitter_frac: f64 = parse_env_or("WHATSRUST_BACKFILL_JITTER_FRAC", bf_default.backfill_jitter_frac);
+    let backfill_cooldown_secs: i64 = parse_env_or("WHATSRUST_BACKFILL_COOLDOWN_SECS", bf_default.backfill_cooldown_secs);
+    let backfill_queue_depth: i64 = parse_env_or("WHATSRUST_BACKFILL_QUEUE_DEPTH", bf_default.backfill_queue_depth);
 
     // --- Fail-closed safety validation (ADR 0022) — MUST run before bridge construction ---
     let safety = BackfillSafety {
@@ -278,15 +285,9 @@ async fn async_main() -> Result<()> {
         max_messages: backfill_max_messages,
     };
     let overrides = SafetyOverrides {
-        allow_fast: std::env::var("WHATSRUST_DANGEROUSLY_ALLOW_FAST_BACKFILL")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false),
-        allow_high_concurrency: std::env::var("WHATSRUST_DANGEROUSLY_ALLOW_HIGH_CONCURRENCY")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false),
-        allow_huge_fetch: std::env::var("WHATSRUST_DANGEROUSLY_ALLOW_HUGE_FETCH")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false),
+        allow_fast: parse_dangerously_flag("WHATSRUST_DANGEROUSLY_ALLOW_FAST_BACKFILL"),
+        allow_high_concurrency: parse_dangerously_flag("WHATSRUST_DANGEROUSLY_ALLOW_HIGH_CONCURRENCY"),
+        allow_huge_fetch: parse_dangerously_flag("WHATSRUST_DANGEROUSLY_ALLOW_HUGE_FETCH"),
     };
     match validate_backfill_safety(&safety, &overrides) {
         Ok(warnings) => {
@@ -299,6 +300,13 @@ async fn async_main() -> Result<()> {
             eprintln!("{msg}");
             std::process::exit(1);
         }
+    }
+    // M1 runs a single-FIFO backfill worker; multi-worker is deferred to M2.
+    if backfill_max_concurrent > 1 {
+        warn!(
+            n = backfill_max_concurrent,
+            "WHATSRUST_BACKFILL_MAX_CONCURRENT > 1 has no effect yet (M1 single-FIFO worker; multi-worker deferred)"
+        );
     }
 
     let config = BridgeConfig {
@@ -2086,5 +2094,16 @@ mod safety_tests {
         let msg = result.unwrap_err();
         // Should report interval_secs (first check)
         assert!(msg.contains("WHATSRUST_BACKFILL_INTERVAL_SECS"), "should report first violation: {msg}");
+    }
+
+    /// (safety-edge) interval_secs = 0 is the most extreme under-floor case and must be rejected
+    /// even without any override.
+    #[test]
+    fn test_safety_zero_interval_is_rejected() {
+        let s = BackfillSafety { interval_secs: 0, ..safe_defaults() };
+        let result = validate_backfill_safety(&s, &all_ok());
+        assert!(result.is_err(), "interval_secs=0 must be rejected");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("WHATSRUST_BACKFILL_INTERVAL_SECS"), "error must name the knob: {msg}");
     }
 }

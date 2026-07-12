@@ -4347,6 +4347,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (bf-c5b) max_messages=0 is the sentinel for "no clamp"; a large target must be accepted as-is.
+    /// Guards against a regression where max_messages=0 accidentally zeroes the target.
+    #[tokio::test]
+    async fn test_backfill_enqueue_count_max_messages_zero_means_no_clamp() {
+        let (store, dir) = open_backfill_store("bf-zero-max");
+
+        let outcome = store
+            .enqueue_backfill_job("zeroclamp@s.whatsapp.net", "count", Some(9999), 0, 0, 0)
+            .await
+            .unwrap();
+        match outcome {
+            EnqueueOutcome::Accepted { job_id, accepted_target } => {
+                assert!(job_id > 0);
+                assert_eq!(
+                    accepted_target,
+                    Some(9999),
+                    "max_messages=0 must NOT clamp; expected Some(9999), got {:?}",
+                    accepted_target
+                );
+                let row = store.get_backfill_job(job_id).await.unwrap().unwrap();
+                assert_eq!(row.target_value, Some(9999), "DB row must store the unclamped target");
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// (bf-c6) Check order: one-active-per-chat fires before queue-depth check.
     #[tokio::test]
     async fn test_backfill_enqueue_active_check_before_queue_depth() {
