@@ -2000,6 +2000,7 @@ async fn run_bridge(
         let bf_source = Arc::new(LiveHistorySource::new(
             client_handle.clone(),
             correlator.clone(),
+            store.clone(),
         ));
         let bf_sink = Arc::new(LiveBatchSink::new(
             client_handle.clone(),
@@ -4052,14 +4053,16 @@ fn rand_jitter_ms(base_ms: u64) -> u64 {
 pub(crate) struct LiveHistorySource {
     client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
     correlator: Arc<crate::backfill::HistoryCorrelator>,
+    store: Store,
 }
 
 impl LiveHistorySource {
     pub fn new(
         client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
         correlator: Arc<crate::backfill::HistoryCorrelator>,
+        store: Store,
     ) -> Self {
-        Self { client_handle, correlator }
+        Self { client_handle, correlator, store }
     }
 }
 
@@ -4103,7 +4106,17 @@ impl crate::backfill::HistorySource for LiveHistorySource {
             .get()
             .ok_or_else(|| anyhow::anyhow!("LiveHistorySource: history sync decode failed"))?;
 
-        Ok(crate::backfill::drain_history_sync(hs, chat_jid))
+        // Build the accepted-ids set: the requested phone JID plus the LID alias if known.
+        // The phone may return Conversation.id as a LID even though we requested by phone JID.
+        // We probe lid_pn_mapping by the bare phone number (e.g. "972542271337").
+        let mut accepted_ids = vec![chat_jid.to_string()];
+        if let Some((bare_phone, _)) = chat_jid.split_once('@') {
+            if let Ok(Some(entry)) = self.store.get_pn_mapping(bare_phone).await {
+                accepted_ids.push(format!("{}@lid", entry.lid));
+            }
+        }
+
+        Ok(crate::backfill::drain_history_sync(hs, &accepted_ids))
     }
 }
 
@@ -4136,7 +4149,7 @@ impl LiveBatchSink {
 impl crate::backfill::BatchSink for LiveBatchSink {
     async fn persist_batch(
         &self,
-        _chat_jid: &str,
+        chat_jid: &str,
         batch: &crate::backfill::HistoryBatch,
     ) -> anyhow::Result<usize> {
         let client = get_client_handle(&self.client_handle)
@@ -4151,10 +4164,8 @@ impl crate::backfill::BatchSink for LiveBatchSink {
                 None => continue,
             };
 
-            let chat_jid = match web.key.remote_jid.as_deref() {
-                Some(j) => j,
-                None => continue,
-            };
+            // Use the requested chat_jid (phone JID) rather than web.key.remote_jid (may be LID).
+            // This ensures backfilled rows unify with the live timeline under the phone JID.
             let msg_id = match web.key.id.as_deref() {
                 Some(id) => id,
                 None => continue,
@@ -4162,9 +4173,13 @@ impl crate::backfill::BatchSink for LiveBatchSink {
             let from_me = web.key.from_me.unwrap_or(false);
             // messageTimestamp is Unix seconds in the proto
             let ts_secs = web.message_timestamp.unwrap_or(0) as i64;
+
             // For group messages the real sender is in `participant`; for DMs it's the remote JID.
-            let sender_jid = web.key.participant.as_deref()
+            // Resolve @lid → @s.whatsapp.net so the stored sender matches the live path.
+            let sender_raw = web.key.participant.as_deref()
                 .unwrap_or_else(|| web.key.remote_jid.as_deref().unwrap_or(""));
+            let sender_resolved = resolve_chat_jid(sender_raw, None, &self.store).await;
+            let sender_jid = sender_resolved.as_str();
 
             // Do NOT emit inbound events / mark-read / store poll keys (live-only).
             // Media stays lazy (ADR 0005) — extract_content_inner handles download if needed.
