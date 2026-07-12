@@ -723,6 +723,10 @@ pub struct BridgeConfig {
     pub backfill_interval_secs: u64,
     /// Maximum concurrent backfill jobs (default: 1).
     /// Guarded: ceiling 3 (WHATSRUST_DANGEROUSLY_ALLOW_HIGH_CONCURRENCY to override).
+    ///
+    /// **NOTE (M1):** this field is validated for safety but is **not yet wired** into the
+    /// worker — M1 runs a single-FIFO backfill worker regardless of this value.
+    /// Multi-worker support is deferred to M2. A startup warn! is emitted when > 1.
     pub backfill_max_concurrent: u32,
     /// Maximum messages per backfill request (daemon-side clamp, default: 50000).
     /// Guarded: ceiling 50000 (WHATSRUST_DANGEROUSLY_ALLOW_HUGE_FETCH to override).
