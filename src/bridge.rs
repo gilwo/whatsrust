@@ -715,6 +715,28 @@ pub struct BridgeConfig {
     pub device_name: String,
     /// Maximum message IDs tracked for dedup (default: 4096).
     pub dedup_capacity: usize,
+
+    // ---- Backfill knobs (Wave C / ADR 0021-0023) ----
+
+    /// Backfill worker base delay between batches in seconds (default: 4).
+    /// Guarded: floor 3 (WHATSRUST_DANGEROUSLY_ALLOW_FAST_BACKFILL to override).
+    pub backfill_interval_secs: u64,
+    /// Maximum concurrent backfill jobs (default: 1).
+    /// Guarded: ceiling 3 (WHATSRUST_DANGEROUSLY_ALLOW_HIGH_CONCURRENCY to override).
+    pub backfill_max_concurrent: u32,
+    /// Maximum messages per backfill request (daemon-side clamp, default: 50000).
+    /// Guarded: ceiling 50000 (WHATSRUST_DANGEROUSLY_ALLOW_HUGE_FETCH to override).
+    pub backfill_max_messages: i64,
+    /// Batch size for backfill worker (messages per WA request, default: 50).
+    pub backfill_batch_size: i32,
+    /// Backstop: maximum total messages per backfill job (default: 20000).
+    pub backfill_backstop: u32,
+    /// Jitter fraction for backfill pacer (default: 0.4).
+    pub backfill_jitter_frac: f64,
+    /// Per-chat cooldown between backfill jobs in seconds (default: 300).
+    pub backfill_cooldown_secs: i64,
+    /// Maximum number of active+queued backfill jobs (default: 5).
+    pub backfill_queue_depth: i64,
 }
 
 impl Default for BridgeConfig {
@@ -738,6 +760,14 @@ impl Default for BridgeConfig {
             presence_tx: None,
             device_name: "Habb".to_string(),
             dedup_capacity: DEDUP_CACHE_CAPACITY,
+            backfill_interval_secs: 4,
+            backfill_max_concurrent: 1,
+            backfill_max_messages: 50_000,
+            backfill_batch_size: 50,
+            backfill_backstop: 20_000,
+            backfill_jitter_frac: 0.4,
+            backfill_cooldown_secs: 300,
+            backfill_queue_depth: 5,
         }
     }
 }
@@ -2009,18 +2039,19 @@ async fn run_bridge(
         let bf_store = store.clone();
         let bf_notify = backfill_notify.clone();
         let bf_cancel = cancel.clone();
-        // Wave C: make configurable (WHATSRUST_*)
         let bf_pacer = crate::backfill::BackfillPacer {
-            base_delay: Duration::from_secs(4),
-            jitter_frac: 0.4,
+            base_delay: Duration::from_secs(config.backfill_interval_secs),
+            jitter_frac: config.backfill_jitter_frac,
         };
+        let bf_batch_size = config.backfill_batch_size;
+        let bf_backstop = config.backfill_backstop;
         tokio::spawn(crate::backfill::run_worker_loop(
             bf_source,
             bf_sink,
             bf_store,
             bf_pacer,
-            50,      // batch_size — Wave C: make configurable (WHATSRUST_*)
-            20_000,  // backstop  — Wave C: make configurable (WHATSRUST_*)
+            bf_batch_size,
+            bf_backstop,
             bf_notify,
             bf_cancel,
         ));
@@ -2038,6 +2069,9 @@ async fn run_bridge(
                 let chat = chat.to_string();
                 let store_bt = store.clone();
                 let notify_bt = backfill_notify.clone();
+                let bt_cooldown = config.backfill_cooldown_secs;
+                let bt_queue_depth = config.backfill_queue_depth;
+                let bt_max_messages = config.backfill_max_messages;
                 tokio::spawn(async move {
                     match store_bt.get_oldest_message(&chat).await {
                         Ok(oldest) => {
@@ -2058,16 +2092,24 @@ async fn run_bridge(
                                 return;
                             }
                             match store_bt
-                                .enqueue_backfill_job(&chat, "count", Some(count), 0)
+                                .enqueue_backfill_job(&chat, "count", Some(count), bt_cooldown, bt_queue_depth, bt_max_messages)
                                 .await
                             {
-                                Ok(_) => {
+                                Ok(crate::storage::EnqueueOutcome::Accepted { job_id, accepted_target }) => {
                                     info!(
                                         chat = %chat,
                                         count,
+                                        job_id,
+                                        accepted_target = ?accepted_target,
                                         "backfill smoke-test: seeded cursor and enqueued job"
                                     );
                                     notify_bt.notify_one();
+                                }
+                                Ok(crate::storage::EnqueueOutcome::QueueFull { limit }) => {
+                                    warn!(limit, "backfill smoke-test: queue full, job not enqueued");
+                                }
+                                Ok(other) => {
+                                    info!(outcome = ?other, "backfill smoke-test: job not enqueued (back-pressure)");
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "backfill smoke-test: enqueue_backfill_job failed");

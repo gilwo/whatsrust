@@ -949,11 +949,16 @@ pub struct BackfillCursorRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnqueueOutcome {
     /// Job was accepted; `job_id` is the new row's id.
-    Accepted { job_id: i64 },
+    /// `accepted_target` is the effective target value stored (may be clamped from the
+    /// requested value when `target_kind == "count"` and `queue_depth_limit` is set).
+    /// `None` for non-count jobs or when no clamping is applicable.
+    Accepted { job_id: i64, accepted_target: Option<i64> },
     /// A job for this chat is already active (queued/running/paused); `job_id` is the existing one.
     AlreadyActive { job_id: i64 },
     /// The chat's last backfill completed within the cooldown window.
     Cooldown { retry_after_secs: i64 },
+    /// Global queue is at capacity; no new jobs accepted until existing ones drain.
+    QueueFull { limit: i64 },
 }
 
 impl Store {
@@ -1512,16 +1517,28 @@ impl Store {
     /// The entire check-and-insert runs in ONE `unchecked_transaction` closure
     /// (ADR 0035 B5 — TOCTOU fix; mirrors `claim_next_job` atomicity):
     ///
-    ///   BEGIN → check for active job → check cooldown → INSERT-or-reject → COMMIT
+    ///   BEGIN → check for active job → check cooldown → check queue-depth → clamp → INSERT → COMMIT
     ///
-    /// Returns a structured `EnqueueOutcome` instead of an error for the two
-    /// rejection cases — they are normal back-pressure, not faults.
+    /// Check order (ADR 0021):
+    ///   1. one-active-per-chat
+    ///   2. per-chat cooldown
+    ///   3. global queue-depth limit (returns `QueueFull` when at capacity)
+    ///   4. clamp `target_value` to `max_messages` for `"count"` jobs (returns clamped value in `accepted_target`)
+    ///
+    /// Returns a structured `EnqueueOutcome` instead of an error for the rejection
+    /// and back-pressure cases — they are normal flow, not faults.
+    ///
+    /// # Parameters
+    /// - `queue_depth_limit`: maximum allowed active+queued+paused jobs across all chats (0 = unlimited).
+    /// - `max_messages`: for `"count"` jobs, clamp `target_value` to this ceiling (0 = no clamp).
     pub async fn enqueue_backfill_job(
         &self,
         chat_jid: &str,
         target_kind: &str,
         target_value: Option<i64>,
         cooldown_secs: i64,
+        queue_depth_limit: i64,
+        max_messages: i64,
     ) -> Result<EnqueueOutcome> {
         let jid = chat_jid.to_owned();
         let kind = target_kind.to_owned();
@@ -1529,7 +1546,7 @@ impl Store {
         self.run(move |c| {
             let tx = c.unchecked_transaction().map_err(db_err)?;
 
-            // Check for an already-active job for this chat
+            // 1. Check for an already-active job for this chat
             let active: Option<i64> = tx
                 .query_row(
                     "SELECT id FROM backfill_jobs
@@ -1546,7 +1563,7 @@ impl Store {
                 return Ok(EnqueueOutcome::AlreadyActive { job_id: existing_id });
             }
 
-            // Check per-chat cooldown via backfill_cursor.last_backfill_at
+            // 2. Check per-chat cooldown via backfill_cursor.last_backfill_at
             if cooldown_secs > 0 {
                 let last_at: Option<i64> = tx
                     .query_row(
@@ -1568,17 +1585,42 @@ impl Store {
                 }
             }
 
-            // Insert the new job
+            // 3. Global queue-depth limit (ADR 0021)
+            if queue_depth_limit > 0 {
+                let depth: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM backfill_jobs WHERE status IN ('queued', 'running', 'paused')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(db_err)?;
+                if depth >= queue_depth_limit {
+                    tx.commit().map_err(db_err)?;
+                    return Ok(EnqueueOutcome::QueueFull { limit: queue_depth_limit });
+                }
+            }
+
+            // 4. Clamp target_value for "count" jobs (ADR 0021)
+            let effective_target = if kind == "count" && max_messages > 0 {
+                target_value.map(|v| v.min(max_messages))
+            } else {
+                target_value
+            };
+
+            // Carry accepted_target only if the value was actually clamped or is a count job
+            let accepted_target = if kind == "count" { effective_target } else { None };
+
+            // Insert the new job with effective (possibly clamped) target_value
             tx.execute(
                 "INSERT INTO backfill_jobs (chat_jid, target_kind, target_value, status, fetched, created_at, updated_at)
                  VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?4)",
-                params![jid, kind, target_value, ts],
+                params![jid, kind, effective_target, ts],
             )
             .map_err(db_err)?;
 
             let job_id = tx.last_insert_rowid();
             tx.commit().map_err(db_err)?;
-            Ok(EnqueueOutcome::Accepted { job_id })
+            Ok(EnqueueOutcome::Accepted { job_id, accepted_target })
         })
         .await
     }
@@ -3855,18 +3897,18 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-enqueue-dedup");
 
         let outcome1 = store
-            .enqueue_backfill_job("chat1@s.whatsapp.net", "all", None, 0)
+            .enqueue_backfill_job("chat1@s.whatsapp.net", "all", None, 0, 0, 0)
             .await
             .unwrap();
         let job_id = match outcome1 {
-            EnqueueOutcome::Accepted { job_id } => job_id,
+            EnqueueOutcome::Accepted { job_id, .. } => job_id,
             other => panic!("expected Accepted, got {:?}", other),
         };
         assert!(job_id > 0);
 
         // Second enqueue for same chat → AlreadyActive
         let outcome2 = store
-            .enqueue_backfill_job("chat1@s.whatsapp.net", "count", Some(50), 0)
+            .enqueue_backfill_job("chat1@s.whatsapp.net", "count", Some(50), 0, 0, 0)
             .await
             .unwrap();
         match outcome2 {
@@ -3893,7 +3935,7 @@ mod tests {
 
         // Enqueue with cooldown_secs = 3600 (1 hour)
         let outcome = store
-            .enqueue_backfill_job("chat2@s.whatsapp.net", "all", None, 3600)
+            .enqueue_backfill_job("chat2@s.whatsapp.net", "all", None, 3600, 0, 0)
             .await
             .unwrap();
         match outcome {
@@ -3922,7 +3964,7 @@ mod tests {
 
         // Enqueue with cooldown_secs = 3600 (1 hour) — should pass
         let outcome = store
-            .enqueue_backfill_job("chat3@s.whatsapp.net", "all", None, 3600)
+            .enqueue_backfill_job("chat3@s.whatsapp.net", "all", None, 3600, 0, 0)
             .await
             .unwrap();
         match outcome {
@@ -3940,20 +3982,20 @@ mod tests {
 
         // Enqueue two jobs for different chats
         let out1 = store
-            .enqueue_backfill_job("chatA@s.whatsapp.net", "all", None, 0)
+            .enqueue_backfill_job("chatA@s.whatsapp.net", "all", None, 0, 0, 0)
             .await
             .unwrap();
         let id1 = match out1 {
-            EnqueueOutcome::Accepted { job_id } => job_id,
+            EnqueueOutcome::Accepted { job_id, .. } => job_id,
             other => panic!("{:?}", other),
         };
 
         let out2 = store
-            .enqueue_backfill_job("chatB@s.whatsapp.net", "count", Some(100), 0)
+            .enqueue_backfill_job("chatB@s.whatsapp.net", "count", Some(100), 0, 0, 0)
             .await
             .unwrap();
         let id2 = match out2 {
-            EnqueueOutcome::Accepted { job_id } => job_id,
+            EnqueueOutcome::Accepted { job_id, .. } => job_id,
             other => panic!("{:?}", other),
         };
 
@@ -4047,11 +4089,11 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-case-guard");
 
         let out = store
-            .enqueue_backfill_job("chatGuard@g.us", "all", None, 0)
+            .enqueue_backfill_job("chatGuard@g.us", "all", None, 0, 0, 0)
             .await
             .unwrap();
         let job_id = match out {
-            EnqueueOutcome::Accepted { job_id } => job_id,
+            EnqueueOutcome::Accepted { job_id, .. } => job_id,
             other => panic!("{:?}", other),
         };
 
@@ -4080,11 +4122,11 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-case-guard-failed");
 
         let out = store
-            .enqueue_backfill_job("chatFail@g.us", "count", Some(100), 0)
+            .enqueue_backfill_job("chatFail@g.us", "count", Some(100), 0, 0, 0)
             .await
             .unwrap();
         let job_id = match out {
-            EnqueueOutcome::Accepted { job_id } => job_id,
+            EnqueueOutcome::Accepted { job_id, .. } => job_id,
             other => panic!("{:?}", other),
         };
         let _claimed = store.claim_next_backfill_job().await.unwrap().unwrap();
@@ -4104,11 +4146,11 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-fetched");
 
         let out = store
-            .enqueue_backfill_job("chatFetch@s.whatsapp.net", "count", Some(500), 0)
+            .enqueue_backfill_job("chatFetch@s.whatsapp.net", "count", Some(500), 0, 0, 0)
             .await
             .unwrap();
         let job_id = match out {
-            EnqueueOutcome::Accepted { job_id } => job_id,
+            EnqueueOutcome::Accepted { job_id, .. } => job_id,
             other => panic!("{:?}", other),
         };
 
@@ -4130,15 +4172,15 @@ mod tests {
 
         // Two chats, two jobs
         let out1 = store
-            .enqueue_backfill_job("listA@s.whatsapp.net", "all", None, 0)
+            .enqueue_backfill_job("listA@s.whatsapp.net", "all", None, 0, 0, 0)
             .await
             .unwrap();
         let id1 = match out1 {
-            EnqueueOutcome::Accepted { job_id } => job_id,
+            EnqueueOutcome::Accepted { job_id, .. } => job_id,
             other => panic!("{:?}", other),
         };
         store
-            .enqueue_backfill_job("listB@s.whatsapp.net", "count", Some(50), 0)
+            .enqueue_backfill_job("listB@s.whatsapp.net", "count", Some(50), 0, 0, 0)
             .await
             .unwrap();
 
@@ -4179,6 +4221,151 @@ mod tests {
         let row = store.get_backfill_cursor("chatP@s.whatsapp.net").await.unwrap().unwrap();
         assert_eq!(row.last_backfill_at, Some(ts), "last_backfill_at must be preserved when None is passed");
         assert_eq!(row.oldest_msg_id.as_deref(), Some("msg-x"), "anchor must be updated");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
+    // Wave C enqueue guard tests (ADR 0021)
+    // =========================================================================
+
+    /// (bf-c1) QueueFull: enqueue is rejected when the global queue-depth limit is reached.
+    #[tokio::test]
+    async fn test_backfill_enqueue_queue_full() {
+        let (store, dir) = open_backfill_store("bf-queue-full");
+
+        // Enqueue two jobs for different chats with limit=2
+        let o1 = store
+            .enqueue_backfill_job("fullA@s.whatsapp.net", "all", None, 0, 2, 0)
+            .await
+            .unwrap();
+        assert!(matches!(o1, EnqueueOutcome::Accepted { .. }), "first job must be accepted");
+
+        let o2 = store
+            .enqueue_backfill_job("fullB@s.whatsapp.net", "all", None, 0, 2, 0)
+            .await
+            .unwrap();
+        assert!(matches!(o2, EnqueueOutcome::Accepted { .. }), "second job must be accepted");
+
+        // Third job hits the limit (depth == 2 == limit)
+        let o3 = store
+            .enqueue_backfill_job("fullC@s.whatsapp.net", "all", None, 0, 2, 0)
+            .await
+            .unwrap();
+        match o3 {
+            EnqueueOutcome::QueueFull { limit } => {
+                assert_eq!(limit, 2, "QueueFull must echo the limit");
+            }
+            other => panic!("expected QueueFull, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-c2) QueueFull is not triggered when limit=0 (unlimited).
+    #[tokio::test]
+    async fn test_backfill_enqueue_zero_limit_is_unlimited() {
+        let (store, dir) = open_backfill_store("bf-unlimited");
+
+        // Enqueue many jobs with limit=0 — none should be rejected by QueueFull
+        for i in 0..10u32 {
+            let jid = format!("chat{}@s.whatsapp.net", i);
+            let outcome = store
+                .enqueue_backfill_job(&jid, "all", None, 0, 0, 0)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, EnqueueOutcome::Accepted { .. }),
+                "job {} must be accepted with limit=0, got {:?}", i, outcome
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-c3) count target above max_messages is clamped; accepted_target reflects the clamped value.
+    #[tokio::test]
+    async fn test_backfill_enqueue_count_clamped_to_max_messages() {
+        let (store, dir) = open_backfill_store("bf-clamp");
+
+        let outcome = store
+            .enqueue_backfill_job("clampChat@s.whatsapp.net", "count", Some(100_000), 0, 0, 50_000)
+            .await
+            .unwrap();
+        match outcome {
+            EnqueueOutcome::Accepted { job_id, accepted_target } => {
+                assert!(job_id > 0);
+                assert_eq!(accepted_target, Some(50_000), "count must be clamped to max_messages");
+                // Verify the DB row has the clamped value
+                let row = store.get_backfill_job(job_id).await.unwrap().unwrap();
+                assert_eq!(row.target_value, Some(50_000), "DB row must store clamped value");
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-c4) count target below max_messages is stored as-is; accepted_target matches requested.
+    #[tokio::test]
+    async fn test_backfill_enqueue_count_below_max_not_clamped() {
+        let (store, dir) = open_backfill_store("bf-no-clamp");
+
+        let outcome = store
+            .enqueue_backfill_job("noclampChat@s.whatsapp.net", "count", Some(1_000), 0, 0, 50_000)
+            .await
+            .unwrap();
+        match outcome {
+            EnqueueOutcome::Accepted { job_id, accepted_target } => {
+                assert!(job_id > 0);
+                assert_eq!(accepted_target, Some(1_000), "count below limit must be stored as-is");
+                let row = store.get_backfill_job(job_id).await.unwrap().unwrap();
+                assert_eq!(row.target_value, Some(1_000), "DB row must store unclamped value");
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-c5) non-count ("all") jobs are not clamped; accepted_target is None.
+    #[tokio::test]
+    async fn test_backfill_enqueue_all_job_not_clamped_accepted_target_is_none() {
+        let (store, dir) = open_backfill_store("bf-all-no-clamp");
+
+        let outcome = store
+            .enqueue_backfill_job("allChat@s.whatsapp.net", "all", None, 0, 0, 50_000)
+            .await
+            .unwrap();
+        match outcome {
+            EnqueueOutcome::Accepted { accepted_target, .. } => {
+                assert_eq!(accepted_target, None, "non-count jobs must have accepted_target = None");
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (bf-c6) Check order: one-active-per-chat fires before queue-depth check.
+    #[tokio::test]
+    async fn test_backfill_enqueue_active_check_before_queue_depth() {
+        let (store, dir) = open_backfill_store("bf-order");
+
+        // Fill the queue to capacity with other chats
+        store.enqueue_backfill_job("orderX@s.whatsapp.net", "all", None, 0, 2, 0).await.unwrap();
+        store.enqueue_backfill_job("orderY@s.whatsapp.net", "all", None, 0, 2, 0).await.unwrap();
+
+        // Enqueue a job for orderX again — must get AlreadyActive, NOT QueueFull,
+        // because the per-chat check comes first.
+        let o = store
+            .enqueue_backfill_job("orderX@s.whatsapp.net", "count", Some(100), 0, 2, 0)
+            .await
+            .unwrap();
+        assert!(
+            matches!(o, EnqueueOutcome::AlreadyActive { .. }),
+            "per-chat check must fire before queue-depth check; got {:?}", o
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -38,6 +38,89 @@ use whatsrust::mcp;
 
 const MAX_LOCAL_MEDIA_READ_BYTES: u64 = 50 * 1024 * 1024;
 
+// ---------------------------------------------------------------------------
+// Backfill safety validation (ADR 0022) — pure, testable, no I/O
+// ---------------------------------------------------------------------------
+
+/// The three ban-critical backfill knobs that are validated at startup.
+pub struct BackfillSafety {
+    pub interval_secs: u64,
+    pub max_concurrent: u32,
+    pub max_messages: i64,
+}
+
+/// Per-knob override flags (set via `WHATSRUST_DANGEROUSLY_ALLOW_*` env vars).
+pub struct SafetyOverrides {
+    pub allow_fast: bool,
+    pub allow_high_concurrency: bool,
+    pub allow_huge_fetch: bool,
+}
+
+/// Validate the three ban-critical backfill knobs against their safety bounds.
+///
+/// Returns `Ok(warnings)` when all violations are overridden (warnings are non-empty if any
+/// override flag is active). Returns `Err(message)` for the first unoverridable violation;
+/// the caller must print the message and exit non-zero BEFORE constructing the bridge.
+///
+/// Rules (ADR 0022):
+/// - `interval_secs < 3`  → violation; override: `WHATSRUST_DANGEROUSLY_ALLOW_FAST_BACKFILL=1`
+/// - `max_concurrent > 3` → violation; override: `WHATSRUST_DANGEROUSLY_ALLOW_HIGH_CONCURRENCY=1`
+/// - `max_messages > 50000` → violation; override: `WHATSRUST_DANGEROUSLY_ALLOW_HUGE_FETCH=1`
+///
+/// Multiple violations: the first violation encountered (in the order above) is reported as `Err`
+/// if unoverridden; overridden violations each contribute a warning string to the `Ok` return.
+pub fn validate_backfill_safety(
+    s: &BackfillSafety,
+    ov: &SafetyOverrides,
+) -> std::result::Result<Vec<String>, String> {
+    let mut warnings: Vec<String> = Vec::new();
+
+    // 1. interval_secs floor: 3 s (too-fast polling is a ban risk)
+    if s.interval_secs < 3 {
+        if ov.allow_fast {
+            warnings.push("fast_backfill_override_active".to_string());
+        } else {
+            return Err(format!(
+                "REFUSE TO START: WHATSRUST_BACKFILL_INTERVAL_SECS={} is below the safety floor of 3 seconds.\n\
+                 Reason: polling faster than 3 s risks WhatsApp rate-limiting or account ban.\n\
+                 To override (dangerous): set WHATSRUST_DANGEROUSLY_ALLOW_FAST_BACKFILL=1",
+                s.interval_secs
+            ));
+        }
+    }
+
+    // 2. max_concurrent ceiling: 3 (parallel backfill streams amplify ban risk)
+    if s.max_concurrent > 3 {
+        if ov.allow_high_concurrency {
+            warnings.push("high_concurrency_override_active".to_string());
+        } else {
+            return Err(format!(
+                "REFUSE TO START: WHATSRUST_BACKFILL_MAX_CONCURRENT={} exceeds the safety ceiling of 3.\n\
+                 Reason: running more than 3 concurrent backfill workers amplifies WhatsApp ban risk.\n\
+                 To override (dangerous): set WHATSRUST_DANGEROUSLY_ALLOW_HIGH_CONCURRENCY=1",
+                s.max_concurrent
+            ));
+        }
+    }
+
+    // 3. max_messages ceiling: 50000 (huge single fetches attract server-side scrutiny)
+    if s.max_messages > 50_000 {
+        if ov.allow_huge_fetch {
+            warnings.push("huge_fetch_override_active".to_string());
+        } else {
+            return Err(format!(
+                "REFUSE TO START: WHATSRUST_BACKFILL_MAX_MESSAGES={} exceeds the safety ceiling of 50000.\n\
+                 Reason: requesting more than 50 000 messages in a single backfill job attracts \
+                 server-side scrutiny and risks account suspension.\n\
+                 To override (dangerous): set WHATSRUST_DANGEROUSLY_ALLOW_HUGE_FETCH=1",
+                s.max_messages
+            ));
+        }
+    }
+
+    Ok(warnings)
+}
+
 /// Read the API port from env, with fallback chain.
 fn get_port() -> u16 {
     std::env::var("WHATSRUST_PORT")
@@ -99,6 +182,23 @@ async fn async_main() -> Result<()> {
 
     info!("whatsrust v{}", env!("CARGO_PKG_VERSION"));
 
+    // --- dotenvy: load .env file BEFORE any env::var reads (ADR 0023) ---
+    // Absent file → silent no-op. Malformed entry → log warn + continue.
+    // Real env vars take precedence (dotenvy fills unset vars only).
+    {
+        let env_path = std::env::var("WHATSRUST_ENV_FILE")
+            .unwrap_or_else(|_| ".env".to_string());
+        match dotenvy::from_path(&env_path) {
+            Ok(_) => {}
+            Err(dotenvy::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                // absent file is a no-op
+            }
+            Err(e) => {
+                warn!(path = %env_path, error = %e, "dotenvy: malformed .env file, continuing with environment only");
+            }
+        }
+    }
+
     let (inbound_tx, mut inbound_rx) = mpsc::channel(256);
     let cancel = CancellationToken::new();
 
@@ -134,6 +234,73 @@ async fn async_main() -> Result<()> {
     let skip_history_sync = std::env::var("WHATSRUST_SKIP_HISTORY_SYNC")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+
+    // --- Backfill knobs (ADR 0021/0022/0023) ---
+    let bf_default = bridge::BridgeConfig::default();
+
+    let backfill_interval_secs: u64 = std::env::var("WHATSRUST_BACKFILL_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(bf_default.backfill_interval_secs);
+    let backfill_max_concurrent: u32 = std::env::var("WHATSRUST_BACKFILL_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(bf_default.backfill_max_concurrent);
+    let backfill_max_messages: i64 = std::env::var("WHATSRUST_BACKFILL_MAX_MESSAGES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(bf_default.backfill_max_messages);
+    let backfill_batch_size: i32 = std::env::var("WHATSRUST_BACKFILL_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(bf_default.backfill_batch_size);
+    let backfill_backstop: u32 = std::env::var("WHATSRUST_BACKFILL_BACKSTOP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(bf_default.backfill_backstop);
+    let backfill_jitter_frac: f64 = std::env::var("WHATSRUST_BACKFILL_JITTER_FRAC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(bf_default.backfill_jitter_frac);
+    let backfill_cooldown_secs: i64 = std::env::var("WHATSRUST_BACKFILL_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(bf_default.backfill_cooldown_secs);
+    let backfill_queue_depth: i64 = std::env::var("WHATSRUST_BACKFILL_QUEUE_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(bf_default.backfill_queue_depth);
+
+    // --- Fail-closed safety validation (ADR 0022) — MUST run before bridge construction ---
+    let safety = BackfillSafety {
+        interval_secs: backfill_interval_secs,
+        max_concurrent: backfill_max_concurrent,
+        max_messages: backfill_max_messages,
+    };
+    let overrides = SafetyOverrides {
+        allow_fast: std::env::var("WHATSRUST_DANGEROUSLY_ALLOW_FAST_BACKFILL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        allow_high_concurrency: std::env::var("WHATSRUST_DANGEROUSLY_ALLOW_HIGH_CONCURRENCY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        allow_huge_fetch: std::env::var("WHATSRUST_DANGEROUSLY_ALLOW_HUGE_FETCH")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+    };
+    match validate_backfill_safety(&safety, &overrides) {
+        Ok(warnings) => {
+            for w in warnings {
+                // TODO(ADR 0022): surface in status/SSE
+                warn!(warning = %w, "backfill safety override active");
+            }
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    }
+
     let config = BridgeConfig {
         db_path: PathBuf::from("whatsapp.db"),
         pair_phone: std::env::var("WHATSAPP_PAIR_PHONE").ok(),
@@ -142,6 +309,14 @@ async fn async_main() -> Result<()> {
         backup_dir,
         send_burst,
         skip_history_sync,
+        backfill_interval_secs,
+        backfill_max_concurrent,
+        backfill_max_messages,
+        backfill_batch_size,
+        backfill_backstop,
+        backfill_jitter_frac,
+        backfill_cooldown_secs,
+        backfill_queue_depth,
         ..Default::default()
     };
 
@@ -1781,5 +1956,135 @@ mod cli_tests {
         let (from_me, sender_jid) = parse_cli_react_args_without_emoji(&args).unwrap();
         assert!(!from_me);
         assert_eq!(sender_jid.as_deref(), Some("alice@s.whatsapp.net"));
+    }
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+
+    fn all_ok() -> SafetyOverrides {
+        SafetyOverrides { allow_fast: false, allow_high_concurrency: false, allow_huge_fetch: false }
+    }
+
+    fn all_overridden() -> SafetyOverrides {
+        SafetyOverrides { allow_fast: true, allow_high_concurrency: true, allow_huge_fetch: true }
+    }
+
+    fn safe_defaults() -> BackfillSafety {
+        BackfillSafety { interval_secs: 4, max_concurrent: 1, max_messages: 50_000 }
+    }
+
+    // (s-1) All knobs in range → Ok with no warnings
+    #[test]
+    fn test_safety_in_range_no_warnings() {
+        let result = validate_backfill_safety(&safe_defaults(), &all_ok());
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        assert!(result.unwrap().is_empty(), "expected no warnings for safe defaults");
+    }
+
+    // (s-2) interval_secs < 3 without override → Err naming the var and the override flag
+    #[test]
+    fn test_safety_fast_interval_without_override_is_err() {
+        let s = BackfillSafety { interval_secs: 2, ..safe_defaults() };
+        let result = validate_backfill_safety(&s, &all_ok());
+        assert!(result.is_err(), "expected Err for fast interval");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("WHATSRUST_BACKFILL_INTERVAL_SECS"), "error must name the var: {msg}");
+        assert!(msg.contains("WHATSRUST_DANGEROUSLY_ALLOW_FAST_BACKFILL"), "error must name the override flag: {msg}");
+    }
+
+    // (s-3) interval_secs < 3 WITH override → Ok with warning
+    #[test]
+    fn test_safety_fast_interval_with_override_is_ok_with_warning() {
+        let s = BackfillSafety { interval_secs: 2, ..safe_defaults() };
+        let ov = SafetyOverrides { allow_fast: true, ..all_ok() };
+        let result = validate_backfill_safety(&s, &ov);
+        assert!(result.is_ok(), "expected Ok when fast override set");
+        let warnings = result.unwrap();
+        assert!(!warnings.is_empty(), "expected at least one warning");
+        assert!(warnings.iter().any(|w| w.contains("fast_backfill_override_active")));
+    }
+
+    // (s-4) max_concurrent > 3 without override → Err naming the var and the override flag
+    #[test]
+    fn test_safety_high_concurrency_without_override_is_err() {
+        let s = BackfillSafety { max_concurrent: 4, ..safe_defaults() };
+        let result = validate_backfill_safety(&s, &all_ok());
+        assert!(result.is_err(), "expected Err for high concurrency");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("WHATSRUST_BACKFILL_MAX_CONCURRENT"), "error must name the var: {msg}");
+        assert!(msg.contains("WHATSRUST_DANGEROUSLY_ALLOW_HIGH_CONCURRENCY"), "error must name the override flag: {msg}");
+    }
+
+    // (s-5) max_concurrent > 3 WITH override → Ok with warning
+    #[test]
+    fn test_safety_high_concurrency_with_override_is_ok_with_warning() {
+        let s = BackfillSafety { max_concurrent: 4, ..safe_defaults() };
+        let ov = SafetyOverrides { allow_high_concurrency: true, ..all_ok() };
+        let result = validate_backfill_safety(&s, &ov);
+        assert!(result.is_ok(), "expected Ok when high-concurrency override set");
+        let warnings = result.unwrap();
+        assert!(warnings.iter().any(|w| w.contains("high_concurrency_override_active")));
+    }
+
+    // (s-6) max_messages > 50000 without override → Err naming the var and the override flag
+    #[test]
+    fn test_safety_huge_fetch_without_override_is_err() {
+        let s = BackfillSafety { max_messages: 50_001, ..safe_defaults() };
+        let result = validate_backfill_safety(&s, &all_ok());
+        assert!(result.is_err(), "expected Err for huge fetch");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("WHATSRUST_BACKFILL_MAX_MESSAGES"), "error must name the var: {msg}");
+        assert!(msg.contains("WHATSRUST_DANGEROUSLY_ALLOW_HUGE_FETCH"), "error must name the override flag: {msg}");
+    }
+
+    // (s-7) max_messages > 50000 WITH override → Ok with warning
+    #[test]
+    fn test_safety_huge_fetch_with_override_is_ok_with_warning() {
+        let s = BackfillSafety { max_messages: 100_000, ..safe_defaults() };
+        let ov = SafetyOverrides { allow_huge_fetch: true, ..all_ok() };
+        let result = validate_backfill_safety(&s, &ov);
+        assert!(result.is_ok(), "expected Ok when huge-fetch override set");
+        let warnings = result.unwrap();
+        assert!(warnings.iter().any(|w| w.contains("huge_fetch_override_active")));
+    }
+
+    // (s-8) Multiple violations all overridden → Ok with all three warnings
+    #[test]
+    fn test_safety_all_violations_all_overridden_produces_three_warnings() {
+        let s = BackfillSafety { interval_secs: 1, max_concurrent: 10, max_messages: 100_000 };
+        let result = validate_backfill_safety(&s, &all_overridden());
+        assert!(result.is_ok(), "expected Ok when all overrides set");
+        let warnings = result.unwrap();
+        assert_eq!(warnings.len(), 3, "expected three warnings, got: {warnings:?}");
+    }
+
+    // (s-9) Boundary values: exactly at limits are safe
+    #[test]
+    fn test_safety_boundary_values_are_safe() {
+        // interval_secs == 3 (floor inclusive) → safe
+        let s1 = BackfillSafety { interval_secs: 3, ..safe_defaults() };
+        assert!(validate_backfill_safety(&s1, &all_ok()).is_ok());
+        // max_concurrent == 3 (ceiling inclusive) → safe
+        let s2 = BackfillSafety { max_concurrent: 3, ..safe_defaults() };
+        assert!(validate_backfill_safety(&s2, &all_ok()).is_ok());
+        // max_messages == 50000 (ceiling inclusive) → safe
+        let s3 = BackfillSafety { max_messages: 50_000, ..safe_defaults() };
+        assert!(validate_backfill_safety(&s3, &all_ok()).is_ok());
+    }
+
+    // (s-10) First violation without override → Err (fast interval, no override on fast,
+    // even though other overrides are set — the first failing check stops processing)
+    #[test]
+    fn test_safety_first_violation_without_override_stops_at_first() {
+        let s = BackfillSafety { interval_secs: 1, max_concurrent: 4, max_messages: 100_000 };
+        // Only the fast-backfill override is NOT set
+        let ov = SafetyOverrides { allow_fast: false, allow_high_concurrency: true, allow_huge_fetch: true };
+        let result = validate_backfill_safety(&s, &ov);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        // Should report interval_secs (first check)
+        assert!(msg.contains("WHATSRUST_BACKFILL_INTERVAL_SECS"), "should report first violation: {msg}");
     }
 }
