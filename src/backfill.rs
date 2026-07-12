@@ -605,14 +605,22 @@ fn oldest_anchor(batch: &HistoryBatch) -> Option<Anchor> {
 // drain_history_sync — extract a HistoryBatch for one chat from a HistorySync
 // ---------------------------------------------------------------------------
 
-/// Extract the messages for `chat_jid` from a decoded `HistorySync` into a `HistoryBatch`.
+/// Extract the messages for `accepted_ids` from a decoded `HistorySync` into a `HistoryBatch`.
 ///
 /// The live source (Wave B2b) calls `lazy.get()` then passes the decoded `&wa::HistorySync` here.
 ///
 /// ## Selection
-/// All `Conversation`s whose `id == chat_jid` are selected. Every `HistorySyncMsg.message`
-/// (dereffing the `Box<WebMessageInfo>`) is collected into `messages` (cloned, order preserved).
-/// If no conversation matches, `messages` is empty.
+/// All `Conversation`s whose `id` appears in `accepted_ids` are selected. This allows matching
+/// both the requested phone JID (`…@s.whatsapp.net`) and the LID alias (`…@lid`) for the same
+/// contact — the phone sent the LID form in `Conversation.id` even though we requested by phone.
+///
+/// **Single-conversation fallback**: if NO conversation matched any `accepted_ids` AND
+/// `hs.conversations.len() == 1`, the sole conversation is used regardless. On-demand fetch
+/// targets exactly one chat; the LID mapping may not be learned yet at the time of the first
+/// fetch, making this the safe fallback. A debug log is emitted when the fallback fires.
+///
+/// Every `HistorySyncMsg.message` (dereffing the `Box<WebMessageInfo>`) is collected into
+/// `messages` (cloned, order preserved). If no conversation matches, `messages` is empty.
 ///
 /// ## `more_remain`
 /// Derived from the matched conversation's `end_of_history_transfer_type`:
@@ -626,13 +634,13 @@ fn oldest_anchor(batch: &HistoryBatch) -> Option<Anchor> {
 /// ## Timestamps
 /// Raw `WebMessageInfo` values are returned unmodified — `message_timestamp` is seconds.
 /// Do NOT scale here; `oldest_anchor` handles ×1000 when computing the next anchor.
-pub fn drain_history_sync(hs: &wa::HistorySync, chat_jid: &str) -> HistoryBatch {
+pub fn drain_history_sync(hs: &wa::HistorySync, accepted_ids: &[String]) -> HistoryBatch {
     let mut messages: Vec<wa::WebMessageInfo> = Vec::new();
     let mut found_any = false;
     let mut more_remain = false;
 
     for conv in &hs.conversations {
-        if conv.id != chat_jid {
+        if !accepted_ids.iter().any(|id| id == &conv.id) {
             continue;
         }
         found_any = true;
@@ -656,7 +664,31 @@ pub fn drain_history_sync(hs: &wa::HistorySync, chat_jid: &str) -> HistoryBatch 
         more_remain = more_remain || conv_more;
     }
 
-    // If no matching conversation, apply the progress-based fallback conservatively
+    // Single-conversation fallback: if no accepted_id matched but there is exactly one
+    // conversation, use it. On-demand fetch targets one chat; the LID mapping may not
+    // be populated yet on the first fetch, so we cannot match by id.
+    if !found_any && hs.conversations.len() == 1 {
+        let conv = &hs.conversations[0];
+        tracing::debug!(
+            conv_id = %conv.id,
+            "drain_history_sync: no accepted_id matched; using single-conversation fallback",
+        );
+        found_any = true;
+        for hsm in &conv.messages {
+            if let Some(boxed) = &hsm.message {
+                messages.push((**boxed).clone());
+            }
+        }
+        let conv_more = match conv.end_of_history_transfer_type {
+            Some(0) | Some(2) => true,
+            Some(1) | Some(3) => false,
+            _ => hs.progress.map_or(true, |p| p < 100),
+        };
+        more_remain = conv_more;
+    }
+
+    // If no matching conversation (and no fallback applied), apply the progress-based
+    // fallback conservatively.
     if !found_any {
         more_remain = hs.progress.map_or(true, |p| p < 100);
     }
@@ -2333,7 +2365,7 @@ mod tests {
             ..Default::default()
         };
 
-        let batch = drain_history_sync(&hs, "chat@s.whatsapp.net");
+        let batch = drain_history_sync(&hs, &["chat@s.whatsapp.net".to_string()]);
         assert_eq!(batch.messages.len(), 3);
         assert!(batch.more_remain, "type=2 → more_remain=true");
         assert_eq!(batch.progress, Some(50));
@@ -2354,7 +2386,7 @@ mod tests {
             ..Default::default()
         };
         let hs = wa::HistorySync { conversations: vec![conv], ..Default::default() };
-        let batch = drain_history_sync(&hs, "c@s");
+        let batch = drain_history_sync(&hs, &["c@s".to_string()]);
         assert!(batch.more_remain, "type=0 → more_remain=true");
     }
 
@@ -2367,7 +2399,7 @@ mod tests {
             ..Default::default()
         };
         let hs = wa::HistorySync { conversations: vec![conv], ..Default::default() };
-        let batch = drain_history_sync(&hs, "c@s");
+        let batch = drain_history_sync(&hs, &["c@s".to_string()]);
         assert!(!batch.more_remain, "type=1 → more_remain=false");
     }
 
@@ -2380,7 +2412,7 @@ mod tests {
             ..Default::default()
         };
         let hs = wa::HistorySync { conversations: vec![conv], ..Default::default() };
-        let batch = drain_history_sync(&hs, "c@s");
+        let batch = drain_history_sync(&hs, &["c@s".to_string()]);
         assert!(batch.more_remain, "type=2 → more_remain=true");
     }
 
@@ -2393,7 +2425,7 @@ mod tests {
             ..Default::default()
         };
         let hs = wa::HistorySync { conversations: vec![conv], ..Default::default() };
-        let batch = drain_history_sync(&hs, "c@s");
+        let batch = drain_history_sync(&hs, &["c@s".to_string()]);
         assert!(!batch.more_remain, "type=3 → more_remain=false");
     }
 
@@ -2412,7 +2444,7 @@ mod tests {
             progress: Some(50),
             ..Default::default()
         };
-        let batch = drain_history_sync(&hs, "c@s");
+        let batch = drain_history_sync(&hs, &["c@s".to_string()]);
         assert!(batch.more_remain, "None type + progress=50 → more_remain=true (50 < 100)");
     }
 
@@ -2429,27 +2461,34 @@ mod tests {
             progress: Some(100),
             ..Default::default()
         };
-        let batch = drain_history_sync(&hs, "c@s");
+        let batch = drain_history_sync(&hs, &["c@s".to_string()]);
         assert!(!batch.more_remain, "None type + progress=100 → more_remain=false");
     }
 
-    // --- drain_history_sync: non-matching conversation → empty batch ---
+    // --- drain_history_sync: non-matching conversation (two convs) → empty batch (no fallback) ---
+    // With two conversations, the single-conversation fallback does NOT fire.
 
     #[test]
-    fn test_drain_different_jid_returns_empty() {
-        let conv = wa::Conversation {
-            id: "other@s.whatsapp.net".to_owned(),
+    fn test_drain_different_jid_two_convs_returns_empty() {
+        let conv1 = wa::Conversation {
+            id: "other1@s.whatsapp.net".to_owned(),
             messages: vec![make_hsm(make_wmi("x"))],
             end_of_history_transfer_type: Some(1),
             ..Default::default()
         };
+        let conv2 = wa::Conversation {
+            id: "other2@s.whatsapp.net".to_owned(),
+            messages: vec![make_hsm(make_wmi("y"))],
+            end_of_history_transfer_type: Some(1),
+            ..Default::default()
+        };
         let hs = wa::HistorySync {
-            conversations: vec![conv],
+            conversations: vec![conv1, conv2],
             progress: Some(100), // progress=100 → if no match, more_remain=false
             ..Default::default()
         };
-        let batch = drain_history_sync(&hs, "chat@s.whatsapp.net");
-        assert!(batch.messages.is_empty(), "non-matching JID → empty messages");
+        let batch = drain_history_sync(&hs, &["chat@s.whatsapp.net".to_string()]);
+        assert!(batch.messages.is_empty(), "two non-matching convs, no fallback → empty messages");
     }
 
     // --- drain_history_sync: empty conversations → empty batch ---
@@ -2461,7 +2500,7 @@ mod tests {
             progress: Some(100),
             ..Default::default()
         };
-        let batch = drain_history_sync(&hs, "chat@s.whatsapp.net");
+        let batch = drain_history_sync(&hs, &["chat@s.whatsapp.net".to_string()]);
         assert!(batch.messages.is_empty(), "empty HistorySync → empty batch");
     }
 
@@ -2488,6 +2527,87 @@ mod tests {
         assert_eq!(anchor.oldest_msg_id, "", "empty anchor id");
         assert!(!anchor.oldest_msg_from_me);
         assert_eq!(anchor.oldest_msg_timestamp_ms, 0, "empty anchor ts_ms = 0");
+    }
+
+    // =========================================================================
+    // LID/PN matching and single-conversation fallback tests (Part 1 of LID fix)
+    // =========================================================================
+
+    // (a) Conversation keyed by LID; accepted_ids = [phone, lid] → matched via LID entry.
+    #[test]
+    fn test_drain_lid_matched_via_accepted_ids() {
+        let conv = wa::Conversation {
+            id: "7945790185720@lid".to_owned(),
+            messages: vec![make_hsm(make_wmi("lid-msg-1")), make_hsm(make_wmi("lid-msg-2"))],
+            end_of_history_transfer_type: Some(1), // complete — no more remain
+            ..Default::default()
+        };
+        let hs = wa::HistorySync {
+            conversations: vec![conv],
+            progress: Some(100),
+            ..Default::default()
+        };
+
+        // The caller provides both the phone JID and the LID alias in accepted_ids.
+        let accepted_ids = vec![
+            "972542271337@s.whatsapp.net".to_string(),
+            "7945790185720@lid".to_string(),
+        ];
+        let batch = drain_history_sync(&hs, &accepted_ids);
+        assert_eq!(batch.messages.len(), 2, "messages must be extracted via LID match");
+        assert!(!batch.more_remain, "type=1 → no more remain");
+        assert_eq!(batch.messages[0].key.id.as_deref(), Some("lid-msg-1"));
+        assert_eq!(batch.messages[1].key.id.as_deref(), Some("lid-msg-2"));
+    }
+
+    // (b) Single conversation whose id is in neither accepted_id → single-conv fallback fires.
+    #[test]
+    fn test_drain_single_conv_fallback_when_no_accepted_id_matches() {
+        let conv = wa::Conversation {
+            id: "unknown-lid@lid".to_owned(),
+            messages: vec![make_hsm(make_wmi("fallback-msg"))],
+            end_of_history_transfer_type: Some(1),
+            ..Default::default()
+        };
+        let hs = wa::HistorySync {
+            conversations: vec![conv],
+            progress: Some(100),
+            ..Default::default()
+        };
+
+        // accepted_ids does NOT contain "unknown-lid@lid", but there is exactly one conversation.
+        let accepted_ids = vec!["972000000001@s.whatsapp.net".to_string()];
+        let batch = drain_history_sync(&hs, &accepted_ids);
+        assert_eq!(batch.messages.len(), 1, "single-conv fallback must extract messages");
+        assert!(!batch.more_remain, "type=1 → no more remain");
+        assert_eq!(batch.messages[0].key.id.as_deref(), Some("fallback-msg"));
+    }
+
+    // (c) Two conversations, none in accepted_ids → fallback does NOT fire → empty batch.
+    #[test]
+    fn test_drain_two_convs_no_match_returns_empty() {
+        let conv1 = wa::Conversation {
+            id: "conv-a@lid".to_owned(),
+            messages: vec![make_hsm(make_wmi("a"))],
+            end_of_history_transfer_type: Some(2),
+            ..Default::default()
+        };
+        let conv2 = wa::Conversation {
+            id: "conv-b@lid".to_owned(),
+            messages: vec![make_hsm(make_wmi("b"))],
+            end_of_history_transfer_type: Some(2),
+            ..Default::default()
+        };
+        let hs = wa::HistorySync {
+            conversations: vec![conv1, conv2],
+            progress: Some(50),
+            ..Default::default()
+        };
+
+        // Neither conv-a nor conv-b is in accepted_ids, and there are 2 convs → no fallback.
+        let accepted_ids = vec!["972000000002@s.whatsapp.net".to_string()];
+        let batch = drain_history_sync(&hs, &accepted_ids);
+        assert!(batch.messages.is_empty(), "two non-matching convs → no fallback → empty");
     }
 
     // =========================================================================
