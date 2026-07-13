@@ -1293,6 +1293,12 @@ impl Store {
     }
 
     /// Search inbound message history. Returns recent messages matching filters.
+    ///
+    /// - `query = None`: chronological browse — `ORDER BY timestamp DESC`. Used by `handle_history`.
+    /// - `query = Some(q)`: FTS5/BM25 relevance search via the `messages_fts` external-content
+    ///   index (ADR 0019). `ORDER BY rank` ascending (BM25 negated score → most-relevant first).
+    ///   No LIKE fallback — single FTS path only; EXPLAIN QUERY PLAN confirms FTS index drives
+    ///   the query (see test_fts_explain_query_plan).
     pub async fn search_inbound(
         &self,
         chat_jid: Option<&str>,
@@ -1301,39 +1307,87 @@ impl Store {
         before_ts: Option<i64>,
     ) -> Result<Vec<InboundRow>> {
         let cj = chat_jid.map(|s| s.to_owned());
-        let q = query.map(|s| format!("%{}%", s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")));
         let before = before_ts.unwrap_or(i64::MAX);
-        self.run(move |c| {
-            let mut sql = String::from(
-                "SELECT id, chat_jid, sender_jid, message_id, content_kind, body_text, timestamp
-                 FROM messages WHERE timestamp < ?1"
-            );
-            let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(before)];
-            if let Some(ref jid) = cj {
-                sql.push_str(&format!(" AND chat_jid = ?{}", params_vec.len() + 1));
-                params_vec.push(Box::new(jid.clone()));
-            }
-            if let Some(ref search) = q {
-                sql.push_str(&format!(" AND body_text LIKE ?{} ESCAPE '\\'", params_vec.len() + 1));
-                params_vec.push(Box::new(search.clone()));
-            }
-            sql.push_str(&format!(" ORDER BY timestamp DESC LIMIT ?{}", params_vec.len() + 1));
-            params_vec.push(Box::new(limit));
 
-            let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
-            let mut stmt = c.prepare(&sql).map_err(db_err)?;
-            let rows = stmt.query_map(params_refs.as_slice(), |row| {
-                Ok(InboundRow {
-                    id: row.get(0)?,
-                    chat_jid: row.get(1)?,
-                    sender_jid: row.get(2)?,
-                    message_id: row.get(3)?,
-                    content_kind: row.get(4)?,
-                    body_text: row.get(5)?,
-                    timestamp: row.get(6)?,
-                })
-            }).map_err(db_err)?;
-            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)
+        // Sanitize user input as an FTS5 phrase by wrapping in double-quotes and escaping
+        // embedded double-quotes as "" (per ADR 0019 MATCH sanitization policy — quote-as-phrase).
+        // This treats ALL input as a literal phrase: FTS5 operators (AND/OR/NOT/*/col:) are NOT
+        // interpreted, preventing parse errors and unintended query semantics. Tradeoff: no
+        // boolean/prefix search in M1.3 — acceptable, revisable when needed later.
+        let phrase = query.map(|q| format!("\"{}\"", q.replace('"', "\"\"")));
+
+        self.run(move |c| {
+            let rows = match phrase {
+                None => {
+                    // query=None: pure chronological browse (handle_history path).
+                    // ORDER BY timestamp DESC — behavior must stay byte-identical to before M1.3.
+                    let mut sql = String::from(
+                        "SELECT id, chat_jid, sender_jid, message_id, content_kind, body_text, timestamp
+                         FROM messages WHERE timestamp < ?1"
+                    );
+                    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(before)];
+                    if let Some(ref jid) = cj {
+                        sql.push_str(&format!(" AND chat_jid = ?{}", params_vec.len() + 1));
+                        params_vec.push(Box::new(jid.clone()));
+                    }
+                    sql.push_str(&format!(" ORDER BY timestamp DESC LIMIT ?{}", params_vec.len() + 1));
+                    params_vec.push(Box::new(limit));
+
+                    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+                    let mut stmt = c.prepare(&sql).map_err(db_err)?;
+                    let iter = stmt.query_map(params_refs.as_slice(), |row| {
+                        Ok(InboundRow {
+                            id: row.get(0)?,
+                            chat_jid: row.get(1)?,
+                            sender_jid: row.get(2)?,
+                            message_id: row.get(3)?,
+                            content_kind: row.get(4)?,
+                            body_text: row.get(5)?,
+                            timestamp: row.get(6)?,
+                        })
+                    }).map_err(db_err)?;
+                    iter.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?
+                }
+
+                Some(ref p) => {
+                    // query=Some: FTS5/BM25 ranked search (handle_search path).
+                    // JOIN messages_fts → messages on rowid; ORDER BY rank ASC (negated BM25 score,
+                    // most-relevant = most-negative). before_ts and chat_jid predicates preserved.
+                    let mut sql = String::from(
+                        "SELECT m.id, m.chat_jid, m.sender_jid, m.message_id, m.content_kind, m.body_text, m.timestamp
+                         FROM messages_fts f
+                         JOIN messages m ON m.id = f.rowid
+                         WHERE f.body_text MATCH ?1
+                           AND m.timestamp < ?2"
+                    );
+                    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+                        Box::new(p.clone()),
+                        Box::new(before),
+                    ];
+                    if let Some(ref jid) = cj {
+                        sql.push_str(&format!(" AND m.chat_jid = ?{}", params_vec.len() + 1));
+                        params_vec.push(Box::new(jid.clone()));
+                    }
+                    sql.push_str(&format!(" ORDER BY rank LIMIT ?{}", params_vec.len() + 1));
+                    params_vec.push(Box::new(limit));
+
+                    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+                    let mut stmt = c.prepare(&sql).map_err(db_err)?;
+                    let iter = stmt.query_map(params_refs.as_slice(), |row| {
+                        Ok(InboundRow {
+                            id: row.get(0)?,
+                            chat_jid: row.get(1)?,
+                            sender_jid: row.get(2)?,
+                            message_id: row.get(3)?,
+                            content_kind: row.get(4)?,
+                            body_text: row.get(5)?,
+                            timestamp: row.get(6)?,
+                        })
+                    }).map_err(db_err)?;
+                    iter.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?
+                }
+            };
+            Ok(rows)
         })
         .await
     }
@@ -4500,6 +4554,219 @@ mod tests {
         assert_eq!(row.message_id, "live-msg-1");
         assert!(!row.from_me, "insert_inbound must write from_me=false");
         assert_eq!(row.timestamp_secs, 500);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
+    // M1.3 — FTS5/BM25 search_inbound tests (ADR 0019/0025)
+    // =========================================================================
+
+    /// Helper: open a fresh temp Store for search tests.
+    fn open_search_store(name: &str) -> (Store, PathBuf) {
+        let dir = unique_test_dir(&format!("fts-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("wa.db");
+        let store = Store::new(&db_path).unwrap();
+        (store, dir)
+    }
+
+    /// (fts-1) Basic English term: FTS search returns the matching row.
+    #[tokio::test]
+    async fn test_fts_search_basic_english_term() {
+        let (store, dir) = open_search_store("basic-en");
+
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "en-001", "text", Some("hello world"), 1000).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "en-002", "text", Some("goodbye moon"), 2000).await.unwrap();
+
+        let results = store.search_inbound(None, Some("hello"), 10, None).await.unwrap();
+        assert_eq!(results.len(), 1, "FTS must return exactly one hit for 'hello'");
+        assert_eq!(results[0].message_id, "en-001");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (fts-2) Hebrew token: FTS5 unicode61 tokenizer must match a Hebrew word.
+    #[tokio::test]
+    async fn test_fts_search_hebrew_token() {
+        let (store, dir) = open_search_store("hebrew");
+
+        // Hebrew: "שלום" = shalom
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "heb-001", "text", Some("שלום עולם"), 1000).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "heb-002", "text", Some("להתראות"), 2000).await.unwrap();
+
+        let results = store.search_inbound(None, Some("שלום"), 10, None).await.unwrap();
+        assert_eq!(results.len(), 1, "FTS must find Hebrew token 'שלום'");
+        assert_eq!(results[0].message_id, "heb-001");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (fts-3) Arabic token: FTS5 unicode61 tokenizer must match an Arabic word.
+    #[tokio::test]
+    async fn test_fts_search_arabic_token() {
+        let (store, dir) = open_search_store("arabic");
+
+        // Arabic: "مرحبا" = hello/welcome
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "ara-001", "text", Some("مرحبا بالعالم"), 1000).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "ara-002", "text", Some("وداعا"), 2000).await.unwrap();
+
+        let results = store.search_inbound(None, Some("مرحبا"), 10, None).await.unwrap();
+        assert_eq!(results.len(), 1, "FTS must find Arabic token 'مرحبا'");
+        assert_eq!(results[0].message_id, "ara-001");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (fts-4) Adversarial inputs: raw double-quote does not error (quote-as-phrase policy).
+    #[tokio::test]
+    async fn test_fts_search_adversarial_double_quote() {
+        let (store, dir) = open_search_store("adv-quote");
+
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "adv-001", "text", Some("normal message"), 1000).await.unwrap();
+
+        // A raw " must not cause a parse error (escaped as "" inside the phrase wrapper)
+        let result = store.search_inbound(None, Some("\""), 10, None).await;
+        assert!(result.is_ok(), "raw double-quote input must not error; got: {:?}", result.err());
+        // Must return empty (no match for the literal character")
+        assert_eq!(result.unwrap().len(), 0, "raw '\"' must return no hits");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (fts-5) Adversarial inputs: FTS5 keywords (AND, OR, NOT, *, col:foo) are literal phrases.
+    #[tokio::test]
+    async fn test_fts_search_adversarial_operators_are_literal() {
+        let (store, dir) = open_search_store("adv-ops");
+
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-001", "text", Some("foo bar"), 1000).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-002", "text", Some("baz qux"), 2000).await.unwrap();
+
+        // "foo OR bar" must NOT match as FTS5 boolean — it should be a literal phrase.
+        // No message contains the exact phrase "foo OR bar", so 0 hits expected.
+        let results = store.search_inbound(None, Some("foo OR bar"), 10, None).await.unwrap();
+        assert_eq!(results.len(), 0, "'foo OR bar' must be treated as a literal phrase, not an FTS5 boolean");
+
+        // "AND" as a standalone search — must not error
+        let result_and = store.search_inbound(None, Some("AND"), 10, None).await;
+        assert!(result_and.is_ok(), "'AND' input must not error");
+
+        // "*" as a standalone search — must not error
+        let result_star = store.search_inbound(None, Some("*"), 10, None).await;
+        assert!(result_star.is_ok(), "'*' input must not error");
+
+        // "col:foo" as input — must not error
+        let result_col = store.search_inbound(None, Some("col:foo"), 10, None).await;
+        assert!(result_col.is_ok(), "'col:foo' input must not error");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (fts-6) Whitespace-only and quote-only inputs return empty without erroring.
+    #[tokio::test]
+    async fn test_fts_search_whitespace_and_quote_only_inputs() {
+        let (store, dir) = open_search_store("adv-empty");
+
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "e-001", "text", Some("something"), 1000).await.unwrap();
+
+        // Whitespace-only
+        let r1 = store.search_inbound(None, Some("   "), 10, None).await;
+        assert!(r1.is_ok(), "whitespace-only input must not error");
+
+        // Quote-only (will be escaped as """""" — empty phrase inside)
+        let r2 = store.search_inbound(None, Some("\"\""), 10, None).await;
+        assert!(r2.is_ok(), "quote-only input must not error");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (fts-7) chat_jid scoping: a match in chat A is NOT returned when scoped to chat B.
+    #[tokio::test]
+    async fn test_fts_search_chat_jid_scoping() {
+        let (store, dir) = open_search_store("scoping");
+
+        store.insert_inbound("chatA@s.whatsapp.net", "s@s.whatsapp.net", "scope-001", "text", Some("apple pie"), 1000).await.unwrap();
+        store.insert_inbound("chatB@g.us",            "s@s.whatsapp.net", "scope-002", "text", Some("apple cider"), 2000).await.unwrap();
+
+        // Scoped to chatA — must only return chatA's message
+        let r_a = store.search_inbound(Some("chatA@s.whatsapp.net"), Some("apple"), 10, None).await.unwrap();
+        assert_eq!(r_a.len(), 1, "scoped to chatA must return 1 hit");
+        assert_eq!(r_a[0].chat_jid, "chatA@s.whatsapp.net");
+        assert_eq!(r_a[0].message_id, "scope-001");
+
+        // Scoped to chatB — must only return chatB's message
+        let r_b = store.search_inbound(Some("chatB@g.us"), Some("apple"), 10, None).await.unwrap();
+        assert_eq!(r_b.len(), 1, "scoped to chatB must return 1 hit");
+        assert_eq!(r_b[0].chat_jid, "chatB@g.us");
+        assert_eq!(r_b[0].message_id, "scope-002");
+
+        // No scope — both returned
+        let r_all = store.search_inbound(None, Some("apple"), 10, None).await.unwrap();
+        assert_eq!(r_all.len(), 2, "unscoped search must return both hits");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (fts-8) query=None history browse returns results in timestamp DESC order (unaffected by M1.3).
+    #[tokio::test]
+    async fn test_search_inbound_none_query_is_chronological_desc() {
+        let (store, dir) = open_search_store("history-browse");
+
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-001", "text", Some("first"), 100).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-002", "text", Some("second"), 200).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-003", "text", Some("third"), 300).await.unwrap();
+
+        // query=None → chronological browse
+        let results = store.search_inbound(None, None, 10, None).await.unwrap();
+        assert_eq!(results.len(), 3);
+        // Must be newest-first (timestamp DESC)
+        assert_eq!(results[0].message_id, "h-003", "newest first");
+        assert_eq!(results[1].message_id, "h-002");
+        assert_eq!(results[2].message_id, "h-001", "oldest last");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (fts-9) EXPLAIN QUERY PLAN: confirms FTS5 index drives the search query.
+    /// Verifies via EXPLAIN QUERY PLAN that messages_fts virtual table is in the query plan.
+    #[test]
+    fn test_fts_explain_query_plan() {
+        let dir = unique_test_dir("fts-eqp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("wa.db");
+        let conn = open_fresh_conn(&db_path);
+
+        // Insert a row so the planner has real data
+        conn.execute(
+            "INSERT INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at)
+             VALUES ('c@s.whatsapp.net', 's@s.whatsapp.net', 'eqp-001', 'text', 'test query plan', ?1, ?1)",
+            rusqlite::params![1000_i64],
+        ).unwrap();
+
+        // The exact SQL the FTS branch of search_inbound builds (no chat_jid scope, no before_ts)
+        let sql = "SELECT m.id, m.chat_jid, m.sender_jid, m.message_id, m.content_kind, m.body_text, m.timestamp
+                   FROM messages_fts f
+                   JOIN messages m ON m.id = f.rowid
+                   WHERE f.body_text MATCH ?1
+                     AND m.timestamp < ?2
+                   ORDER BY rank LIMIT ?3";
+
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan_rows: Vec<String> = stmt.query_map(
+            rusqlite::params!["\"test\"", i64::MAX, 20_i64],
+            |row| row.get::<_, String>(3),
+        ).unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+        let plan = plan_rows.join("\n");
+        println!("EXPLAIN QUERY PLAN output:\n{plan}");
+
+        // Must mention the FTS virtual table in the plan
+        assert!(
+            plan.contains("messages_fts") || plan.contains("VIRTUAL TABLE"),
+            "EXPLAIN QUERY PLAN must show FTS virtual table usage; got:\n{plan}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
