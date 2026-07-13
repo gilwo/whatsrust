@@ -143,6 +143,20 @@ respects the 3-level abort, and cannot be outrun by any client. Safety is in the
 
 **M1.3 exit:** search is FTS5/BM25 over live + backfilled messages, multilingual, injection-safe.
 
+> ✅ **M1.3 DONE (2026-07-13).** `search_inbound` split into two branches: `query=None` keeps the
+> chronological browse (`ORDER BY timestamp DESC`, byte-identical to before — `handle_history`);
+> `query=Some` now runs FTS5 over the external-content index — `FROM messages_fts f JOIN messages m
+> ON m.id = f.rowid WHERE f.body_text MATCH ?1 … ORDER BY rank` (ascending; BM25 negated score →
+> most-relevant first; never `DESC`). **Sanitization (1.3.2):** quote-as-phrase — wrap input in
+> `"…"`, escape `"`→`""`; ALL input is a literal phrase so FTS5 operators (`AND`/`OR`/`NOT`/`*`/`col:`)
+> can't parse-error or alter semantics. **Fallback (1.3.3):** none — `EXPLAIN QUERY PLAN` shows
+> `SCAN f VIRTUAL TABLE INDEX` + `SEARCH m USING INTEGER PRIMARY KEY (rowid=?)`, so the FTS index
+> drives; no LIKE fallback kept. **Callers (1.3.4):** no code change needed in `api.rs`/`mcp.rs` —
+> `/api/search` JSON shape unchanged (now relevance-ranked, not newest-first); `handle_history`
+> unaffected. 9 new storage tests (English/Hebrew/Arabic hits, adversarial operators as literal
+> phrases, whitespace/quote-only no-error, chat scoping, chronological browse, EXPLAIN). Suite green:
+> 188 lib / 203 bin. No DDL/trigger changes. (ADR 0019)
+
 ---
 
 ## M1.4 — API/MCP trigger + watchdog  [ADR 0011/0013/0034/0036]
