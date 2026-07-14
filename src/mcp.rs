@@ -162,6 +162,22 @@ fn tool_definitions() -> Vec<Value> {
                 "jid":{"type":"string","description":"Limit to specific chat (optional)"},
                 "limit":{"type":"integer"}
             },"required":["q"]})),
+        tool_def("whatsrust_fetch_history",
+            "Trigger a per-chat historical backfill. Runs as a paced background job (anti-ban) and is daemon-clamped (cooldown, queue-depth, max-messages); poll whatsrust_fetch_status for progress.",
+            json!({"type":"object","properties":{
+                "chat_jid":{"type":"string","description":"Chat JID to backfill"},
+                "mode":{"type":"string","description":"all | since | count; default all"},
+                "target_value":{"type":"integer","description":"ms-timestamp for since, count for count"}
+            },"required":["chat_jid"]})),
+        tool_def("whatsrust_fetch_status", "Poll history-fetch job status. Pass job_id for a single job, or active=true to list only active jobs, or omit both for all jobs.",
+            json!({"type":"object","properties":{
+                "job_id":{"type":"integer","description":"Specific job ID to query (optional)"},
+                "active":{"type":"boolean","description":"List only active jobs (optional)"}
+            }})),
+        tool_def("whatsrust_fetch_cancel", "Cancel a history-fetch backfill job",
+            json!({"type":"object","properties":{
+                "job_id":{"type":"integer","description":"Job ID to cancel"}
+            },"required":["job_id"]})),
         tool_def("whatsrust_typing", "Send typing indicator",
             json!({"type":"object","properties":{"jid":{"type":"string"}},"required":["jid"]})),
         tool_def("whatsrust_location", "Send a location pin",
@@ -297,6 +313,22 @@ fn call_tool(name: &str, args: &Value, port: u16) -> Value {
         "whatsrust_delete_for_me" => http_post(port, "/api/delete-for-me", args),
         "whatsrust_star" => http_post(port, "/api/star", args),
         "whatsrust_unstar" => http_post(port, "/api/unstar", args),
+        "whatsrust_fetch_history" => {
+            let chat_jid = args.get("chat_jid").and_then(|v| v.as_str()).unwrap_or("");
+            let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("all");
+            let mut body = serde_json::json!({"chat_jid": chat_jid, "mode": mode});
+            if let Some(tv) = args.get("target_value").and_then(|v| v.as_i64()) { body["target_value"] = serde_json::json!(tv); }
+            http_post(port, "/api/history-fetch", &body)
+        }
+        "whatsrust_fetch_status" => {
+            if let Some(id) = args.get("job_id").and_then(|v| v.as_i64()) {
+                http_get(port, &format!("/api/history-fetch?job_id={id}"))
+            } else {
+                let active = args.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                http_get(port, &format!("/api/history-fetch?active={active}"))
+            }
+        }
+        "whatsrust_fetch_cancel" => http_post(port, "/api/history-fetch/cancel", args),
         "whatsrust_status_text" => http_post(port, "/api/status-text", args),
         "whatsrust_status_image" => http_post(port, "/api/status-image", args),
         "whatsrust_status_video" => http_post(port, "/api/status-video", args),
@@ -378,6 +410,36 @@ fn extract_http_body(raw: &[u8]) -> Result<String, String> {
         Err(body)
     } else {
         Ok(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_definitions_include_fetch_history() {
+        let tools = tool_definitions();
+        let names: Vec<&str> = tools.iter()
+            .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(names.contains(&"whatsrust_fetch_history"), "missing whatsrust_fetch_history");
+        assert!(names.contains(&"whatsrust_fetch_status"), "missing whatsrust_fetch_status");
+        assert!(names.contains(&"whatsrust_fetch_cancel"), "missing whatsrust_fetch_cancel");
+    }
+
+    #[test]
+    fn test_fetch_history_description_mentions_pacing() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.get("name").and_then(|v| v.as_str()) == Some("whatsrust_fetch_history"))
+            .expect("whatsrust_fetch_history must exist");
+        let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(!desc.is_empty(), "description must be non-empty");
+        let desc_lower = desc.to_lowercase();
+        assert!(
+            desc_lower.contains("paced") || desc_lower.contains("clamp") || desc_lower.contains("background"),
+            "description must mention pacing/limits (paced/clamp/background); got: {desc}"
+        );
     }
 }
 
