@@ -824,6 +824,8 @@ type MsgCache = Arc<ParkingMutex<BoundedMsgCache>>;
 pub struct WhatsAppBridge {
     /// Wakes the outbound worker after a new job is enqueued.
     outbound_notify: Arc<tokio::sync::Notify>,
+    /// Wakes the backfill worker after a new job is enqueued.
+    backfill_notify: Arc<tokio::sync::Notify>,
     state_rx: watch::Receiver<BridgeState>,
     #[allow(dead_code)] // Used by agent integrations via subscribe_qr()
     qr_rx: watch::Receiver<Option<String>>,
@@ -841,6 +843,10 @@ pub struct WhatsAppBridge {
     event_tx: tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
     /// Cached group metadata (TTL-based, invalidated on group mutation).
     group_cache: GroupCacheHandle,
+    /// Backfill config values exposed to the API handler.
+    backfill_cooldown_secs: i64,
+    backfill_queue_depth: i64,
+    backfill_max_messages: i64,
 }
 
 impl WhatsAppBridge {
@@ -854,6 +860,7 @@ impl WhatsAppBridge {
         let (state_tx, state_rx) = watch::channel(BridgeState::Disconnected);
         let (qr_tx, qr_rx) = watch::channel::<Option<String>>(None);
         let outbound_notify = Arc::new(tokio::sync::Notify::new());
+        let backfill_notify = Arc::new(tokio::sync::Notify::new());
         let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> =
             Arc::new(ParkingMutex::new(None));
         let rr_tx = spawn_scheduler(None, 200);
@@ -867,6 +874,11 @@ impl WhatsAppBridge {
         let store = Store::new(&config.db_path).expect("failed to open database for bridge");
         let metrics = Arc::new(BridgeMetrics::new());
 
+        // Extract backfill config values before config is moved into run_bridge.
+        let backfill_cooldown_secs = config.backfill_cooldown_secs;
+        let backfill_queue_depth = config.backfill_queue_depth;
+        let backfill_max_messages = config.backfill_max_messages;
+
         let cancel_clone = cancel.clone();
         let ch = client_handle.clone();
         let rr = rr_tx.clone();
@@ -875,12 +887,13 @@ impl WhatsAppBridge {
         let sp = send_pacer.clone();
         let sub_pres = subscribed_presence.clone();
         let on = outbound_notify.clone();
+        let bn = backfill_notify.clone();
         let et = event_tx.clone();
         let st = store.clone();
         let gc = group_cache.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, et, st, gc).await
+                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, bn, et, st, gc).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -888,6 +901,7 @@ impl WhatsAppBridge {
 
         Self {
             outbound_notify,
+            backfill_notify,
             state_rx,
             qr_rx,
             cancel,
@@ -900,6 +914,9 @@ impl WhatsAppBridge {
             subscribed_presence,
             event_tx,
             group_cache,
+            backfill_cooldown_secs,
+            backfill_queue_depth,
+            backfill_max_messages,
         }
     }
 
@@ -1261,6 +1278,16 @@ impl WhatsAppBridge {
     /// Get a reference to the storage backend (for history/search queries).
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Get a reference to the backfill notify handle (to wake the worker after enqueueing).
+    pub fn backfill_notify(&self) -> &Arc<tokio::sync::Notify> {
+        &self.backfill_notify
+    }
+
+    /// Backfill config values for the API trigger handler.
+    pub fn backfill_config(&self) -> (i64, i64, i64) {
+        (self.backfill_cooldown_secs, self.backfill_queue_depth, self.backfill_max_messages)
     }
 
     pub fn metrics(&self) -> &BridgeMetrics {
@@ -1933,6 +1960,7 @@ async fn run_bridge(
     send_pacer: Arc<SendPacer>,
     subscribed_presence: Arc<DashSet<String>>,
     outbound_notify: Arc<tokio::sync::Notify>,
+    backfill_notify: Arc<tokio::sync::Notify>,
     event_tx: tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
     store: Store,
     group_cache: GroupCacheHandle,
@@ -2028,8 +2056,9 @@ async fn run_bridge(
 
     // Spawn backfill worker (Wave B2b) — connects the already-built process_job / run_worker_loop
     // to the live WhatsApp client via LiveHistorySource + LiveBatchSink + HistoryCorrelator.
+    // `backfill_notify` is passed in from `start()` so the API handler and the worker share
+    // the same Notify handle.
     let correlator = Arc::new(crate::backfill::HistoryCorrelator::new());
-    let backfill_notify = Arc::new(tokio::sync::Notify::new());
     {
         let bf_source = Arc::new(LiveHistorySource::new(
             client_handle.clone(),
