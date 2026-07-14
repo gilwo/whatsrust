@@ -1368,7 +1368,7 @@ impl Store {
                         sql.push_str(&format!(" AND m.chat_jid = ?{}", params_vec.len() + 1));
                         params_vec.push(Box::new(jid.clone()));
                     }
-                    sql.push_str(&format!(" ORDER BY rank LIMIT ?{}", params_vec.len() + 1));
+                    sql.push_str(&format!(" ORDER BY f.rank LIMIT ?{}", params_vec.len() + 1));
                     params_vec.push(Box::new(limit));
 
                     let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
@@ -4641,23 +4641,30 @@ mod tests {
 
         store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-001", "text", Some("foo bar"), 1000).await.unwrap();
         store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-002", "text", Some("baz qux"), 2000).await.unwrap();
+        // Extra message whose body contains the literal word "and" — for the AND test below.
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-003", "text", Some("cats and dogs"), 3000).await.unwrap();
 
         // "foo OR bar" must NOT match as FTS5 boolean — it should be a literal phrase.
         // No message contains the exact phrase "foo OR bar", so 0 hits expected.
         let results = store.search_inbound(None, Some("foo OR bar"), 10, None).await.unwrap();
         assert_eq!(results.len(), 0, "'foo OR bar' must be treated as a literal phrase, not an FTS5 boolean");
 
-        // "AND" as a standalone search — must not error
-        let result_and = store.search_inbound(None, Some("AND"), 10, None).await;
-        assert!(result_and.is_ok(), "'AND' input must not error");
+        // "AND" — after quote-as-phrase sanitization it becomes the literal word "and".
+        // unicode61 case-folds, so "AND" matches "and" in "cats and dogs". Must return op-003.
+        let result_and = store.search_inbound(None, Some("AND"), 10, None).await.unwrap();
+        assert_eq!(result_and.len(), 1, "'AND' must match the literal word 'and', not be treated as a boolean operator");
+        assert_eq!(result_and[0].message_id, "op-003", "'AND' must match op-003 ('cats and dogs')");
 
-        // "*" as a standalone search — must not error
-        let result_star = store.search_inbound(None, Some("*"), 10, None).await;
-        assert!(result_star.is_ok(), "'*' input must not error");
+        // "*" — after sanitization it becomes the phrase "\"*\"". FTS5 strips the prefix-
+        // wildcard from a quoted phrase, leaving a zero-token phrase → no hits.
+        let result_star = store.search_inbound(None, Some("*"), 10, None).await.unwrap();
+        assert!(result_star.is_empty(), "'*' must return no hits after quote-as-phrase sanitization");
 
-        // "col:foo" as input — must not error
+        // "col:foo" as input — treated as a literal phrase; must not error.
+        // (No message contains "col:foo" verbatim, so empty result is the expected behavior.)
         let result_col = store.search_inbound(None, Some("col:foo"), 10, None).await;
         assert!(result_col.is_ok(), "'col:foo' input must not error");
+        assert!(result_col.unwrap().is_empty(), "'col:foo' must return no hits (treated as literal phrase)");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4749,7 +4756,7 @@ mod tests {
                    JOIN messages m ON m.id = f.rowid
                    WHERE f.body_text MATCH ?1
                      AND m.timestamp < ?2
-                   ORDER BY rank LIMIT ?3";
+                   ORDER BY f.rank LIMIT ?3";
 
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
         let plan_rows: Vec<String> = stmt.query_map(
@@ -4767,6 +4774,78 @@ mod tests {
             plan.contains("messages_fts") || plan.contains("VIRTUAL TABLE"),
             "EXPLAIN QUERY PLAN must show FTS virtual table usage; got:\n{plan}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (fts-10) BM25 relevance ordering: the multi-occurrence document ranks first.
+    ///
+    /// Guards against `ORDER BY f.rank` silently degrading to insertion/timestamp order.
+    /// The LESS-relevant document (single occurrence) is intentionally given the NEWER
+    /// timestamp, so any fallback to timestamp-DESC or rowid-DESC order would place it
+    /// first and the assertion would FAIL — making the test sensitive to ordering source.
+    #[tokio::test]
+    async fn test_fts_search_bm25_relevance_order() {
+        let (store, dir) = open_search_store("bm25-order");
+
+        // "multi-occ": 3 occurrences of "apple" — higher BM25 term-frequency → more relevant.
+        // Timestamp 1000 → OLDER insertion order (would rank 2nd if ordering by ts-DESC or rowid).
+        store.insert_inbound(
+            "chat@s.whatsapp.net", "s@s.whatsapp.net",
+            "multi-occ", "text", Some("apple apple apple"), 1000,
+        ).await.unwrap();
+
+        // "single-occ": 1 occurrence of "apple" — lower BM25 score → less relevant.
+        // Timestamp 2000 → NEWER insertion order (would rank 1st if ordering by ts-DESC or rowid).
+        store.insert_inbound(
+            "chat@s.whatsapp.net", "s@s.whatsapp.net",
+            "single-occ", "text", Some("apple pie"), 2000,
+        ).await.unwrap();
+
+        let results = store.search_inbound(None, Some("apple"), 10, None).await.unwrap();
+
+        assert_eq!(results.len(), 2, "both messages must match 'apple'");
+        // BM25 ascending (most-negative = most-relevant first): multi-occurrence doc must be first.
+        // If this fails, ORDER BY is not using BM25 (e.g. silently fell back to timestamp or rowid).
+        assert_eq!(
+            results[0].message_id, "multi-occ",
+            "multi-occurrence doc must rank first (BM25 most-relevant); got '{}' first — \
+             ORDER BY f.rank is not driving the sort",
+            results[0].message_id
+        );
+        assert_eq!(results[1].message_id, "single-occ", "single-occurrence doc must rank second");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (fts-11) before_ts + FTS combined: the `AND m.timestamp < ?2` predicate correctly
+    /// excludes messages at or after the cutoff when using the FTS path.
+    #[tokio::test]
+    async fn test_fts_search_before_ts_excludes_newer_messages() {
+        let (store, dir) = open_search_store("before-ts");
+
+        // Two messages matching the same term, with different timestamps.
+        store.insert_inbound(
+            "chat@s.whatsapp.net", "s@s.whatsapp.net",
+            "ts-old", "text", Some("mango smoothie"), 1000,
+        ).await.unwrap();
+        store.insert_inbound(
+            "chat@s.whatsapp.net", "s@s.whatsapp.net",
+            "ts-new", "text", Some("mango shake"), 5000,
+        ).await.unwrap();
+
+        // Cutoff at 3000: only ts-old (ts=1000) must be returned; ts-new (ts=5000) must be excluded.
+        let results = store.search_inbound(None, Some("mango"), 10, Some(3000)).await.unwrap();
+
+        assert_eq!(results.len(), 1, "before_ts=3000 must exclude the message with ts=5000");
+        assert_eq!(
+            results[0].message_id, "ts-old",
+            "only the message with timestamp < cutoff must be returned"
+        );
+
+        // Sanity: without the cutoff, both are returned.
+        let all = store.search_inbound(None, Some("mango"), 10, None).await.unwrap();
+        assert_eq!(all.len(), 2, "without before_ts both messages must match");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
