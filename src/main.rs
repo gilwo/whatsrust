@@ -1710,6 +1710,35 @@ async fn cli_main(args: &[String]) -> Result<()> {
             print_json_result(status, &body)?;
             Ok(())
         }
+        "fetch-history" => {
+            require_args(args, 3, "fetch-history <jid> <mode:all|since|count> [value]")?;
+            let mut payload = json!({"chat_jid": args[1], "mode": args[2]});
+            if let Some(tv) = args.get(3).and_then(|v| v.parse::<i64>().ok()) {
+                payload["target_value"] = json!(tv);
+            }
+            let (status, resp) = api::cli_post(port, "/api/history-fetch", &payload.to_string()).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "fetch-status" => {
+            let url = if let Some(id) = args.get(1).and_then(|v| v.parse::<i64>().ok()) {
+                format!("/api/history-fetch?job_id={id}")
+            } else {
+                "/api/history-fetch?active=true".to_string()
+            };
+            let (status, body) = api::cli_get(port, &url).await?;
+            print_json_result(status, &body)?;
+            Ok(())
+        }
+        "fetch-cancel" => {
+            require_args(args, 2, "fetch-cancel <job_id>")?;
+            let job_id = args[1].parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("invalid job_id: must be an integer"))?;
+            let payload = json!({"job_id": job_id});
+            let (status, resp) = api::cli_post(port, "/api/history-fetch/cancel", &payload.to_string()).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
         "status-text" => {
             require_args(args, 3, "status-text <recipients> <text>")?;
             let body = json!({
@@ -1893,6 +1922,9 @@ fn print_cli_help() {
     println!("  whatsrust mcp                          MCP server (JSON-RPC over stdio)");
     println!("  whatsrust history <jid> [limit]        Recent messages for a chat");
     println!("  whatsrust search <query> [jid]         Search message history");
+    println!("  whatsrust fetch-history <jid> <mode> [value]  Trigger historical backfill (all|since|count)");
+    println!("  whatsrust fetch-status [job_id]        Backfill job status (all active, or one by id)");
+    println!("  whatsrust fetch-cancel <job_id>        Cancel a backfill job");
     println!();
     println!("ENVIRONMENT:");
     println!("  WHATSRUST_PORT   API port (default: 7270, fallback: HEALTH_PORT)");
