@@ -955,7 +955,7 @@ fn validate_fetch_mode(mode: &str, target_value: Option<i64>) -> Result<(), Vec<
 }
 
 /// Map an `EnqueueOutcome` to the HTTP response bytes.
-/// Extracted as a pure function so it can be unit-tested without a bridge.
+/// Pure function — no side effects — so it can be unit-tested without a bridge.
 fn enqueue_outcome_to_response(
     outcome: crate::storage::EnqueueOutcome,
     chat_jid: &str,
@@ -963,12 +963,10 @@ fn enqueue_outcome_to_response(
     requested_target: Option<i64>,
     resume_anchor_ts: Option<i64>,
     more_remain: bool,
-    backfill_notify: &Arc<tokio::sync::Notify>,
 ) -> Vec<u8> {
     use crate::storage::EnqueueOutcome;
     match outcome {
         EnqueueOutcome::Accepted { job_id, accepted_target } => {
-            backfill_notify.notify_one();
             json_ok(json!({
                 "job_id": job_id,
                 "chat_jid": chat_jid,
@@ -1030,26 +1028,24 @@ async fn handle_history_fetch_trigger(bridge: &WhatsAppBridge, body: &[u8]) -> V
 
     let store = bridge.store();
 
-    // No-op fast path: if cursor is already exhausted, return immediately without enqueuing
-    match store.get_backfill_cursor(&chat_jid).await {
-        Ok(Some(cursor)) if cursor.exhausted => {
-            return json_ok(json!({
-                "job_id": serde_json::Value::Null,
-                "chat_jid": chat_jid,
-                "status": "already_exhausted",
-                "more_remain": false,
-            }));
-        }
-        Ok(_) => {} // cursor absent or not exhausted — proceed
-        Err(e) => return json_err(500, &format!("storage error: {e}")),
-    }
-
-    // Cursor seed/resume: if no cursor exists, seed it from the oldest message.
-    // If a cursor exists and is not exhausted, leave it untouched (resume from where it is).
+    // Read cursor once; use for both the exhausted fast-path check and the seed/resume decision.
     let cursor_opt = match store.get_backfill_cursor(&chat_jid).await {
         Ok(c) => c,
         Err(e) => return json_err(500, &format!("storage error: {e}")),
     };
+
+    // No-op fast path: if cursor is already exhausted, return immediately without enqueuing.
+    if cursor_opt.as_ref().map(|c| c.exhausted).unwrap_or(false) {
+        return json_ok(json!({
+            "job_id": serde_json::Value::Null,
+            "chat_jid": chat_jid,
+            "status": "already_exhausted",
+            "more_remain": false,
+        }));
+    }
+
+    // Cursor seed/resume: if no cursor exists, seed it from the oldest message.
+    // If a cursor exists and is not exhausted, leave it untouched (resume from where it is).
 
     let resume_anchor_ts = if cursor_opt.is_none() {
         // Seed cursor from the oldest stored message (mirrors the smoke-test hook exactly)
@@ -1091,6 +1087,12 @@ async fn handle_history_fetch_trigger(bridge: &WhatsAppBridge, body: &[u8]) -> V
         Err(e) => return json_err(500, &format!("storage error: {e}")),
     };
 
+    // Notify the worker before formatting the response so the SSE event can
+    // be observed immediately after the HTTP 200 is received.
+    if matches!(outcome, crate::storage::EnqueueOutcome::Accepted { .. }) {
+        bridge.backfill_notify().notify_one();
+    }
+
     enqueue_outcome_to_response(
         outcome,
         &chat_jid,
@@ -1098,7 +1100,6 @@ async fn handle_history_fetch_trigger(bridge: &WhatsAppBridge, body: &[u8]) -> V
         req.target_value,
         resume_anchor_ts,
         more_remain,
-        bridge.backfill_notify(),
     )
 }
 
@@ -1143,7 +1144,8 @@ async fn handle_history_fetch_cancel(bridge: &WhatsAppBridge, body: &[u8]) -> Ve
         None => return json_err(400, "job_id is required"),
     };
     match bridge.store().mark_backfill_job(job_id, "cancelled").await {
-        Ok(()) => json_ok(json!({"job_id": job_id, "status": "cancelled"})),
+        Ok(0) => json_err(404, "job not found"),
+        Ok(_) => json_ok(json!({"job_id": job_id, "status": "cancelled"})),
         Err(e) => json_err(500, &e.to_string()),
     }
 }
@@ -1854,10 +1856,6 @@ mod tests {
     // M1.4: enqueue_outcome_to_response mapping tests
     // -------------------------------------------------------------------------
 
-    fn make_notify() -> Arc<tokio::sync::Notify> {
-        Arc::new(tokio::sync::Notify::new())
-    }
-
     fn parse_response_json(raw: &[u8]) -> serde_json::Value {
         // raw is a full HTTP response; find the body after "\r\n\r\n"
         let sep = b"\r\n\r\n";
@@ -1874,10 +1872,11 @@ mod tests {
 
     #[test]
     fn test_outcome_accepted_returns_200_with_job_id_and_notifies() {
+        // Fix 3: enqueue_outcome_to_response is now pure (no notify param).
+        // notify_one() is called by the handler (handle_history_fetch_trigger) instead.
         use crate::storage::EnqueueOutcome;
-        let notify = make_notify();
         let outcome = EnqueueOutcome::Accepted { job_id: 42, accepted_target: Some(100) };
-        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "count", Some(200), Some(1_700_000_000_000), true, &notify);
+        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "count", Some(200), Some(1_700_000_000_000), true);
         assert_eq!(http_status_of(&raw), 200);
         let body = parse_response_json(&raw);
         assert_eq!(body["job_id"], 42);
@@ -1886,22 +1885,13 @@ mod tests {
         assert_eq!(body["requested"], 200);
         assert_eq!(body["accepted"], 100);
         assert_eq!(body["more_remain"], true);
-        // Verify notify_one was called — a second notified() poll would block; instead check
-        // that a future waiting on it can be immediately resolved.
-        let n = notify.clone();
-        let resolved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let r = resolved.clone();
-        // tokio::sync::Notify is not directly inspectable; we trust notify_one() was called
-        // by observing a notified() future resolves in a spawn (best effort in sync context).
-        drop((n, r)); // just compile-check; behavioral coverage via accepted_target assertion above
     }
 
     #[test]
     fn test_outcome_already_active_returns_200_with_job_id() {
         use crate::storage::EnqueueOutcome;
-        let notify = make_notify();
         let outcome = EnqueueOutcome::AlreadyActive { job_id: 7 };
-        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "all", None, None, false, &notify);
+        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "all", None, None, false);
         assert_eq!(http_status_of(&raw), 200);
         let body = parse_response_json(&raw);
         assert_eq!(body["job_id"], 7);
@@ -1911,9 +1901,8 @@ mod tests {
     #[test]
     fn test_outcome_cooldown_returns_429() {
         use crate::storage::EnqueueOutcome;
-        let notify = make_notify();
         let outcome = EnqueueOutcome::Cooldown { retry_after_secs: 120 };
-        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "all", None, None, false, &notify);
+        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "all", None, None, false);
         assert_eq!(http_status_of(&raw), 429);
         let body = parse_response_json(&raw);
         assert_eq!(body["status"], "cooldown");
@@ -1923,9 +1912,8 @@ mod tests {
     #[test]
     fn test_outcome_queue_full_returns_429() {
         use crate::storage::EnqueueOutcome;
-        let notify = make_notify();
         let outcome = EnqueueOutcome::QueueFull { limit: 5 };
-        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "all", None, None, false, &notify);
+        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "all", None, None, false);
         assert_eq!(http_status_of(&raw), 429);
         let body = parse_response_json(&raw);
         assert_eq!(body["status"], "queue_full");

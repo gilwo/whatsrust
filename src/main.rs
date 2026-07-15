@@ -1721,10 +1721,14 @@ async fn cli_main(args: &[String]) -> Result<()> {
             Ok(())
         }
         "fetch-status" => {
-            let url = if let Some(id) = args.get(1).and_then(|v| v.parse::<i64>().ok()) {
-                format!("/api/history-fetch?job_id={id}")
-            } else {
-                "/api/history-fetch?active=true".to_string()
+            // No arg → active-only (default); literal "all" → all jobs; integer → specific job.
+            let url = match args.get(1).map(|s| s.as_str()) {
+                Some("all") => "/api/history-fetch?active=false".to_string(),
+                Some(v) => match v.parse::<i64>() {
+                    Ok(id) => format!("/api/history-fetch?job_id={id}"),
+                    Err(_) => return Err(anyhow::anyhow!("invalid argument: use a job_id integer or 'all'")),
+                },
+                None => "/api/history-fetch?active=true".to_string(),
             };
             let (status, body) = api::cli_get(port, &url).await?;
             print_json_result(status, &body)?;
@@ -1923,7 +1927,7 @@ fn print_cli_help() {
     println!("  whatsrust history <jid> [limit]        Recent messages for a chat");
     println!("  whatsrust search <query> [jid]         Search message history");
     println!("  whatsrust fetch-history <jid> <mode> [value]  Trigger historical backfill (all|since|count)");
-    println!("  whatsrust fetch-status [job_id]        Backfill job status (all active, or one by id)");
+    println!("  whatsrust fetch-status [job_id|all]    Backfill job status: active only (default), one by id, or all");
     println!("  whatsrust fetch-cancel <job_id>        Cancel a backfill job");
     println!();
     println!("ENVIRONMENT:");
