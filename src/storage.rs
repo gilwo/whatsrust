@@ -1730,7 +1730,7 @@ impl Store {
     ///   - `paused` / `queued` — park and shutdown-requeue (must not resurrect cancel)
     /// Only `cancelled` itself is written unconditionally (it is the upgrade path
     /// from any live state, including `running`).
-    pub async fn mark_backfill_job(&self, id: i64, status: &str) -> Result<()> {
+    pub async fn mark_backfill_job(&self, id: i64, status: &str) -> Result<usize> {
         let st = status.to_owned();
         let ts = now_secs();
         self.run(move |c| {
@@ -1747,8 +1747,8 @@ impl Store {
                      WHERE id = ?3 AND status != 'cancelled'"
                 }
             };
-            c.execute(sql, params![st, ts, id]).map_err(db_err)?;
-            Ok(())
+            let n = c.execute(sql, params![st, ts, id]).map_err(db_err)?;
+            Ok(n)
         })
         .await
     }
@@ -4846,6 +4846,23 @@ mod tests {
         // Sanity: without the cutoff, both are returned.
         let all = store.search_inbound(None, Some("mango"), 10, None).await.unwrap();
         assert_eq!(all.len(), 2, "without before_ts both messages must match");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix 2 (cold-review): mark_backfill_job returns 0 rows-affected for absent id
+    // -------------------------------------------------------------------------
+
+    /// Verify that cancelling a non-existent job_id returns 0 (no rows updated),
+    /// which the API layer maps to a 404 response.
+    #[tokio::test]
+    async fn test_mark_backfill_job_returns_zero_for_absent_id() {
+        let (store, dir) = open_backfill_store("fix2-absent-cancel");
+
+        // Cancel a job_id that was never inserted
+        let n = store.mark_backfill_job(99999, "cancelled").await.unwrap();
+        assert_eq!(n, 0, "mark_backfill_job on absent id must return 0 rows affected");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1129,13 +1129,21 @@ pub async fn run_worker_loop(
                 Ok(JobEnd::Deferred) => "deferred",
                 Ok(JobEnd::Failed(_)) | Err(_) => "failed",
             };
+            // Re-query the DB row so `fetched` reflects what process_job recorded via
+            // record_backfill_progress — the local `job` snapshot captured the claim-time
+            // state (fetched=0 for a fresh job) and was never updated in place.
+            let fresh_fetched = store.get_backfill_job(job.id).await
+                .ok()
+                .flatten()
+                .map(|r| r.fetched)
+                .unwrap_or(job.fetched);
             let _ = tx.send(std::sync::Arc::new(crate::bridge_events::BridgeEvent::BackfillProgress(
                 crate::bridge_events::BackfillProgressEvent {
                     job_id: job.id,
                     chat_jid: job.chat_jid.clone(),
                     target_kind: job.target_kind.clone(),
                     target_value: job.target_value,
-                    fetched: job.fetched,
+                    fetched: fresh_fetched,
                     status: terminal_status.to_string(),
                     more_remain: terminal_more_remain,
                 },
@@ -2999,5 +3007,87 @@ mod tests {
         // Also verify the BridgeEvent enum serialises correctly (tag="backfill_progress")
         // Note: serde tag + rename_all="snake_case" → BackfillProgress → "backfill_progress"
         let _ = Arc::new(evt); // ensure it's Clone/Arc-compatible
+    }
+
+    // =========================================================================
+    // Fix 1: terminal SSE event carries fresh `fetched` (not the claim-time 0)
+    // =========================================================================
+
+    /// Drive `run_worker_loop` end-to-end with a FakeHistorySource that returns a known
+    /// total of messages, then assert the terminal `BackfillProgress` SSE event reports
+    /// the correct `fetched` count — not the stale claim-time 0.
+    #[tokio::test]
+    async fn test_run_worker_loop_terminal_event_has_correct_fetched() {
+        let (store, dir) = open_b1_store("fix1-terminal-fetched");
+
+        // Two batches: 3 messages total, then exhausted (more_remain=false).
+        let source = Arc::new(FakeHistorySource::new(vec![
+            FakeResponse::Batch {
+                messages: vec![
+                    make_msg("f1", false, 2_000),
+                    make_msg("f2", false, 3_000),
+                ],
+                more_remain: true,
+                progress: None,
+            },
+            FakeResponse::Batch {
+                messages: vec![make_msg("f0", false, 1_000)],
+                more_remain: false,
+                progress: None,
+            },
+        ]));
+
+        let sink = Arc::new(FakeBatchSink::always_ok());
+        let notify = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+
+        // Set up an event channel to capture SSE events
+        let (tx, mut rx) = crate::bridge_events::new_event_bus();
+
+        store.enqueue_backfill_job("fix1-chat@s.whatsapp.net", "all", None, 0, 0, 0)
+            .await.unwrap();
+
+        let store2 = store.clone();
+        let notify2 = notify.clone();
+        let cancel2 = cancel.clone();
+        let source2 = source.clone();
+        let sink2 = sink.clone();
+
+        let loop_handle = tokio::spawn(async move {
+            run_worker_loop(source2, sink2, store2, no_pacer(), 10, 0, notify2, cancel2, Some(tx)).await;
+        });
+
+        // Trigger the worker
+        notify.notify_one();
+        // Give it enough time to process both batches and emit the terminal event
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(200), loop_handle)
+            .await
+            .expect("loop must exit after cancel")
+            .expect("loop task must not panic");
+
+        // Collect all BackfillProgress events
+        let mut progress_events = vec![];
+        while let Ok(evt) = rx.try_recv() {
+            if let crate::bridge_events::BridgeEvent::BackfillProgress(ref p) = *evt {
+                progress_events.push(p.clone());
+            }
+        }
+
+        // The terminal event is the one with status != "running"
+        let terminal = progress_events.iter()
+            .find(|p| p.status != "running")
+            .expect("a terminal BackfillProgress event must be emitted");
+
+        assert_eq!(terminal.status, "done", "terminal status must be 'done'");
+        // Fix 1: fetched must be 3 (2 + 1), not 0 (the claim-time snapshot value)
+        assert_eq!(terminal.fetched, 3,
+            "terminal event fetched must equal the total messages fetched (3), got {}",
+            terminal.fetched);
+        assert_eq!(terminal.chat_jid, "fix1-chat@s.whatsapp.net");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

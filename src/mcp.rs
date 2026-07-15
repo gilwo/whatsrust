@@ -324,7 +324,9 @@ fn call_tool(name: &str, args: &Value, port: u16) -> Value {
             if let Some(id) = args.get("job_id").and_then(|v| v.as_i64()) {
                 http_get(port, &format!("/api/history-fetch?job_id={id}"))
             } else {
-                let active = args.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                // Default active=true (active-only) to match CLI behaviour; pass active:false
+                // explicitly to list all jobs.
+                let active = args.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
                 http_get(port, &format!("/api/history-fetch?active={active}"))
             }
         }
