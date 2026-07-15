@@ -26,8 +26,36 @@ pub enum BridgeEvent {
     Inbound(Arc<WhatsAppInbound>),
     /// Status change for an outbound job (queued → sending → sent → delivered → read).
     OutboundStatus(OutboundStatusEvent),
+    /// Progress update for a backfill job (per-batch running + terminal states).
+    BackfillProgress(BackfillProgressEvent),
     /// Periodic heartbeat for keepalive (SSE clients).
     Heartbeat,
+}
+
+/// Progress update for a backfill job.
+///
+/// Emitted per-batch (status = "running") and once on terminal exit (status one of
+/// "done" / "paused" / "failed" / "cancelled" / "deferred").
+///
+/// `target_value` is present for `count` jobs, enabling "N / target" display on the
+/// client. `more_remain` drives the fuzzy "still going" indicator for `since`/`all`
+/// targets (ADR 0034). Percentages are NOT computed server-side; raw numbers are shipped.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackfillProgressEvent {
+    /// The backfill_jobs row ID.
+    pub job_id: i64,
+    /// Chat JID the job is fetching for.
+    pub chat_jid: String,
+    /// Job target kind: "all", "since", or "count".
+    pub target_kind: String,
+    /// Target value (milliseconds for "since", message count for "count"; None for "all").
+    pub target_value: Option<i64>,
+    /// Total messages fetched so far (cumulative, including this batch).
+    pub fetched: i64,
+    /// Current status: "running", "done", "paused", "failed", "cancelled", "deferred".
+    pub status: String,
+    /// Whether the phone indicates more history is available (fuzzy indicator for since/all).
+    pub more_remain: bool,
 }
 
 /// Status update for an outbound job.
