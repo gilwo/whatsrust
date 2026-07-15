@@ -2078,6 +2078,7 @@ async fn run_bridge(
         };
         let bf_batch_size = config.backfill_batch_size;
         let bf_backstop = config.backfill_backstop;
+        let bf_event_tx = event_tx.clone();
         tokio::spawn(crate::backfill::run_worker_loop(
             bf_source,
             bf_sink,
@@ -2087,6 +2088,7 @@ async fn run_bridge(
             bf_backstop,
             bf_notify,
             bf_cancel,
+            Some(bf_event_tx),
         ));
     }
 

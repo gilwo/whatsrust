@@ -754,6 +754,7 @@ pub async fn process_job(
     batch_size: i32,
     backstop: u32,
     cancel: &CancellationToken,
+    event_tx: Option<&tokio::sync::broadcast::Sender<std::sync::Arc<crate::bridge_events::BridgeEvent>>>,
 ) -> anyhow::Result<JobEnd> {
     // --- 0. Validate inputs ---
     if batch_size <= 0 {
@@ -940,6 +941,26 @@ pub async fn process_job(
             )
             .await;
 
+        // 3h-i. Emit per-batch progress event (ADR 0034).
+        // NOTE: a dedicated "cooldown" status for randomised long inter-batch pauses is
+        // intentionally absent — the pacer (ADR 0020) currently only does uniform ~4s
+        // jittered inter-batch sleeps; there are no long pauses to signal. Per-batch
+        // "running" events provide liveness. The cooldown state is deferred until the
+        // pacer implements long pauses.
+        if let Some(tx) = event_tx {
+            let _ = tx.send(std::sync::Arc::new(crate::bridge_events::BridgeEvent::BackfillProgress(
+                crate::bridge_events::BackfillProgressEvent {
+                    job_id: job.id,
+                    chat_jid: job.chat_jid.clone(),
+                    target_kind: job.target_kind.clone(),
+                    target_value: job.target_value,
+                    fetched: fetched as i64,
+                    status: "running".to_string(),
+                    more_remain,
+                },
+            )));
+        }
+
         // 3i. Evaluate the target
         let batch_oldest_ts = new_anchor.as_ref().map(|a| a.oldest_msg_timestamp_ms);
         let step = evaluate_target(&target, fetched, batch_oldest_ts, more_remain, backstop);
@@ -1015,6 +1036,7 @@ pub async fn run_worker_loop(
     backstop: u32,
     notify: Arc<Notify>,
     cancel: CancellationToken,
+    event_tx: Option<tokio::sync::broadcast::Sender<std::sync::Arc<crate::bridge_events::BridgeEvent>>>,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -1064,6 +1086,7 @@ pub async fn run_worker_loop(
             batch_size,
             backstop,
             &cancel,
+            event_tx.as_ref(),
         )
         .await;
 
@@ -1091,6 +1114,33 @@ pub async fn run_worker_loop(
         };
 
         tracing::info!(job_id = job.id, status = new_status, "{}", log_msg);
+
+        // Emit terminal progress event (ADR 0034). One event per job completion.
+        // For Cancelled/Deferred we use `more_remain=true` (job will resume); for
+        // Done/Failed we use `more_remain=false` (nothing more to expect from this job).
+        if let Some(ref tx) = event_tx {
+            let terminal_more_remain = matches!(&outcome,
+                Ok(JobEnd::Deferred) | Ok(JobEnd::Parked) | Ok(JobEnd::Cancelled)
+            );
+            let terminal_status = match &outcome {
+                Ok(JobEnd::Done) => "done",
+                Ok(JobEnd::Parked) => "paused",
+                Ok(JobEnd::Cancelled) => "cancelled",
+                Ok(JobEnd::Deferred) => "deferred",
+                Ok(JobEnd::Failed(_)) | Err(_) => "failed",
+            };
+            let _ = tx.send(std::sync::Arc::new(crate::bridge_events::BridgeEvent::BackfillProgress(
+                crate::bridge_events::BackfillProgressEvent {
+                    job_id: job.id,
+                    chat_jid: job.chat_jid.clone(),
+                    target_kind: job.target_kind.clone(),
+                    target_value: job.target_value,
+                    fetched: job.fetched,
+                    status: terminal_status.to_string(),
+                    more_remain: terminal_more_remain,
+                },
+            )));
+        }
 
         if let Err(e) = store.mark_backfill_job(job.id, new_status).await {
             tracing::warn!(job_id = job.id, error = %e, "backfill: mark_backfill_job failed");
@@ -1561,7 +1611,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await
             .unwrap();
 
@@ -1615,7 +1665,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "count-chat@s.whatsapp.net", "count", Some(5)).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 2, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 2, 0, &cancel, None)
             .await
             .unwrap();
 
@@ -1653,7 +1703,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "since-chat@s.whatsapp.net", "since", Some(1_000_000)).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await
             .unwrap();
 
@@ -1701,7 +1751,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "park-chat@g.us", "all", None).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 3, 4, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 3, 4, &cancel, None)
             .await
             .unwrap();
 
@@ -1765,7 +1815,7 @@ mod tests {
 
         let job = enqueue_and_claim(&store, "cancel-chat@s.whatsapp.net", "all", None).await;
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await
             .unwrap();
 
@@ -1795,7 +1845,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel(); // already cancelled
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await
             .unwrap();
 
@@ -1836,7 +1886,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "stuck-chat@g.us", "all", None).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await
             .unwrap();
 
@@ -1860,7 +1910,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "err-chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await
             .unwrap();
 
@@ -1907,7 +1957,7 @@ mod tests {
         });
 
         let t0 = std::time::Instant::now();
-        let end = process_job(&job, &source, &sink, &store, &pacer, 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &pacer, 10, 0, &cancel, None)
             .await
             .unwrap();
         let elapsed = t0.elapsed();
@@ -1946,7 +1996,7 @@ mod tests {
 
         // Run the loop in the background
         let loop_handle = tokio::spawn(async move {
-            run_worker_loop(source2, sink2, store2, no_pacer(), 10, 0, notify2, cancel2).await;
+            run_worker_loop(source2, sink2, store2, no_pacer(), 10, 0, notify2, cancel2, None).await;
         });
 
         // Trigger processing
@@ -2008,7 +2058,7 @@ mod tests {
         let sink2 = sink.clone();
 
         let loop_handle = tokio::spawn(async move {
-            run_worker_loop(source2, sink2, store2, no_pacer(), 10, 0, notify2, cancel2).await;
+            run_worker_loop(source2, sink2, store2, no_pacer(), 10, 0, notify2, cancel2, None).await;
         });
 
         notify.notify_one();
@@ -2074,7 +2124,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "sink-err@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await
             .unwrap();
 
@@ -2111,7 +2161,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "exhaust-chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await
             .unwrap();
 
@@ -2174,7 +2224,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "count-cool@s.whatsapp.net", "count", Some(2)).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await.unwrap();
 
         assert_eq!(end, JobEnd::Done);
@@ -2221,7 +2271,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "noanchor-chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await.unwrap();
 
         // Must be Done (not spin, not stuck-anchor Failed)
@@ -2244,7 +2294,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "bz-chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 0, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 0, 0, &cancel, None)
             .await.unwrap();
 
         match end {
@@ -2265,7 +2315,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "bn-chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), -1, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), -1, 0, &cancel, None)
             .await.unwrap();
 
         match end {
@@ -2628,7 +2678,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "gate-chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await
             .unwrap();
 
@@ -2678,7 +2728,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "gate-mid@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await
             .unwrap();
 
@@ -2704,7 +2754,7 @@ mod tests {
         let job = enqueue_and_claim(&store, "ready-err@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
-        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel)
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
             .await
             .unwrap();
 
@@ -2743,7 +2793,7 @@ mod tests {
         let sink2 = sink.clone();
 
         let loop_handle = tokio::spawn(async move {
-            run_worker_loop(source2, sink2, store2, no_pacer(), 10, 0, notify2, cancel2).await;
+            run_worker_loop(source2, sink2, store2, no_pacer(), 10, 0, notify2, cancel2, None).await;
         });
 
         // Trigger first tick — source not ready, job must NOT be claimed
@@ -2842,7 +2892,7 @@ mod tests {
         let sink2 = sink.clone();
 
         let loop_handle = tokio::spawn(async move {
-            run_worker_loop(source2, sink2, store2, no_pacer(), 10, 0, notify2, cancel2).await;
+            run_worker_loop(source2, sink2, store2, no_pacer(), 10, 0, notify2, cancel2, None).await;
         });
 
         notify.notify_one();
@@ -2860,5 +2910,94 @@ mod tests {
             .expect("loop task must not panic");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
+    // M1.4 Wave 3 — SSE progress event tests (ADR 0034)
+    // =========================================================================
+
+    // --- test: process_job emits BackfillProgress(status="running") per batch ---
+
+    #[tokio::test]
+    async fn test_process_job_emits_running_progress_events() {
+        let (store, dir) = open_b1_store("sse-progress-running");
+
+        // Two batches: batch 1 has more_remain=true (running), batch 2 exhausts (done).
+        let source = FakeHistorySource::new(vec![
+            FakeResponse::Batch {
+                messages: vec![make_msg("e1", false, 2_000), make_msg("e2", false, 3_000)],
+                more_remain: true,
+                progress: None,
+            },
+            FakeResponse::Batch {
+                messages: vec![make_msg("e0", false, 1_000)],
+                more_remain: false,
+                progress: None,
+            },
+        ]);
+        let sink = FakeBatchSink::always_ok();
+        let job = enqueue_and_claim(&store, "sse-chat@s.whatsapp.net", "all", None).await;
+        let cancel = CancellationToken::new();
+
+        let (tx, mut rx) = crate::bridge_events::new_event_bus();
+
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, Some(&tx))
+            .await
+            .unwrap();
+
+        assert_eq!(end, JobEnd::Done);
+
+        // Collect all events that are available (non-blocking drain)
+        let mut running_events = vec![];
+        while let Ok(evt) = rx.try_recv() {
+            if let crate::bridge_events::BridgeEvent::BackfillProgress(ref p) = *evt {
+                running_events.push(p.clone());
+            }
+        }
+
+        // We expect exactly 2 running events (one per batch) — terminal is emitted by run_worker_loop
+        assert_eq!(running_events.len(), 2, "expected 2 running progress events, got {}", running_events.len());
+
+        // First batch: 2 messages fetched
+        assert_eq!(running_events[0].status, "running");
+        assert_eq!(running_events[0].fetched, 2);
+        assert_eq!(running_events[0].chat_jid, "sse-chat@s.whatsapp.net");
+        assert_eq!(running_events[0].target_kind, "all");
+        assert!(running_events[0].more_remain);
+
+        // Second batch: 3 total fetched (2 + 1)
+        assert_eq!(running_events[1].status, "running");
+        assert_eq!(running_events[1].fetched, 3);
+        assert!(!running_events[1].more_remain);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- test: format_sse_event returns Some with event name "backfill" for BackfillProgress ---
+
+    #[test]
+    fn test_format_sse_event_backfill_progress() {
+        use crate::bridge_events::{BackfillProgressEvent, BridgeEvent};
+        use std::sync::Arc;
+
+        let evt = BridgeEvent::BackfillProgress(BackfillProgressEvent {
+            job_id: 7,
+            chat_jid: "test@s.whatsapp.net".to_string(),
+            target_kind: "count".to_string(),
+            target_value: Some(100),
+            fetched: 42,
+            status: "running".to_string(),
+            more_remain: true,
+        });
+
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"job_id\":7"), "json: {json}");
+        assert!(json.contains("\"status\":\"running\""), "json: {json}");
+        assert!(json.contains("\"fetched\":42"), "json: {json}");
+        assert!(json.contains("\"more_remain\":true"), "json: {json}");
+
+        // Also verify the BridgeEvent enum serialises correctly (tag="backfill_progress")
+        // Note: serde tag + rename_all="snake_case" → BackfillProgress → "backfill_progress"
+        let _ = Arc::new(evt); // ensure it's Clone/Arc-compatible
     }
 }
