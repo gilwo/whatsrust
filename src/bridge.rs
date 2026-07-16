@@ -2027,11 +2027,13 @@ async fn run_bridge(
         });
     }
 
-    // Spawn periodic prune task
+    // Spawn periodic prune task (+ storage-growth watchdog, ADR 0013)
     {
         let prune_store = store.clone();
         let prune_cancel = cancel.clone();
         let prune_interval = config.prune_interval_secs;
+        let prune_db_path = config.db_path.clone();
+        let prune_event_tx = event_tx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(prune_interval));
             interval.tick().await; // skip immediate first tick
@@ -2046,6 +2048,57 @@ async fn run_bridge(
                                 }
                             }
                             Err(e) => warn!(error = %e, "database prune failed"),
+                        }
+
+                        // Storage-growth watchdog (ADR 0013): measure footprint; compare to persisted
+                        // baseline; ≥50% growth → WARN + SSE StorageAlert + reset baseline.
+                        match prune_store.storage_footprint(&prune_db_path).await {
+                            Ok(current) => {
+                                let baseline: u64 = prune_store
+                                    .get_metadata("watchdog_last_alerted_size")
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0);
+                                match crate::storage::watchdog_should_alert(current, baseline) {
+                                    Some(growth_pct) => {
+                                        warn!(
+                                            current_bytes = current,
+                                            baseline_bytes = baseline,
+                                            growth_pct,
+                                            "storage growth alert: DB footprint grew ≥50% vs baseline"
+                                        );
+                                        let _ = prune_event_tx.send(Arc::new(
+                                            crate::bridge_events::BridgeEvent::StorageAlert(
+                                                crate::bridge_events::StorageAlertEvent {
+                                                    current_bytes: current,
+                                                    baseline_bytes: baseline,
+                                                    growth_pct,
+                                                },
+                                            ),
+                                        ));
+                                        if let Err(e) = prune_store
+                                            .set_metadata("watchdog_last_alerted_size", &current.to_string())
+                                            .await
+                                        {
+                                            warn!(error = %e, "watchdog: failed to reset baseline");
+                                        }
+                                    }
+                                    None if baseline == 0 => {
+                                        // Absent/zero baseline — seed it silently (shouldn't happen
+                                        // on a migrated DB, but guard against test/fresh-DB edge case).
+                                        if let Err(e) = prune_store
+                                            .set_metadata("watchdog_last_alerted_size", &current.to_string())
+                                            .await
+                                        {
+                                            warn!(error = %e, "watchdog: failed to seed baseline");
+                                        }
+                                    }
+                                    None => {} // below threshold — nothing to do
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "storage watchdog: footprint measurement failed"),
                         }
                     }
                     _ = prune_cancel.cancelled() => break,
@@ -2090,78 +2143,6 @@ async fn run_bridge(
             bf_cancel,
             Some(bf_event_tx),
         ));
-    }
-
-    // TEMPORARY smoke-test trigger — replaced by the API/MCP trigger in M1.4
-    //
-    // Set WHATSRUST_BACKFILL_TEST=<chat_jid>:<count> (e.g. 123@s.whatsapp.net:100)
-    // to immediately seed the backfill cursor for that chat and enqueue a Count job.
-    // Expected logs: "backfill smoke-test: seeded cursor and enqueued job"
-    // Expected DB: rows in backfill_jobs (status=queued→running→done) and backfill_cursors.
-    if let Ok(val) = std::env::var("WHATSRUST_BACKFILL_TEST") {
-        if let Some((chat, count_str)) = val.split_once(':') {
-            if let Ok(count) = count_str.parse::<i64>() {
-                let chat = chat.to_string();
-                let store_bt = store.clone();
-                let notify_bt = backfill_notify.clone();
-                let bt_cooldown = config.backfill_cooldown_secs;
-                let bt_queue_depth = config.backfill_queue_depth;
-                let bt_max_messages = config.backfill_max_messages;
-                tokio::spawn(async move {
-                    match store_bt.get_oldest_message(&chat).await {
-                        Ok(oldest) => {
-                            let anchor = crate::backfill::initial_anchor(oldest);
-                            if let Err(e) = store_bt
-                                .upsert_backfill_cursor(
-                                    &chat,
-                                    Some(&anchor.oldest_msg_id),
-                                    Some(anchor.oldest_msg_from_me),
-                                    Some(anchor.oldest_msg_timestamp_ms),
-                                    true,
-                                    false,
-                                    None,
-                                )
-                                .await
-                            {
-                                warn!(error = %e, "backfill smoke-test: upsert_backfill_cursor failed");
-                                return;
-                            }
-                            match store_bt
-                                .enqueue_backfill_job(&chat, "count", Some(count), bt_cooldown, bt_queue_depth, bt_max_messages)
-                                .await
-                            {
-                                Ok(crate::storage::EnqueueOutcome::Accepted { job_id, accepted_target }) => {
-                                    info!(
-                                        chat = %chat,
-                                        count,
-                                        job_id,
-                                        accepted_target = ?accepted_target,
-                                        "backfill smoke-test: seeded cursor and enqueued job"
-                                    );
-                                    notify_bt.notify_one();
-                                }
-                                Ok(crate::storage::EnqueueOutcome::QueueFull { limit }) => {
-                                    warn!(limit, "backfill smoke-test: queue full, job not enqueued");
-                                }
-                                Ok(other) => {
-                                    info!(outcome = ?other, "backfill smoke-test: job not enqueued (back-pressure)");
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "backfill smoke-test: enqueue_backfill_job failed");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "backfill smoke-test: get_oldest_message failed");
-                        }
-                    }
-                });
-            } else {
-                warn!(val = %val, "WHATSRUST_BACKFILL_TEST: invalid count (expected <jid>:<number>)");
-            }
-        } else {
-            warn!(val = %val, "WHATSRUST_BACKFILL_TEST: expected format <jid>:<count>");
-        }
     }
 
     let mut backoff = Duration::from_secs(1);

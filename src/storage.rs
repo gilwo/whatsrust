@@ -570,9 +570,9 @@ fn validate_migration_post_commit(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Seed the watchdog baseline in `metadata` — INSERT OR IGNORE (seed-on-absence semantics).
-/// Measures `db + -wal + -shm` on-disk size.
-fn seed_watchdog_baseline(conn: &Connection, db_path: &Path) -> Result<()> {
+/// Measure the total on-disk footprint of a SQLite WAL-mode database:
+/// `db + -wal + -shm` file sizes, each absent file contributes 0.
+fn measure_db_footprint(db_path: &Path) -> u64 {
     let db_size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
     let sidecar = |suffix: &str| -> PathBuf {
         let name = format!(
@@ -584,12 +584,40 @@ fn seed_watchdog_baseline(conn: &Connection, db_path: &Path) -> Result<()> {
     };
     let wal_size = std::fs::metadata(sidecar("-wal")).map(|m| m.len()).unwrap_or(0);
     let shm_size = std::fs::metadata(sidecar("-shm")).map(|m| m.len()).unwrap_or(0);
-    let total = db_size + wal_size + shm_size;
+    db_size + wal_size + shm_size
+}
+
+/// Seed the watchdog baseline in `metadata` — INSERT OR IGNORE (seed-on-absence semantics).
+/// Measures `db + -wal + -shm` on-disk size.
+fn seed_watchdog_baseline(conn: &Connection, db_path: &Path) -> Result<()> {
+    let total = measure_db_footprint(db_path);
     conn.execute(
         "INSERT OR IGNORE INTO metadata (key, value) VALUES ('watchdog_last_alerted_size', ?1)",
         params![total.to_string()],
     ).map_err(db_err)?;
     Ok(())
+}
+
+/// Decide whether the storage watchdog should alert.
+///
+/// Returns `Some(growth_pct)` when `current >= baseline + baseline/2` (≥50% growth vs baseline).
+/// Returns `None` when `baseline == 0` (avoid div-by-zero; caller should silently re-seed)
+/// or when growth is below the 50% threshold.
+///
+/// Uses integer-only math to avoid floating-point and u64 overflow:
+///   - threshold comparison: `current >= baseline + baseline/2` (no multiply)
+///   - growth_pct: cast to u128 for the multiply, then truncate back
+pub fn watchdog_should_alert(current: u64, baseline: u64) -> Option<u32> {
+    if baseline == 0 {
+        return None;
+    }
+    let threshold = baseline.saturating_add(baseline / 2);
+    if current < threshold {
+        return None;
+    }
+    // growth_pct = (current - baseline) * 100 / baseline — use u128 to avoid overflow
+    let growth_pct = ((current - baseline) as u128 * 100 / baseline as u128) as u32;
+    Some(growth_pct)
 }
 
 /// Find the newest `<db_path>.pre-migration-v*.bak` sidecar file.
@@ -1447,6 +1475,57 @@ impl Store {
             let _ = c.execute_batch("PRAGMA incremental_vacuum(500);");
 
             Ok(PruneStats { sent_deleted })
+        })
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Storage watchdog — footprint measurement + metadata key-value store
+    // -----------------------------------------------------------------------
+
+    /// Measure the current on-disk footprint of the database.
+    ///
+    /// Runs `PRAGMA wal_checkpoint(PASSIVE)` first (non-blocking; flushes WAL pages where
+    /// possible without stalling writers), then delegates to `measure_db_footprint` for the
+    /// three-file stat sum. The caller must supply `db_path` — `Store` holds no path field.
+    pub async fn storage_footprint(&self, db_path: &Path) -> Result<u64> {
+        let path = db_path.to_path_buf();
+        self.run(move |c| {
+            // PASSIVE checkpoint — ignore result rows (busy readers OK; next tick catches up)
+            let _ = c.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+            Ok(measure_db_footprint(&path))
+        })
+        .await
+    }
+
+    /// Read a value from the `metadata` key-value table.
+    ///
+    /// Returns `Ok(None)` when the key is absent.
+    pub async fn get_metadata(&self, key: &str) -> Result<Option<String>> {
+        let k = key.to_owned();
+        self.run(move |c| {
+            c.query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                params![k],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    /// Write (insert-or-replace) a value into the `metadata` key-value table.
+    pub async fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
+        let k = key.to_owned();
+        let v = value.to_owned();
+        self.run(move |c| {
+            c.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+                params![k, v],
+            )
+            .map_err(db_err)?;
+            Ok(())
         })
         .await
     }
@@ -4865,5 +4944,84 @@ mod tests {
         assert_eq!(n, 0, "mark_backfill_job on absent id must return 0 rows affected");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // Storage watchdog — metadata roundtrip + watchdog_should_alert boundaries
+    // -------------------------------------------------------------------------
+
+    /// (wd-1) get_metadata returns None for an absent key; set_metadata + get_metadata roundtrips.
+    #[tokio::test]
+    async fn test_metadata_roundtrip() {
+        let dir = unique_test_dir("metadata-roundtrip");
+        let db_path = dir.join("whatsapp.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::new(&db_path).unwrap();
+
+        // Absent key → None
+        let val = store.get_metadata("test_key_absent").await.unwrap();
+        assert_eq!(val, None, "absent key must return None");
+
+        // Set then get
+        store.set_metadata("test_key_absent", "hello").await.unwrap();
+        let val = store.get_metadata("test_key_absent").await.unwrap();
+        assert_eq!(val.as_deref(), Some("hello"), "set then get must roundtrip");
+
+        // Overwrite (INSERT OR REPLACE semantics)
+        store.set_metadata("test_key_absent", "world").await.unwrap();
+        let val = store.get_metadata("test_key_absent").await.unwrap();
+        assert_eq!(val.as_deref(), Some("world"), "second set must overwrite");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // watchdog_should_alert — pure-function boundary tests (no DB needed)
+    // -------------------------------------------------------------------------
+
+    /// (wd-2) baseline == 0 → always None (avoid div-by-zero; caller should re-seed silently).
+    #[test]
+    fn test_watchdog_baseline_zero_returns_none() {
+        assert_eq!(watchdog_should_alert(0, 0), None);
+        assert_eq!(watchdog_should_alert(1_000_000, 0), None);
+        assert_eq!(watchdog_should_alert(u64::MAX, 0), None);
+    }
+
+    /// (wd-3) exactly 1.5× growth (100 → 150) must fire with growth_pct = 50.
+    #[test]
+    fn test_watchdog_exactly_fifty_percent_fires() {
+        let result = watchdog_should_alert(150, 100);
+        assert_eq!(result, Some(50), "exactly 1.5× must return Some(50)");
+    }
+
+    /// (wd-4) just under 1.5× (100 → 149) must NOT fire.
+    #[test]
+    fn test_watchdog_just_under_threshold_no_alert() {
+        let result = watchdog_should_alert(149, 100);
+        assert_eq!(result, None, "149/100 is <1.5× and must return None");
+    }
+
+    /// (wd-5) current < baseline must NOT fire (DB shrank or WAL flushed).
+    #[test]
+    fn test_watchdog_shrink_no_alert() {
+        assert_eq!(watchdog_should_alert(50, 100), None);
+        assert_eq!(watchdog_should_alert(0, 100), None);
+    }
+
+    /// (wd-6) large values must not overflow (u128 intermediate avoids u64 overflow).
+    #[test]
+    fn test_watchdog_large_values_no_overflow() {
+        // baseline = 2^62, current = 3 × 2^62 → 200% growth, Some(200)
+        let baseline: u64 = 1 << 62;
+        let current: u64 = baseline.saturating_mul(3);
+        let result = watchdog_should_alert(current, baseline);
+        assert_eq!(result, Some(200), "large values must not overflow");
+    }
+
+    /// (wd-7) current == baseline must NOT fire (0% growth).
+    #[test]
+    fn test_watchdog_equal_no_alert() {
+        assert_eq!(watchdog_should_alert(100, 100), None);
+        assert_eq!(watchdog_should_alert(1_000_000, 1_000_000), None);
     }
 }

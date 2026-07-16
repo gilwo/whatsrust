@@ -32,7 +32,7 @@ When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md
 - `src/outbound.rs` — typed outbound ops (21 OpKinds), payload structs, execute_job() builds wa::Message + uploads media
 - `src/bridge_events.rs` — broadcast event bus: BridgeEvent, OutboundStatusEvent, OutboundJobState, DeliveryStatus
 - `src/api.rs` — REST API server (54 endpoints) + SSE streaming + CLI HTTP client
-- `src/mcp.rs` — MCP server (30 tools, JSON-RPC over stdio, proxies to HTTP daemon)
+- `src/mcp.rs` — MCP server (33 tools, JSON-RPC over stdio, proxies to HTTP daemon)
 - `src/storage.rs` — rusqlite Signal Protocol store + typed outbound queue + inbound history + search
 - `src/polls.rs` — poll crypto (HKDF-SHA256 + AES-256-GCM)
 - `src/dedup.rs` — generation-tracked DashMap dedup
