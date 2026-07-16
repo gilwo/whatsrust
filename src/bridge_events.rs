@@ -28,6 +28,8 @@ pub enum BridgeEvent {
     OutboundStatus(OutboundStatusEvent),
     /// Progress update for a backfill job (per-batch running + terminal states).
     BackfillProgress(BackfillProgressEvent),
+    /// Storage growth alert — DB footprint grew ≥50% vs the persisted baseline (ADR 0013).
+    StorageAlert(StorageAlertEvent),
     /// Periodic heartbeat for keepalive (SSE clients).
     Heartbeat,
 }
@@ -56,6 +58,20 @@ pub struct BackfillProgressEvent {
     pub status: String,
     /// Whether the phone indicates more history is available (fuzzy indicator for since/all).
     pub more_remain: bool,
+}
+
+/// Storage growth alert emitted when the DB footprint grows ≥50% vs the persisted baseline.
+///
+/// Raw bytes are shipped; clients can format as MB. Emitted at most once per growth event
+/// because the baseline is reset to `current_bytes` on each alert (ADR 0013).
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageAlertEvent {
+    /// Current total on-disk footprint in bytes (`db + -wal + -shm`).
+    pub current_bytes: u64,
+    /// Baseline footprint in bytes at the time of the last alert (or migration seed).
+    pub baseline_bytes: u64,
+    /// Growth percentage: `(current - baseline) * 100 / baseline`.
+    pub growth_pct: u32,
 }
 
 /// Status update for an outbound job.

@@ -2,7 +2,7 @@
 
 **Type:** Live document — kept up to date as features land. Update the **Status** of an
 item when work starts/completes; add a dated note in its row's detail.
-**Last updated:** 2026-07-03
+**Last updated:** 2026-07-16
 
 This is the single tracking surface for in-flight and planned work on this experimental
 fork. The *why* for each design lives in the ADRs (`docs/adr/`); the *what/how* blueprints
@@ -27,7 +27,7 @@ Per-chat historical backfill (`all` / `since:T` / `count:N`) + local FTS5 (lexic
     - [x] **M1.1 storage + migration** — DONE 2026-07-03. v8 `messages` table + FTS5 (external-content, BM25) + `'delete'`-command sync triggers; sibling tables (`media_refs`, `embeddings`, `backfill_cursor`, `backfill_jobs`, `metadata`); copy-then-drop v7→v8 migration; staged ceremony (fail-closed backup → FTS5 probe → migrate-in-TX → post-commit validation → circuit-breaker pin + `--rollback`/`--migrate` → watchdog baseline seed); **I2 age-prune removed**. 168 tests + real-data dry-run (Hebrew/Arabic FTS verified). (ADR 0009/0019/0027/0028-0032/0036)
     - [x] **M1.2 fetch worker + safety/config** — DONE 2026-07-03. Single-FIFO paginating worker (two-phase async on-demand fetch via `HistoryCorrelator`), contained-C target model (`since`/`all`/`count`), 3-level abort, dedicated backfill pacer, daemon-side guards (queue-depth + `max_messages` clamp + cooldown), fail-closed safety config (`WHATSRUST_DANGEROUSLY_ALLOW_*`), dotenvy `.env`. Connection-gating (defer-not-fail when not connected) + LID/PN resolution fixes. **Live-validated end-to-end** (count fetch auto-paginated to exhaustion, 14 msgs stored under phone JID). (ADR 0003/0010/0020/0021/0022/0023/0026/0033/0035)
     - [x] **M1.3 FTS5 lexical search** — DONE 2026-07-13. `search_inbound` rewritten: `query=Some` → FTS5 `messages_fts MATCH` + BM25 `ORDER BY rank` (ascending); `query=None` history browse unchanged. Quote-as-phrase MATCH sanitization (`"`→`""`; operators neutralized). Single FTS path (EXPLAIN-verified: FTS index drives, PK rowid lookup) — no LIKE fallback. Multilingual (Hebrew/Arabic) + injection-safe. 9 tests; suite 188 lib / 203 bin green. API/MCP JSON shape unchanged (now relevance-ranked). (ADR 0019)
-    - [ ] M1.4 API/MCP trigger + watchdog (`/api/history-fetch`, `whatsrust_fetch_history`, SSE, growth watchdog). (ADR 0011/0013/0034/0036)
+    - [x] **M1.4 API/MCP trigger + watchdog** — DONE 2026-07-16. `/api/history-fetch` (trigger/status/cancel) + MCP tools `whatsrust_fetch_history`/`_status`/`_cancel` (→33 MCP tools) + SSE `BackfillProgress` events (fuzzy/precise per target-kind); storage-growth watchdog wired into the periodic prune tick (`wal_checkpoint(PASSIVE)` + `db+wal+shm` stat, ≥50% → WARN + `BridgeEvent::StorageAlert` + baseline reset); temp `WHATSRUST_BACKFILL_TEST` hook retired. M1 is **code-complete; live E2E smoke test is the remaining M1 exit gate.** (ADR 0011/0013/0034/0036)
   - [ ] **M2 — semantic search** (layers on M1; = F2 below): sidecar + drain + cosine rerank. Phase breakdown deferred to M2 start. (ADR 0008/0015/0016/0017/0024)
 
 ### F2 — Embedder sidecar (implementation) 🔵 Designed

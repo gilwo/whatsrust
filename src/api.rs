@@ -1499,6 +1499,11 @@ fn format_sse_event(event: &crate::bridge_events::BridgeEvent) -> Option<String>
             let event_id = format!("backfill:{}:{}", p.job_id, p.fetched);
             Some(format_sse_frame("backfill", Some(&event_id), &data))
         }
+        crate::bridge_events::BridgeEvent::StorageAlert(a) => {
+            let data = serde_json::to_string(a).ok()?;
+            let event_id = format!("storage_alert:{}", a.current_bytes);
+            Some(format_sse_frame("storage_alert", Some(&event_id), &data))
+        }
         crate::bridge_events::BridgeEvent::Heartbeat => {
             Some(format_sse_frame("heartbeat", None, "{}"))
         }
