@@ -584,7 +584,7 @@ fn measure_db_footprint(db_path: &Path) -> u64 {
     };
     let wal_size = std::fs::metadata(sidecar("-wal")).map(|m| m.len()).unwrap_or(0);
     let shm_size = std::fs::metadata(sidecar("-shm")).map(|m| m.len()).unwrap_or(0);
-    db_size + wal_size + shm_size
+    db_size.saturating_add(wal_size).saturating_add(shm_size)
 }
 
 /// Seed the watchdog baseline in `metadata` — INSERT OR IGNORE (seed-on-absence semantics).
@@ -609,6 +609,11 @@ fn seed_watchdog_baseline(conn: &Connection, db_path: &Path) -> Result<()> {
 ///   - growth_pct: cast to u128 for the multiply, then truncate back
 pub fn watchdog_should_alert(current: u64, baseline: u64) -> Option<u32> {
     if baseline == 0 {
+        return None;
+    }
+    // Equal or shrunk size must never alert (also fixes baseline==1 edge where
+    // threshold == baseline and the `current < threshold` guard alone would misfire).
+    if current <= baseline {
         return None;
     }
     let threshold = baseline.saturating_add(baseline / 2);
@@ -5023,5 +5028,60 @@ mod tests {
     fn test_watchdog_equal_no_alert() {
         assert_eq!(watchdog_should_alert(100, 100), None);
         assert_eq!(watchdog_should_alert(1_000_000, 1_000_000), None);
+        // baseline==1 edge: threshold = 1+0 = 1; without the current<=baseline guard this
+        // previously returned Some(0) — a spurious 0%-growth alert.
+        assert_eq!(watchdog_should_alert(1, 1), None, "baseline==1 equal must return None");
+    }
+
+    /// (wd-8) Store-level integration: set_metadata + watchdog decision + reset prevents re-alert.
+    ///
+    /// This exercises the full decision+update sequence the periodic watchdog tick performs
+    /// (storage_footprint → get_metadata → watchdog_should_alert → set_metadata), without
+    /// needing the live bridge task.  It mechanically verifies the reset-prevents-re-alert
+    /// invariant that Fix 1 depends on.
+    #[tokio::test]
+    async fn test_watchdog_reset_prevents_re_alert() {
+        let dir = unique_test_dir("watchdog-reset");
+        let db_path = dir.join("whatsapp.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::new(&db_path).unwrap();
+
+        // Seed a baseline of 100 (simulates what migration or a previous alert would write).
+        store.set_metadata("watchdog_last_alerted_size", "100").await.unwrap();
+
+        // Simulate tick: current=150 vs baseline=100 → 50% growth → should alert.
+        let baseline: u64 = store
+            .get_metadata("watchdog_last_alerted_size")
+            .await
+            .unwrap()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        assert_eq!(baseline, 100);
+        assert_eq!(
+            watchdog_should_alert(150, baseline),
+            Some(50),
+            "150 vs 100 must alert with 50% growth"
+        );
+
+        // Simulate the tick's reset (Fix 1: reset BEFORE emitting SSE).
+        store.set_metadata("watchdog_last_alerted_size", "150").await.unwrap();
+
+        // Verify the reset persisted.
+        let new_baseline: u64 = store
+            .get_metadata("watchdog_last_alerted_size")
+            .await
+            .unwrap()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        assert_eq!(new_baseline, 150, "baseline must be updated to 150 after reset");
+
+        // After reset, same current (150) vs new baseline (150) → must NOT re-alert.
+        assert_eq!(
+            watchdog_should_alert(150, new_baseline),
+            None,
+            "after reset, current==baseline must not re-alert"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2069,20 +2069,27 @@ async fn run_bridge(
                                             growth_pct,
                                             "storage growth alert: DB footprint grew ≥50% vs baseline"
                                         );
-                                        let _ = prune_event_tx.send(Arc::new(
-                                            crate::bridge_events::BridgeEvent::StorageAlert(
-                                                crate::bridge_events::StorageAlertEvent {
-                                                    current_bytes: current,
-                                                    baseline_bytes: baseline,
-                                                    growth_pct,
-                                                },
-                                            ),
-                                        ));
-                                        if let Err(e) = prune_store
+                                        // Reset baseline FIRST; only emit SSE if reset succeeded.
+                                        // If reset fails, skip the emit — the alert will naturally
+                                        // retry on the next tick once the write succeeds.
+                                        match prune_store
                                             .set_metadata("watchdog_last_alerted_size", &current.to_string())
                                             .await
                                         {
-                                            warn!(error = %e, "watchdog: failed to reset baseline");
+                                            Ok(()) => {
+                                                let _ = prune_event_tx.send(Arc::new(
+                                                    crate::bridge_events::BridgeEvent::StorageAlert(
+                                                        crate::bridge_events::StorageAlertEvent {
+                                                            current_bytes: current,
+                                                            baseline_bytes: baseline,
+                                                            growth_pct,
+                                                        },
+                                                    ),
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                warn!(error = %e, "watchdog: failed to reset baseline; skipping SSE emit");
+                                            }
                                         }
                                     }
                                     None if baseline == 0 => {

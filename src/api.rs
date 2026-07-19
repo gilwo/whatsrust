@@ -1501,7 +1501,7 @@ fn format_sse_event(event: &crate::bridge_events::BridgeEvent) -> Option<String>
         }
         crate::bridge_events::BridgeEvent::StorageAlert(a) => {
             let data = serde_json::to_string(a).ok()?;
-            let event_id = format!("storage_alert:{}", a.current_bytes);
+            let event_id = format!("storage_alert:{}:{}", a.current_bytes, a.baseline_bytes);
             Some(format_sse_frame("storage_alert", Some(&event_id), &data))
         }
         crate::bridge_events::BridgeEvent::Heartbeat => {
