@@ -178,11 +178,34 @@ fn read_local_media_file(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn main() -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    // A panic must terminate the process, not unwind into the tokio Runtime's
+    // Drop — that Drop blocks forever on the REPL's tokio::io::stdin() reader
+    // thread, which is parked in read(). (Ctrl+C in a `| tee` pipeline kills tee,
+    // breaking stdout; the in-async exit(0) guard is bypassed on that path.)
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        prev_hook(info);
+        std::process::exit(101);
+    }));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(8 * 1024 * 1024)
-        .build()?
-        .block_on(async_main())
+        .build()?;
+    let result = rt.block_on(async_main());
+
+    // Do NOT let `rt` drop here: Runtime::drop waits on the parked blocking
+    // stdin reader thread and would hang. Flush and exit hard instead.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("whatsrust: {e:?}");
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn async_main() -> Result<()> {
