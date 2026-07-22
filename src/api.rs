@@ -52,6 +52,43 @@ impl HttpRequest {
     }
 }
 
+/// Percent-encode a value for use in a URL query component (RFC 3986):
+/// keep unreserved chars, %XX-encode every other byte. UTF-8 safe (operates on bytes).
+pub fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Percent-decode a URL query component. Invalid/incomplete `%` escapes are
+/// left literal (so a raw string with no valid escapes is returned unchanged).
+/// Does NOT treat '+' as space (RFC 3986 query components use %20).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let hex = |c: u8| -> Option<u8> {
+        match c { b'0'..=b'9' => Some(c - b'0'), b'a'..=b'f' => Some(c - b'a' + 10), b'A'..=b'F' => Some(c - b'A' + 10), _ => None }
+    };
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
     let status_text = match status {
         200 => "OK",
@@ -237,7 +274,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest>
             .split('&')
             .filter_map(|pair| {
                 let mut kv = pair.splitn(2, '=');
-                Some((kv.next()?.to_string(), kv.next().unwrap_or("").to_string()))
+                Some((percent_decode(kv.next()?), percent_decode(kv.next().unwrap_or(""))))
             })
             .collect();
         (raw_path[..idx].to_string(), q)
@@ -1948,5 +1985,93 @@ mod tests {
         assert!(jobs.is_empty(), "no job should have been enqueued for an exhausted cursor");
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // -------------------------------------------------------------------------
+    // Query param hardening: urlencode / percent_decode
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_urlencode_percent_decode_round_trip() {
+        let cases = [
+            "972542271337@s.whatsapp.net",
+            "120363000@g.us",
+            "foo&bar=baz #x",
+            " ",
+            "50%",
+            "שלום",
+            "مرحبا",
+        ];
+        for s in cases {
+            let encoded = urlencode(s);
+            assert_eq!(percent_decode(&encoded), s, "round-trip failed for {s:?}");
+        }
+    }
+
+    #[test]
+    fn test_urlencode_keeps_unreserved_chars_literal() {
+        assert_eq!(urlencode("abcXYZ019-_.~"), "abcXYZ019-_.~");
+        assert_eq!(urlencode("@"), "%40");
+        assert_eq!(urlencode(" "), "%20");
+        assert_eq!(urlencode("&"), "%26");
+    }
+
+    #[test]
+    fn test_percent_decode_raw_string_is_unchanged() {
+        // Backward compat: no '%' escapes means the decode is a no-op.
+        let raw = "972542271337@s.whatsapp.net";
+        assert_eq!(percent_decode(raw), raw);
+    }
+
+    #[test]
+    fn test_percent_decode_trailing_percent_left_literal() {
+        // Incomplete escape at end of string must not panic or truncate.
+        assert_eq!(percent_decode("50%"), "50%");
+        assert_eq!(percent_decode("50%4"), "50%4");
+        assert_eq!(percent_decode("%"), "%");
+    }
+
+    #[test]
+    fn test_percent_decode_decodes_valid_escapes() {
+        assert_eq!(percent_decode("972%40s.whatsapp.net"), "972@s.whatsapp.net");
+        assert_eq!(percent_decode("foo%26bar%3Dbaz"), "foo&bar=baz");
+    }
+
+    #[tokio::test]
+    async fn test_read_request_percent_decodes_query_params() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+
+        client
+            .write_all(b"GET /api/search?q=foo%26bar&jid=972%40s.whatsapp.net HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+
+        let req = read_request(&mut server_stream).await.expect("request should parse");
+        assert_eq!(req.query_get("q"), Some("foo&bar"));
+        assert_eq!(req.query_get("jid"), Some("972@s.whatsapp.net"));
+    }
+
+    #[tokio::test]
+    async fn test_read_request_leaves_raw_query_unchanged_for_backward_compat() {
+        // Un-updated clients (and direct curl) send raw, unencoded values — verify
+        // the server-side decode is a no-op when there are no '%' escapes.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+
+        client
+            .write_all(b"GET /api/history?jid=972542271337@s.whatsapp.net&limit=20 HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+
+        let req = read_request(&mut server_stream).await.expect("request should parse");
+        assert_eq!(req.query_get("jid"), Some("972542271337@s.whatsapp.net"));
+        assert_eq!(req.query_get("limit"), Some("20"));
     }
 }

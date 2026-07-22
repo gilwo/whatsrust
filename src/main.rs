@@ -1419,7 +1419,7 @@ async fn cli_main(args: &[String]) -> Result<()> {
         }
         "group-info" => {
             require_args(args, 2, "group-info <jid>")?;
-            let (status, body) = api::cli_get(port, &format!("/api/group-info?jid={}", args[1])).await?;
+            let (status, body) = api::cli_get(port, &format!("/api/group-info?jid={}", api::urlencode(&args[1]))).await?;
             print_json_result(status, &body)?;
             Ok(())
         }
@@ -1647,7 +1647,7 @@ async fn cli_main(args: &[String]) -> Result<()> {
         }
         "group-invite" | "group-invite-link" => {
             require_args(args, 2, "group-invite <jid>")?;
-            let (status, resp) = api::cli_get(port, &format!("/api/group-invite-link?jid={}", args[1])).await?;
+            let (status, resp) = api::cli_get(port, &format!("/api/group-invite-link?jid={}", api::urlencode(&args[1]))).await?;
             print_json_result(status, &resp)?;
             Ok(())
         }
@@ -1721,14 +1721,14 @@ async fn cli_main(args: &[String]) -> Result<()> {
         "history" => {
             require_args(args, 2, "history <jid> [limit]")?;
             let limit = args.get(2).and_then(|v| v.parse::<i64>().ok()).unwrap_or(20);
-            let (status, body) = api::cli_get(port, &format!("/api/history?jid={}&limit={}", args[1], limit)).await?;
+            let (status, body) = api::cli_get(port, &format!("/api/history?jid={}&limit={}", api::urlencode(&args[1]), limit)).await?;
             print_json_result(status, &body)?;
             Ok(())
         }
         "search" => {
             require_args(args, 2, "search <query> [jid]")?;
-            let query = &args[1];
-            let jid_param = args.get(2).map(|j| format!("&jid={j}")).unwrap_or_default();
+            let query = api::urlencode(&args[1]);
+            let jid_param = args.get(2).map(|j| format!("&jid={}", api::urlencode(j))).unwrap_or_default();
             let (status, body) = api::cli_get(port, &format!("/api/search?q={query}{jid_param}")).await?;
             print_json_result(status, &body)?;
             Ok(())

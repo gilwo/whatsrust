@@ -274,13 +274,13 @@ fn call_tool(name: &str, args: &Value, port: u16) -> Value {
         "whatsrust_groups" => http_get(port, "/api/groups"),
         "whatsrust_group_info" => {
             let jid = args.get("jid").and_then(|v| v.as_str()).unwrap_or("");
-            http_get(port, &format!("/api/group-info?jid={jid}"))
+            http_get(port, &format!("/api/group-info?jid={}", crate::api::urlencode(jid)))
         }
         "whatsrust_history" => {
             let jid = args.get("jid").and_then(|v| v.as_str()).unwrap_or("");
             let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
             let before = args.get("before").and_then(|v| v.as_i64());
-            let mut url = format!("/api/history?jid={jid}&limit={limit}");
+            let mut url = format!("/api/history?jid={}&limit={limit}", crate::api::urlencode(jid));
             if let Some(b) = before { url.push_str(&format!("&before={b}")); }
             http_get(port, &url)
         }
@@ -288,8 +288,8 @@ fn call_tool(name: &str, args: &Value, port: u16) -> Value {
             let q = args.get("q").and_then(|v| v.as_str()).unwrap_or("");
             let jid = args.get("jid").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
-            let mut url = format!("/api/search?q={q}&limit={limit}");
-            if let Some(j) = jid { url.push_str(&format!("&jid={j}")); }
+            let mut url = format!("/api/search?q={}&limit={limit}", crate::api::urlencode(q));
+            if let Some(j) = jid { url.push_str(&format!("&jid={}", crate::api::urlencode(j))); }
             http_get(port, &url)
         }
         "whatsrust_send" => http_post(port, "/api/send?sync=true", args),
