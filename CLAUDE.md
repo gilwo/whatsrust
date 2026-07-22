@@ -16,7 +16,7 @@ Where to look for what — read the relevant doc before changing related code.
 | **Implementation execution plan (phases, gates, milestone exit criteria)** | `docs/plans/IMPLEMENTATION-ROADMAP.md` |
 | Design specs / plans (the "what/how" blueprints) | `docs/plans/*.md` |
 | Design review reports (cold reviews, reconciliation) | `_reviewer/design/` |
-| In-flight: historical fetch + semantic/lexical search | `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (+ ADRs 0001–0025) |
+| Historical fetch + lexical search (M1 — **DONE** 2026-07-20) / semantic search (M2 — planned) | `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (+ ADRs 0001–0037) |
 
 When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md`, MADR format) and link it from `docs/adr/0000-index.md`.
 
@@ -31,9 +31,10 @@ When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md
 - `src/bridge.rs` — core bridge: events, all message types, typing, groups, polls, presence, delivery receipts, group cache
 - `src/outbound.rs` — typed outbound ops (21 OpKinds), payload structs, execute_job() builds wa::Message + uploads media
 - `src/bridge_events.rs` — broadcast event bus: BridgeEvent, OutboundStatusEvent, OutboundJobState, DeliveryStatus
-- `src/api.rs` — REST API server (54 endpoints) + SSE streaming + CLI HTTP client
+- `src/api.rs` — REST API server (58 endpoints) + SSE streaming + CLI HTTP client
 - `src/mcp.rs` — MCP server (33 tools, JSON-RPC over stdio, proxies to HTTP daemon)
-- `src/storage.rs` — rusqlite Signal Protocol store + typed outbound queue + inbound history + search
+- `src/storage.rs` — rusqlite Signal Protocol store + typed outbound queue + v8 unified `messages` table (live + backfill) + FTS5 search + backfill job queue/cursor + `metadata` KV
+- `src/backfill.rs` — historical backfill worker: two-phase async on-demand fetch (`client.fetch_message_history` → session-id → later `Event::HistorySync` correlated via `HistoryCorrelator`), single-worker FIFO pagination, contained-C target model (`since`/`all`/`count`), dedicated `BackfillPacer`, 3-level abort (batch/job/task), behind `HistorySource`/`BatchSink` trait seams
 - `src/polls.rs` — poll crypto (HKDF-SHA256 + AES-256-GCM)
 - `src/dedup.rs` — generation-tracked DashMap dedup
 - `src/read_receipts.rs` — batched receipt scheduler
@@ -48,7 +49,9 @@ When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md
 - `parse_jid()` for JID normalization (phone → @s.whatsapp.net, group → @g.us)
 - `parking_lot::Mutex<Connection>` + `spawn_blocking` for SQLite
 - `extract_content_inner` recursive descent for inbound message parsing
-- Schema migrations via version check in `Store::new()` (currently v7)
+- Schema migrations via version check in `Store::new()` (currently v8)
 - Token-bucket rate limiter (burst + sustained rate) for anti-ban pacing
 - Chat management ops (pin, mute, archive, mark-read, delete, star) use direct client calls, not the outbound queue
 - Status/story sending (text, image, video, revoke) goes through the outbound queue like regular messages
+- FTS5/BM25 lexical search: `query=Some(q)` → `messages_fts MATCH` + `ORDER BY f.rank` (relevance-ranked); `query=None` → chronological browse
+- SQLite-first backfill: durable `backfill_jobs` queue + single FIFO worker + connection-gating (defer, not fail, when disconnected)

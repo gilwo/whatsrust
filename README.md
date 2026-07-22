@@ -16,9 +16,9 @@
 &nbsp;
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 &nbsp;
-[![54 API Endpoints](https://img.shields.io/badge/API-54_endpoints-green?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#api)
+[![58 API Endpoints](https://img.shields.io/badge/API-58_endpoints-green?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#api)
 &nbsp;
-[![30 MCP Tools](https://img.shields.io/badge/MCP-30_tools-blueviolet?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#mcp-server-for-ai-agents)
+[![33 MCP Tools](https://img.shields.io/badge/MCP-33_tools-blueviolet?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#mcp-server-for-ai-agents)
 &nbsp;
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust/pulls)
 
@@ -47,12 +47,13 @@ We needed WhatsApp inside agent software and got tired of babysitting a Node sid
 | **Memory usage** | ~50-120 MB idle | **~15 MB** |
 | **Dependencies** | `npm install` + hope | `cargo build` |
 | **Crash recovery** | Roll your own | SQLite-backed queue + per-message backoff |
-| **API** | None built-in | **54 REST endpoints** + CLI + MCP server |
+| **API** | None built-in | **58 REST endpoints** + CLI + MCP server |
 | **Status/stories** | DIY | Text, image, video, revoke -- all built in |
 | **Chat management** | Manual API calls | **12 operations** (pin, mute, archive, star...) |
 | **Group management** | Manual | **12 methods**, full CRUD |
 | **Anti-ban protection** | None | Read receipt batching, typing sim, jitter |
-| **AI agent support** | None | **30 MCP tools** for Claude Code, etc. |
+| **AI agent support** | None | **33 MCP tools** for Claude Code, etc. |
+| **History & search** | DIY | Paced per-chat backfill + local FTS5 search (multilingual, relevance-ranked) |
 
 ---
 
@@ -84,8 +85,8 @@ src/
   bridge.rs          Core: events, messaging, queue, groups, chat management
   outbound.rs        21 typed outbound ops, durable SQLite queue
   bridge_events.rs   Broadcast event bus (tokio::sync::broadcast)
-  api.rs             REST API (54 endpoints) + SSE + CLI HTTP client
-  mcp.rs             MCP server (30 tools, JSON-RPC over stdio)
+  api.rs             REST API (58 endpoints) + SSE + CLI HTTP client
+  mcp.rs             MCP server (33 tools, JSON-RPC over stdio)
   storage.rs         rusqlite Signal Protocol store + schema migrations
   polls.rs           Poll crypto (HKDF-SHA256 + AES-256-GCM)
   dedup.rs           Generation-tracked DashMap (concurrent-safe)
@@ -105,7 +106,7 @@ src/
 | **Daemon** | `cargo run` -- REPL with 54 commands |
 | **CLI** | `whatsrust send 15551234567 "Hello"` -- JSON to stdout |
 | **Library** | `WhatsAppBridge::start(config, tx, cancel)` -- embed in your Rust app |
-| **MCP server** | `whatsrust mcp` -- 30 tools for AI agents (Claude Code, etc.) |
+| **MCP server** | `whatsrust mcp` -- 33 tools for AI agents (Claude Code, etc.) |
 
 ---
 
@@ -126,6 +127,10 @@ List groups, get info, create, rename, set description, add/remove/promote/demot
 ### Status/story posting
 
 Text stories with custom background colors and fonts. Image and video stories. Revoke posted stories. Privacy controls (contacts, allowlist, denylist). All go through the durable outbound queue.
+
+### Historical fetch + local search
+
+Trigger a per-chat backfill on demand -- fetch `all` history, everything `since` a timestamp, or a `count` of messages -- and watch it run as a paced background job with the same anti-ban discipline as live sends. The daemon clamps every request (cooldown, queue depth, max messages) so a misbehaving script or agent can't hammer WhatsApp. Once fetched, search your history locally with FTS5: relevance-ranked (BM25), fully offline, and multilingual (Hebrew, Arabic, and more) out of the box. Semantic (embedding-based) search is a planned future add-on, not built yet.
 
 ### Stays alive
 
@@ -174,6 +179,16 @@ whatsrust delete-chat 15551234567
 whatsrust groups
 whatsrust group-info 120363012345678901@g.us
 whatsrust group-create "My Group" 15551234567 15559876543
+
+# History & search
+whatsrust fetch-history 15551234567 all
+whatsrust fetch-history 15551234567 since 1700000000000
+whatsrust fetch-history 15551234567 count 500
+whatsrust fetch-status
+whatsrust fetch-status 42
+whatsrust fetch-cancel 42
+whatsrust search "dinner plans"
+whatsrust search "printer" 15551234567
 ```
 
 Output:
@@ -185,7 +200,7 @@ Output:
 
 ## API
 
-54 REST endpoints on `localhost:7270`. JSON in, JSON out. No framework -- raw TCP for minimal overhead.
+58 REST endpoints on `localhost:7270`. JSON in, JSON out. No framework -- raw TCP for minimal overhead.
 
 ### Messaging
 
@@ -223,7 +238,17 @@ Output:
 | `POST /api/delete-for-me` | `{jid, id}` |
 | `POST /api/star` | `{jid, id}` |
 
-Plus: SSE streaming (`GET /api/events`), groups, presence, health check, QR.
+### History & search
+
+| Endpoint | Body / Query |
+|----------|------|
+| `GET /api/history` | `?jid=<chat_jid>&limit=<n>&before=<epoch_ms>` |
+| `GET /api/search` | `?q=<query>&jid=<chat_jid>?&limit=<n>` (FTS5, BM25 relevance-ranked) |
+| `POST /api/history-fetch` | `{chat_jid, mode: all\|since\|count, target_value?}` -- trigger a backfill job |
+| `GET /api/history-fetch` | `?job_id=<n>` for one job, or `?active=true` to list active jobs |
+| `POST /api/history-fetch/cancel` | `{job_id}` |
+
+Plus: SSE streaming (`GET /api/events` -- outbound status, backfill progress per-batch/on-completion, storage-growth alerts), groups, presence, health check, QR.
 
 Async sends return `{ok, job_id}`. Add `?sync=true` to wait for the WhatsApp message ID.
 
@@ -231,7 +256,7 @@ Async sends return `{ok, job_id}`. Add `?sync=true` to wait for the WhatsApp mes
 
 ## MCP server for AI agents
 
-Run `whatsrust mcp` to start a Model Context Protocol server with 30 tools over JSON-RPC stdio. Connect it to Claude Code, Cursor, or any MCP-compatible AI agent and your agent can send messages, manage groups, post stories, and handle chat operations through WhatsApp.
+Run `whatsrust mcp` to start a Model Context Protocol server with 33 tools over JSON-RPC stdio. Connect it to Claude Code, Cursor, or any MCP-compatible AI agent and your agent can send messages, manage groups, post stories, handle chat operations, and search or backfill chat history (`whatsrust_search`, `whatsrust_fetch_history`, `whatsrust_fetch_status`, `whatsrust_fetch_cancel`) through WhatsApp.
 
 Works out of the box with Claude Code -- just add it to your MCP config and your AI agent gets full WhatsApp access.
 
