@@ -84,26 +84,28 @@ WhatsRust runs as a daemon with a built-in REPL, REST API, and MCP server. Every
 src/
   bridge.rs          Core: events, messaging, queue, groups, chat management
   outbound.rs        21 typed outbound ops, durable SQLite queue
+  media_utils.rs     Media enrichment: image dims + thumbnails, audio waveform
   bridge_events.rs   Broadcast event bus (tokio::sync::broadcast)
   api.rs             REST API (58 endpoints) + SSE + CLI HTTP client
   mcp.rs             MCP server (33 tools, JSON-RPC over stdio)
-  storage.rs         rusqlite Signal Protocol store + schema migrations
+  storage.rs         rusqlite store + v8 messages table (FTS5) + schema migrations
+  backfill.rs        Historical backfill worker (on-demand fetch, FIFO, pacer)
   polls.rs           Poll crypto (HKDF-SHA256 + AES-256-GCM)
   dedup.rs           Generation-tracked DashMap (concurrent-safe)
   read_receipts.rs   Batched receipt scheduler
   qr.rs              QR rendering (terminal/PNG/HTML/SVG)
   instance_lock.rs   flock-based single-instance guard
-  main.rs            Daemon (REPL) + CLI (54 commands) + MCP mode
+  main.rs            Daemon (REPL) + CLI (49 commands) + MCP mode
   lib.rs             Library crate exports
 ```
 
-~11,000 lines across 13 files. Built on [`whatsapp-rust`](https://github.com/jlucaso1/whatsapp-rust) (v0.5.0, MIT) for the protocol layer.
+~19,600 lines across 15 files. Built on [`whatsapp-rust`](https://github.com/oxidezap/whatsapp-rust) (oxidezap main @ 9e8c70e2, post-v0.6.0; MIT) for the protocol layer.
 
 ### Four ways to run it
 
 | Mode | How |
 |------|-----|
-| **Daemon** | `cargo run` -- REPL with 54 commands |
+| **Daemon** | `cargo run` -- REPL with 49 commands |
 | **CLI** | `whatsrust send 15551234567 "Hello"` -- JSON to stdout |
 | **Library** | `WhatsAppBridge::start(config, tx, cancel)` -- embed in your Rust app |
 | **MCP server** | `whatsrust mcp` -- 33 tools for AI agents (Claude Code, etc.) |
