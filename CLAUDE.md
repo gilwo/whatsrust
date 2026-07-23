@@ -41,7 +41,7 @@ When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md
 - `src/qr.rs` — QR rendering (terminal/PNG/HTML/SVG)
 - `src/instance_lock.rs` — single-instance file lock
 - `src/lib.rs` — library crate entry: all modules pub (consumed by habb)
-- `src/main.rs` — binary: daemon mode (REPL + API) + CLI client (54 commands) + MCP mode
+- `src/main.rs` — binary: daemon mode (REPL + API) + CLI client (49 commands) + MCP mode
 
 ## Patterns
 - SQLite-first sends: all outbound ops enqueue to SQLite via `enqueue_job()`, worker executes via `execute_job()`

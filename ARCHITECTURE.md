@@ -1,23 +1,25 @@
 # Architecture
 
-whatsrust is a pure Rust WhatsApp Web bridge. ~10,000 lines across 13 files.
+whatsrust is a pure Rust WhatsApp Web bridge. ~19,600 lines across 15 files.
 
 ## Module Map
 
 ```
 src/
   bridge.rs          Core: event loop, messaging, groups, delivery receipts, group cache, presence, chat management, status/stories
-  outbound.rs        Typed outbound ops (17 OpKinds), payload structs, execute_job()
+  outbound.rs        Typed outbound ops (21 OpKinds), payload structs, execute_job()
+  media_utils.rs     Media enrichment: image dims + JPEG thumbnails, audio waveform data
   bridge_events.rs   Broadcast event bus: BridgeEvent, OutboundStatusEvent, DeliveryStatus
-  api.rs             REST API (54 endpoints), SSE streaming, CLI HTTP client
-  mcp.rs             MCP server (30 tools, JSON-RPC over stdio)
-  storage.rs         rusqlite Signal Protocol store + typed job queue + inbound history
+  api.rs             REST API (58 endpoints), SSE streaming, CLI HTTP client
+  mcp.rs             MCP server (33 tools, JSON-RPC over stdio)
+  storage.rs         rusqlite Signal Protocol store + typed job queue + v8 unified messages table (FTS5 search) + backfill queue/cursor
+  backfill.rs        Historical backfill worker: two-phase on-demand fetch (HistoryCorrelator), FIFO pagination, contained-C targets, pacer, 3-level abort
   dedup.rs           Generation-tracked DashMap dedup (concurrent-safe, bounded)
   read_receipts.rs   Batched receipt scheduler with flush-before-reply
   polls.rs           Poll crypto (HKDF-SHA256 + AES-256-GCM)
   qr.rs              QR rendering (terminal/PNG/HTML/SVG)
   instance_lock.rs   flock-based single-instance guard (prevents StreamReplaced loops)
-  main.rs            Daemon (REPL + API), CLI client (54 commands), MCP mode
+  main.rs            Daemon (REPL + API), CLI client (49 commands), MCP mode
   lib.rs             Library crate exports (all modules pub, consumed by habb)
 ```
 
