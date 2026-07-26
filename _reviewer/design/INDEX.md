@@ -8,3 +8,4 @@
 | 2026-07-23 | M2 Detailed Execution Plan (Semantic Search) | Approve with changes (1 blocking, 12 non-blocking) |
 | 2026-07-23 | M2 Detailed Execution Plan (Semantic Search) — v2 (follow-up) | Needs rework (2 blocking, 7 non-blocking) |
 | 2026-07-23 | M2 Detailed Execution Plan (Semantic Search) — v3 (follow-up) | Approve with changes (3 blocking, 7 non-blocking) |
+| 2026-07-23 | M2 Detailed Execution Plan (Semantic Search) — v4 (follow-up) | Approve with changes (1 blocking, 8 non-blocking) |
