@@ -50,6 +50,7 @@ This directory contains Architecture Decision Records (ADRs) for the whatsrust p
 | [0035](0035-cooldown-and-dedup-via-single-frontier.md) | Cooldown and dedup via single frontier model | 2026-06-22 | Accepted |
 | [0036](0036-metadata-kv-table.md) | Generic metadata KV table for singleton scalars | 2026-06-22 | Accepted |
 | [0037](0037-enable-history-sync-for-dm-tctokens.md) | Enable history sync by default to obtain 1:1-DM trusted-contact tokens | 2026-07-01 | Accepted |
+| [0038](0038-m2-drain-text-sourcing-and-failure-handling.md) | M2 embedding-drain text sourcing and failure handling | 2026-07-23 | Accepted |
 
 ## Revised ADRs
 
@@ -75,6 +76,10 @@ The following ADRs received hardening notes during the 2026-06-23 v2 design revi
 - **0035** — Cooldown TOCTOU fix (B5)
 - **0036** — Watchdog baseline seeding revised (B2)
 
+The following ADRs received M2-refinement pointers during M2 planning (2026-07-23), formalized in ADR 0038:
+- **0016** — classifier uses `embeddable_text()` distinct from `display_text()`; pre-M2 backlog tolerated (→ ADR 0038)
+- **0017** — "in-memory OR a table" failure-tracking open item resolved to in-memory for v1 (→ ADR 0038)
+
 ## Future ADRs
 
-Start numbering at 0038. Follow the established format. Keep each ADR focused on one decision.
+Start numbering at 0039. Follow the established format. Keep each ADR focused on one decision.

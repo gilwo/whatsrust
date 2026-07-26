@@ -65,3 +65,11 @@ The `embeddings` table IS the source of truth for "what's embedded". Per-model f
 
 **Future:**
 - Multi-active-model search (query multiple models, fuse rankings) — schema supports it, just needs search-layer changes
+
+## M2 refinement (2026-07-23, see ADR 0038)
+
+The "Per-model failure tracking ... is separate lightweight state (in-memory or `embed_failures` table)"
+open item is resolved to **in-memory** for M2 v1 — a process-local `(message_id, model_id) → attempts`
+map owned by the drain worker, cap 3 → `embed_status='failed'`. **No `embed_failures` table, no schema
+bump** (`CURRENT_SCHEMA_VERSION` stays 8). Accepted tradeoff: attempt counts reset on daemon restart
+(benign). Promotable to a durable table later (additive, lossless). See ADR 0038.

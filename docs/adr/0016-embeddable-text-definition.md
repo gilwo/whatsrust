@@ -51,3 +51,11 @@ Anchor: existing `InboundContent::display_text()` (bridge.rs:433) shows the per-
 - Image content embedding (CLIP-style) — requires different model, multimodal sidecar
 - Audio transcription (Whisper-style) — requires speech model, transcription pipeline
 - Sticker alt-text embedding — debatable value (most stickers lack descriptive alt-text)
+
+## M2 refinement (2026-07-23, see ADR 0038)
+
+The classifier is implemented as a new `InboundContent::embeddable_text()` distinct from
+`display_text()` (M1 stores the *decorated* label in `messages.body_text`, not bare NL). The pre-M2
+backlog (every migrated row is `embed_status='pending'`) is **tolerated**, not reclassified — the raw
+`wa::Message` needed for a perfect reclassify is not retained. Drain-time text preparation is
+kind-gated (Option C: embed the decorated label as-is for location/contact/poll). See ADR 0038.
