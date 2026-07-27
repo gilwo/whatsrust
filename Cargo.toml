@@ -14,6 +14,19 @@ path = "src/lib.rs"
 name = "whatsrust"
 path = "src/main.rs"
 
+# Minimal fake embedder sidecar for tests (ADR 0025 seam 3, M2.1.8). Test/dev
+# only — gated behind the `fake-embedder` feature (not in `default`) so a plain
+# `cargo build` / `cargo build --release` of the primary `whatsrust` binary
+# never produces this extra artifact. Run `cargo test --features fake-embedder`
+# to include the real-subprocess round-trip tests that spawn it.
+[[bin]]
+name = "fake-embedder"
+path = "src/bin/fake-embedder.rs"
+required-features = ["fake-embedder"]
+
+[features]
+fake-embedder = []
+
 [dependencies]
 aes-gcm = "0.10"
 anyhow = "1"
@@ -34,7 +47,7 @@ rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-util", "io-std", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-util", "io-std", "fs", "process"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
