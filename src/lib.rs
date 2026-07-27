@@ -3,6 +3,7 @@ pub mod backfill;
 pub mod bridge;
 pub mod bridge_events;
 pub mod dedup;
+pub mod embedder;
 pub mod instance_lock;
 pub mod mcp;
 pub mod media_utils;

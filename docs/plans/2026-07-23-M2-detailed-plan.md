@@ -272,6 +272,19 @@ faithful health relay, non-fatal construction, **serialized concurrent access + 
 `Embedder` seam all compile and pass unit tests, **including one real-subprocess round-trip (2.1.8)**.
 No drain worker, no schema changes yet.
 
+> ✅ **M2.1 DONE (2026-07-28).** New `src/embedder.rs`: `#[async_trait] Embedder` (`fn model_info()
+> -> ModelInfo` sync/cached; `async fn embed(&[String]) -> Result<Vec<Vec<f32>>>`; `async fn health()
+> -> HealthStatus{Ok,Loading,Error(String)}`) — verified dyn-safe (`Arc<dyn Embedder>`), de-risking
+> M2.3.10. `StdioEmbedder` (child JSON-RPC, `tokio::process`, 16 MiB line bound, non-fatal
+> `from_env()` construction with `model_info` timeout, `tokio::sync::Mutex`-serialized calls,
+> `kill_on_drop`), `FakeEmbedder` (ADR 0025 seam), fresh JSON-RPC client structs (F-G). Trust-but-verify
+> (`verify_embed_response`) + health relay (`map_health`) extracted as pure fns. New `src/bin/fake-embedder.rs`
+> gated behind a non-default `fake-embedder` Cargo feature (release build confirmed to exclude it).
+> `anyhow::Result` + `TransportFailure` error idiom (matches `backfill.rs`). No new crates. Suite green:
+> **231 lib / 233 bin** (default) + **14 feature-gated** (`cargo test --features fake-embedder`: real
+> subprocess round-trip, concurrent-serialize, drop-kills-child, 4× trust-but-verify, health, dyn-safety,
+> non-fatal construction). No DB/bridge/search wiring (M2.2+). [ADR 0006/0024/0025]
+
 ---
 
 ## M2.2 — Embeddable-text classification + set-difference work derivation  [ADR 0016/0017]
