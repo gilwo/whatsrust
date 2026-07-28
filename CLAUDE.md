@@ -11,6 +11,7 @@ Where to look for what — read the relevant doc before changing related code.
 | System architecture, data flow, design decisions | `ARCHITECTURE.md` |
 | User-facing features, install, API/MCP overview | `README.md` |
 | Contributing workflow | `CONTRIBUTING.md` |
+| Operational playbook (build, configure, run, CLI/MCP usage, DB migration recovery, test/lint) | `docs/HOWTO.md` |
 | **Architecture Decision Records (the "why" ledger)** | `docs/adr/` — start at `docs/adr/0000-index.md` |
 | **Feature roadmap & status (LIVE — what's done/in-flight/planned)** | `docs/plans/FEATURES.md` |
 | **Implementation execution plan (phases, gates, milestone exit criteria)** | `docs/plans/IMPLEMENTATION-ROADMAP.md` |
