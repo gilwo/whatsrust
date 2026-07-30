@@ -305,6 +305,19 @@ existing-backlog decision recorded, and the set-difference drain query implement
 write time per ADR 0016; the set-difference query returns exactly the correct drain work-set for a
 given active model; the existing-backlog handling is a documented decision, not silent behavior.
 
+> ✅ **M2.2 DONE (2026-07-28).** `InboundContent::embeddable_text() -> Option<String>` (bridge.rs) —
+> bare NL per ADR 0016, 22 per-variant tests (7 embeddable / 8 skipped kinds). `insert_message` +
+> `insert_inbound` gained a trailing `embed_status: &str` param; both write sites classify from
+> `embeddable_text().is_some()` (`"pending"`/`"skipped"`) with an ADR-0038 tolerate-backlog code
+> comment. **Option C honored:** the `embeddable_text()` *value* is NOT persisted — only `.is_some()`
+> classifies; `body_text` still stores the decorated `display_text()` label (FTS untouched), and the
+> bare text is re-derived at drain time (M2.3.9). `Store::fetch_pending_embeddings(active_model_id,
+> batch_size) -> Vec<PendingEmbeddingRow{message_id, content_kind, body_text}>` — the F-J anti-join,
+> selecting `content_kind`. Non-versioned `idx_messages_embed_status ON messages(embed_status, id)` in
+> `SCHEMA` (**`CURRENT_SCHEMA_VERSION` stays 8**), EXPLAIN-verified to drive the drain query. ~27
+> test call sites mechanically updated. Suite green: **257 lib / 259 bin** (+26). No drain worker /
+> Embedder wiring / search (M2.3+). [ADR 0016/0017/0038]
+
 ---
 
 ## M2.3 — Embedding-drain worker  [ADR 0015/0017]

@@ -213,6 +213,13 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at INTEGER NOT NULL,
     from_me INTEGER NOT NULL DEFAULT 0,
     source TEXT NOT NULL DEFAULT 'live',
+    -- 'pending' | 'skipped' | 'failed'. Write-time classification (ADR 0016) now always binds this
+    -- explicitly via insert_message's embed_status param — the DEFAULT below only backstops rows
+    -- inserted by a path that (mistakenly) omits it. This column NEVER transitions to a 'done'-style
+    -- value: it stays 'pending' for the life of the row once classified embeddable. The embeddings
+    -- table (keyed by message_id + model_id) is the source of truth for whether a row has been
+    -- embedded for a given model (ADR 0017) — the drain worker's set-difference query is what
+    -- actually retires work, not a status flip here.
     embed_status TEXT NOT NULL DEFAULT 'pending'
 );
 
@@ -296,6 +303,10 @@ CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_queue(status, retry_a
 CREATE INDEX IF NOT EXISTS idx_outbound_wa_id ON outbound_queue(wa_message_id);
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(message_id);
+-- M2.2.5 (ADR 0031 non-versioned performance index, NOT a schema-version bump): backs the
+-- fetch_pending_embeddings (M2.2.4) anti-join and the M2.3.8 circuit-breaker count, both of which
+-- filter embed_status='pending' over an indefinitely-retained (ADR 0012) table.
+CREATE INDEX IF NOT EXISTS idx_messages_embed_status ON messages(embed_status, id);
 ";
 
 const CURRENT_SCHEMA_VERSION: i64 = 8;
@@ -935,6 +946,17 @@ pub struct InboundRow {
     pub timestamp: i64,
 }
 
+/// A row of drain work returned by `fetch_pending_embeddings` (M2.2.4): a message classified
+/// `embed_status='pending'` (ADR 0016) that has no vector yet for the given active model.
+/// `content_kind` lets the (future, M2.3.9) drain worker branch its text-prep per kind rather than
+/// blindly stripping `body_text`'s decorated `display_text()` label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingEmbeddingRow {
+    pub message_id: String,
+    pub content_kind: String,
+    pub body_text: Option<String>,
+}
+
 /// The oldest stored message for a chat — used to seed the initial backfill anchor.
 /// `timestamp_secs` is Unix seconds (raw storage value — do NOT assume milliseconds).
 pub struct OldestMessageRow {
@@ -1255,6 +1277,11 @@ impl Store {
     ///
     /// `timestamp_secs` is Unix seconds — consistent with the `messages.timestamp` column.
     /// `source` distinguishes live inbound messages (`"live"`) from backfilled ones (`"backfill"`).
+    /// `embed_status` is the write-time ADR 0016 classification (`"pending"` if
+    /// `InboundContent::embeddable_text()` was `Some`, else `"skipped"`) — callers derive it from
+    /// the `InboundContent` they have in hand (this fn only sees `content_kind`/`body_text`, not
+    /// the enum, so it cannot classify itself). Bound explicitly rather than relying on the schema
+    /// `DEFAULT 'pending'` (M2.2.2).
     pub async fn insert_message(
         &self,
         chat_jid: &str,
@@ -1265,6 +1292,7 @@ impl Store {
         timestamp_secs: i64,
         from_me: bool,
         source: &str,
+        embed_status: &str,
     ) -> Result<()> {
         let cj = chat_jid.to_owned();
         let sj = sender_jid.to_owned();
@@ -1272,13 +1300,14 @@ impl Store {
         let ck = content_kind.to_owned();
         let bt = body_text.map(|s| s.to_owned());
         let src = source.to_owned();
+        let es = embed_status.to_owned();
         let from_me_i = if from_me { 1i64 } else { 0i64 };
         let created = now_secs();
         self.run(move |c| {
             c.execute(
-                "INSERT OR IGNORE INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at, from_me, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![cj, sj, mid, ck, bt, timestamp_secs, created, from_me_i, src],
+                "INSERT OR IGNORE INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![cj, sj, mid, ck, bt, timestamp_secs, created, from_me_i, src, es],
             )
             .map_err(db_err)?;
             Ok(())
@@ -1288,6 +1317,10 @@ impl Store {
 
     /// Insert an inbound message into the history table. Duplicates (by message_id) are ignored.
     /// Delegates to `insert_message` with `from_me=false` and `source="live"`.
+    ///
+    /// `embed_status`: see `insert_message` — the live-ingest call site classifies from the
+    /// `InboundContent` before calling this wrapper (M2.2.2 blast-radius fix: this wrapper used to
+    /// hardcode everything except body/timestamp and had no way to thread classification through).
     pub async fn insert_inbound(
         &self,
         chat_jid: &str,
@@ -1296,8 +1329,9 @@ impl Store {
         content_kind: &str,
         body_text: Option<&str>,
         timestamp: i64,
+        embed_status: &str,
     ) -> Result<()> {
-        self.insert_message(chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, false, "live").await
+        self.insert_message(chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, false, "live", embed_status).await
     }
 
     /// Return the oldest stored message for a chat (by timestamp ASC), or None if no messages exist.
@@ -1421,6 +1455,45 @@ impl Store {
                 }
             };
             Ok(rows)
+        })
+        .await
+    }
+
+    /// Set-difference drain work-set (M2.2.4, ADR 0016/0017/0038, F-J): messages classified
+    /// `embed_status='pending'` at write time that lack a vector for `active_model_id` in the
+    /// `embeddings` table. Reuses the exact `LEFT JOIN ... WHERE ... IS NULL` anti-join shape
+    /// already smoke-tested by `validate_migration_post_commit` (rather than a `NOT EXISTS`
+    /// subquery) — both parse/plan identically against the live v8 schema, this form is proven.
+    /// `embeddings` is the durable source of truth for "done" (ADR 0017) — `embed_status` itself
+    /// never flips away from `'pending'` once classified embeddable (only a future content
+    /// rejection can move it to `'failed'`; M2.3).
+    ///
+    /// Returns `content_kind` alongside `message_id`/`body_text` so the (future, M2.3.9) drain
+    /// worker can kind-gate its text-prep — `body_text` is the decorated `display_text()` label,
+    /// not bare NL, and stripping it correctly requires knowing the kind. Ordered `ORDER BY m.id`
+    /// (oldest-first, deterministic) and capped by `batch_size`.
+    pub async fn fetch_pending_embeddings(
+        &self,
+        active_model_id: &str,
+        batch_size: i64,
+    ) -> Result<Vec<PendingEmbeddingRow>> {
+        let model_id = active_model_id.to_owned();
+        self.run(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT m.message_id, m.content_kind, m.body_text
+                 FROM messages m LEFT JOIN embeddings e
+                   ON m.message_id = e.message_id AND e.model_id = ?1
+                 WHERE e.message_id IS NULL AND m.embed_status = 'pending'
+                 ORDER BY m.id LIMIT ?2"
+            ).map_err(db_err)?;
+            let iter = stmt.query_map(params![model_id, batch_size], |row| {
+                Ok(PendingEmbeddingRow {
+                    message_id: row.get(0)?,
+                    content_kind: row.get(1)?,
+                    body_text: row.get(2)?,
+                })
+            }).map_err(db_err)?;
+            iter.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)
         })
         .await
     }
@@ -4554,9 +4627,9 @@ mod tests {
         let (store, dir) = open_b2a_store("get-oldest");
 
         // Insert three messages with timestamps 300, 100, 200 (out of order)
-        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "mid-300", "text", Some("c"), 300, false, "live").await.unwrap();
-        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "mid-100", "text", Some("a"), 100, false, "live").await.unwrap();
-        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "mid-200", "text", Some("b"), 200, false, "live").await.unwrap();
+        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "mid-300", "text", Some("c"), 300, false, "live", "pending").await.unwrap();
+        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "mid-100", "text", Some("a"), 100, false, "live", "pending").await.unwrap();
+        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "mid-200", "text", Some("b"), 200, false, "live", "pending").await.unwrap();
 
         let row = store.get_oldest_message("chat@s.whatsapp.net").await.unwrap().unwrap();
         assert_eq!(row.message_id, "mid-100", "must return message with ts=100");
@@ -4591,6 +4664,7 @@ mod tests {
             1_700_000_000,
             true,
             "backfill",
+            "pending",
         ).await.unwrap();
 
         // Verify via get_oldest_message (returns raw values from DB)
@@ -4607,9 +4681,9 @@ mod tests {
     async fn test_insert_message_duplicate_ignored() {
         let (store, dir) = open_b2a_store("insert-dup");
 
-        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "dup-id", "text", Some("first"), 1000, false, "backfill").await.unwrap();
+        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "dup-id", "text", Some("first"), 1000, false, "backfill", "pending").await.unwrap();
         // Second insert with same message_id — must not error and must not overwrite
-        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "dup-id", "text", Some("second"), 9999, true, "live").await.unwrap();
+        store.insert_message("chat@s.whatsapp.net", "s@s.whatsapp.net", "dup-id", "text", Some("second"), 9999, true, "live", "pending").await.unwrap();
 
         // Only one row with ts=1000 (the first insert)
         let row = store.get_oldest_message("chat@s.whatsapp.net").await.unwrap().unwrap();
@@ -4631,6 +4705,7 @@ mod tests {
             "text",
             Some("body"),
             500,
+            "pending",
         ).await.unwrap();
 
         // Verify via get_oldest_message: from_me must be false
@@ -4660,8 +4735,8 @@ mod tests {
     async fn test_fts_search_basic_english_term() {
         let (store, dir) = open_search_store("basic-en");
 
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "en-001", "text", Some("hello world"), 1000).await.unwrap();
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "en-002", "text", Some("goodbye moon"), 2000).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "en-001", "text", Some("hello world"), 1000, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "en-002", "text", Some("goodbye moon"), 2000, "pending").await.unwrap();
 
         let results = store.search_inbound(None, Some("hello"), 10, None).await.unwrap();
         assert_eq!(results.len(), 1, "FTS must return exactly one hit for 'hello'");
@@ -4676,8 +4751,8 @@ mod tests {
         let (store, dir) = open_search_store("hebrew");
 
         // Hebrew: "שלום" = shalom
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "heb-001", "text", Some("שלום עולם"), 1000).await.unwrap();
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "heb-002", "text", Some("להתראות"), 2000).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "heb-001", "text", Some("שלום עולם"), 1000, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "heb-002", "text", Some("להתראות"), 2000, "pending").await.unwrap();
 
         let results = store.search_inbound(None, Some("שלום"), 10, None).await.unwrap();
         assert_eq!(results.len(), 1, "FTS must find Hebrew token 'שלום'");
@@ -4692,8 +4767,8 @@ mod tests {
         let (store, dir) = open_search_store("arabic");
 
         // Arabic: "مرحبا" = hello/welcome
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "ara-001", "text", Some("مرحبا بالعالم"), 1000).await.unwrap();
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "ara-002", "text", Some("وداعا"), 2000).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "ara-001", "text", Some("مرحبا بالعالم"), 1000, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "ara-002", "text", Some("وداعا"), 2000, "pending").await.unwrap();
 
         let results = store.search_inbound(None, Some("مرحبا"), 10, None).await.unwrap();
         assert_eq!(results.len(), 1, "FTS must find Arabic token 'مرحبا'");
@@ -4707,7 +4782,7 @@ mod tests {
     async fn test_fts_search_adversarial_double_quote() {
         let (store, dir) = open_search_store("adv-quote");
 
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "adv-001", "text", Some("normal message"), 1000).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "adv-001", "text", Some("normal message"), 1000, "pending").await.unwrap();
 
         // A raw " must not cause a parse error (escaped as "" inside the phrase wrapper)
         let result = store.search_inbound(None, Some("\""), 10, None).await;
@@ -4723,10 +4798,10 @@ mod tests {
     async fn test_fts_search_adversarial_operators_are_literal() {
         let (store, dir) = open_search_store("adv-ops");
 
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-001", "text", Some("foo bar"), 1000).await.unwrap();
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-002", "text", Some("baz qux"), 2000).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-001", "text", Some("foo bar"), 1000, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-002", "text", Some("baz qux"), 2000, "pending").await.unwrap();
         // Extra message whose body contains the literal word "and" — for the AND test below.
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-003", "text", Some("cats and dogs"), 3000).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-003", "text", Some("cats and dogs"), 3000, "pending").await.unwrap();
 
         // "foo OR bar" must NOT match as FTS5 boolean — it should be a literal phrase.
         // No message contains the exact phrase "foo OR bar", so 0 hits expected.
@@ -4758,7 +4833,7 @@ mod tests {
     async fn test_fts_search_whitespace_and_quote_only_inputs() {
         let (store, dir) = open_search_store("adv-empty");
 
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "e-001", "text", Some("something"), 1000).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "e-001", "text", Some("something"), 1000, "pending").await.unwrap();
 
         // Whitespace-only
         let r1 = store.search_inbound(None, Some("   "), 10, None).await;
@@ -4776,8 +4851,8 @@ mod tests {
     async fn test_fts_search_chat_jid_scoping() {
         let (store, dir) = open_search_store("scoping");
 
-        store.insert_inbound("chatA@s.whatsapp.net", "s@s.whatsapp.net", "scope-001", "text", Some("apple pie"), 1000).await.unwrap();
-        store.insert_inbound("chatB@g.us",            "s@s.whatsapp.net", "scope-002", "text", Some("apple cider"), 2000).await.unwrap();
+        store.insert_inbound("chatA@s.whatsapp.net", "s@s.whatsapp.net", "scope-001", "text", Some("apple pie"), 1000, "pending").await.unwrap();
+        store.insert_inbound("chatB@g.us",            "s@s.whatsapp.net", "scope-002", "text", Some("apple cider"), 2000, "pending").await.unwrap();
 
         // Scoped to chatA — must only return chatA's message
         let r_a = store.search_inbound(Some("chatA@s.whatsapp.net"), Some("apple"), 10, None).await.unwrap();
@@ -4803,9 +4878,9 @@ mod tests {
     async fn test_search_inbound_none_query_is_chronological_desc() {
         let (store, dir) = open_search_store("history-browse");
 
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-001", "text", Some("first"), 100).await.unwrap();
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-002", "text", Some("second"), 200).await.unwrap();
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-003", "text", Some("third"), 300).await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-001", "text", Some("first"), 100, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-002", "text", Some("second"), 200, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-003", "text", Some("third"), 300, "pending").await.unwrap();
 
         // query=None → chronological browse
         let results = store.search_inbound(None, None, 10, None).await.unwrap();
@@ -4876,14 +4951,14 @@ mod tests {
         // Timestamp 1000 → OLDER insertion order (would rank 2nd if ordering by ts-DESC or rowid).
         store.insert_inbound(
             "chat@s.whatsapp.net", "s@s.whatsapp.net",
-            "multi-occ", "text", Some("apple apple apple"), 1000,
+            "multi-occ", "text", Some("apple apple apple"), 1000, "pending",
         ).await.unwrap();
 
         // "single-occ": 1 occurrence of "apple" — lower BM25 score → less relevant.
         // Timestamp 2000 → NEWER insertion order (would rank 1st if ordering by ts-DESC or rowid).
         store.insert_inbound(
             "chat@s.whatsapp.net", "s@s.whatsapp.net",
-            "single-occ", "text", Some("apple pie"), 2000,
+            "single-occ", "text", Some("apple pie"), 2000, "pending",
         ).await.unwrap();
 
         let results = store.search_inbound(None, Some("apple"), 10, None).await.unwrap();
@@ -4911,11 +4986,11 @@ mod tests {
         // Two messages matching the same term, with different timestamps.
         store.insert_inbound(
             "chat@s.whatsapp.net", "s@s.whatsapp.net",
-            "ts-old", "text", Some("mango smoothie"), 1000,
+            "ts-old", "text", Some("mango smoothie"), 1000, "pending",
         ).await.unwrap();
         store.insert_inbound(
             "chat@s.whatsapp.net", "s@s.whatsapp.net",
-            "ts-new", "text", Some("mango shake"), 5000,
+            "ts-new", "text", Some("mango shake"), 5000, "pending",
         ).await.unwrap();
 
         // Cutoff at 3000: only ts-old (ts=1000) must be returned; ts-new (ts=5000) must be excluded.
@@ -5080,6 +5155,195 @@ mod tests {
             watchdog_should_alert(150, new_baseline),
             None,
             "after reset, current==baseline must not re-alert"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // M2.2 — embed_status classification + fetch_pending_embeddings (ADR 0016/0017/0038)
+    // -------------------------------------------------------------------------
+
+    /// Raw read of `messages.embed_status` for a given message_id (test-only helper — no public
+    /// accessor exists yet, M2.2 doesn't add one; `run` is a private Store method, visible here
+    /// because `mod tests` is a descendant of the `storage` module).
+    async fn get_embed_status(store: &Store, message_id: &str) -> Option<String> {
+        let mid = message_id.to_owned();
+        store
+            .run(move |c| {
+                c.query_row(
+                    "SELECT embed_status FROM messages WHERE message_id = ?1",
+                    params![mid],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db_err)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// (m2.2-1) insert_message: `embed_status` is bound explicitly per call and persists exactly
+    /// as passed, across the ADR 0016 classification matrix (image+caption→pending,
+    /// captionless image→skipped, sticker→skipped, poll→pending, reaction→skipped, edit→skipped,
+    /// receipt→skipped) — mirroring what the bridge.rs call sites derive from
+    /// `InboundContent::embeddable_text().is_some()`.
+    #[tokio::test]
+    async fn test_insert_message_embed_status_classification_matrix() {
+        let (store, dir) = open_b2a_store("embed-status-matrix");
+
+        let cases: &[(&str, &str, Option<&str>, &str)] = &[
+            // (message_id, content_kind, body_text, expected embed_status)
+            ("m2-text", "text", Some("hello"), "pending"),
+            ("m2-image-caption", "image", Some("caption text"), "pending"),
+            ("m2-image-no-caption", "image", None, "skipped"),
+            ("m2-sticker", "sticker", None, "skipped"),
+            ("m2-poll", "poll", Some("question | opt1 | opt2"), "pending"),
+            ("m2-reaction", "reaction", Some("[react 👍 on abc123]"), "skipped"),
+            ("m2-edit", "edit", Some("[edit abc123] corrected"), "skipped"),
+            ("m2-receipt", "delivery-receipt", Some("[receipt: delivered for 1 message(s)]"), "skipped"),
+        ];
+
+        for (mid, kind, body, expected) in cases {
+            store.insert_message(
+                "chat@s.whatsapp.net", "s@s.whatsapp.net", mid, kind, *body, 1000, false, "live", expected,
+            ).await.unwrap();
+        }
+
+        for (mid, _, _, expected) in cases {
+            let got = get_embed_status(&store, mid).await;
+            assert_eq!(got.as_deref(), Some(*expected), "embed_status mismatch for {mid}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (m2.2-2) fetch_pending_embeddings: set-difference over mixed embed_status + partial
+    /// per-model embeddings coverage. Must return exactly the pending-and-unvectored-for-model-A
+    /// set (with `content_kind`), excluding `skipped`/`failed` rows and rows already vectored for A
+    /// (a row vectored only for a DIFFERENT model must still be returned for A).
+    #[tokio::test]
+    async fn test_fetch_pending_embeddings_set_difference() {
+        let (store, dir) = open_b2a_store("fetch-pending");
+
+        // pending, no vector anywhere — must be returned for model A.
+        store.insert_message(
+            "chat@s.whatsapp.net", "s@s.whatsapp.net", "p-no-vec", "text", Some("alpha"), 100, false, "live", "pending",
+        ).await.unwrap();
+
+        // pending, already vectored for model A — must NOT be returned for A.
+        store.insert_message(
+            "chat@s.whatsapp.net", "s@s.whatsapp.net", "p-vec-a", "text", Some("bravo"), 200, false, "live", "pending",
+        ).await.unwrap();
+
+        // pending, vectored only for model B (NOT A) — must still be returned for A (cold storage
+        // for B doesn't count as "done" for A; ADR 0017 per-model retention).
+        store.insert_message(
+            "chat@s.whatsapp.net", "s@s.whatsapp.net", "p-vec-b-only", "image", Some("charlie"), 300, false, "live", "pending",
+        ).await.unwrap();
+
+        // skipped — must NEVER be returned regardless of vector state.
+        store.insert_message(
+            "chat@s.whatsapp.net", "s@s.whatsapp.net", "skip-row", "sticker", None, 400, false, "live", "skipped",
+        ).await.unwrap();
+
+        // failed — must NEVER be returned (terminal, dropped out of the drain set).
+        store.insert_message(
+            "chat@s.whatsapp.net", "s@s.whatsapp.net", "fail-row", "text", Some("delta"), 500, false, "live", "failed",
+        ).await.unwrap();
+
+        // Seed embeddings: p-vec-a has a model-A vector; p-vec-b-only has only a model-B vector.
+        store.run(move |c| {
+            c.execute(
+                "INSERT INTO embeddings (message_id, model_id, dim, vec) VALUES ('p-vec-a', 'model-A', 3, ?1)",
+                params![vec![1u8, 2, 3]],
+            ).map_err(db_err)?;
+            c.execute(
+                "INSERT INTO embeddings (message_id, model_id, dim, vec) VALUES ('p-vec-b-only', 'model-B', 3, ?1)",
+                params![vec![4u8, 5, 6]],
+            ).map_err(db_err)?;
+            Ok(())
+        }).await.unwrap();
+
+        let rows = store.fetch_pending_embeddings("model-A", 100).await.unwrap();
+        let ids: std::collections::HashSet<&str> = rows.iter().map(|r| r.message_id.as_str()).collect();
+
+        assert_eq!(rows.len(), 2, "expected exactly 2 pending-and-unvectored-for-model-A rows, got {rows:?}");
+        assert!(ids.contains("p-no-vec"), "p-no-vec must be in the drain set");
+        assert!(ids.contains("p-vec-b-only"), "p-vec-b-only (vectored only for B) must be in A's drain set");
+        assert!(!ids.contains("p-vec-a"), "p-vec-a already has a model-A vector, must be excluded");
+        assert!(!ids.contains("skip-row"), "skipped rows must never be returned");
+        assert!(!ids.contains("fail-row"), "failed rows must never be returned");
+
+        // content_kind must be carried through for the future kind-gated drain text-prep (M2.3.9).
+        let charlie = rows.iter().find(|r| r.message_id == "p-vec-b-only").unwrap();
+        assert_eq!(charlie.content_kind, "image");
+        assert_eq!(charlie.body_text.as_deref(), Some("charlie"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (m2.2-3) fetch_pending_embeddings: `LIMIT` and `ORDER BY m.id` (oldest-first, deterministic)
+    /// are honored.
+    #[tokio::test]
+    async fn test_fetch_pending_embeddings_respects_batch_size_and_order() {
+        let (store, dir) = open_b2a_store("fetch-pending-limit");
+
+        for (mid, ts) in [("b-1", 100), ("b-2", 200), ("b-3", 300)] {
+            store.insert_message(
+                "chat@s.whatsapp.net", "s@s.whatsapp.net", mid, "text", Some("x"), ts, false, "live", "pending",
+            ).await.unwrap();
+        }
+
+        let rows = store.fetch_pending_embeddings("model-A", 2).await.unwrap();
+        assert_eq!(rows.len(), 2, "batch_size=2 must cap the result to 2 rows");
+        assert_eq!(rows[0].message_id, "b-1", "must be ordered oldest-first by m.id");
+        assert_eq!(rows[1].message_id, "b-2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (m2.2-4) EXPLAIN QUERY PLAN for fetch_pending_embeddings's SQL shows the anti-join driven by
+    /// `idx_messages_embed_status` (SEARCH), not a full table SCAN — mirrors
+    /// `test_fts_explain_query_plan`'s discipline (M2.2.5).
+    #[test]
+    fn test_fetch_pending_embeddings_explain_query_plan() {
+        let dir = unique_test_dir("embed-status-eqp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("wa.db");
+        let conn = open_fresh_conn(&db_path);
+
+        conn.execute(
+            "INSERT INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at, embed_status)
+             VALUES ('c@s.whatsapp.net', 's@s.whatsapp.net', 'eqp-001', 'text', 'plan probe', ?1, ?1, 'pending')",
+            rusqlite::params![1000_i64],
+        ).unwrap();
+
+        // The exact SQL fetch_pending_embeddings builds.
+        let sql = "SELECT m.message_id, m.content_kind, m.body_text
+                   FROM messages m LEFT JOIN embeddings e
+                     ON m.message_id = e.message_id AND e.model_id = ?1
+                   WHERE e.message_id IS NULL AND m.embed_status = 'pending'
+                   ORDER BY m.id LIMIT ?2";
+
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan_rows: Vec<String> = stmt.query_map(
+            rusqlite::params!["model-A", 64_i64],
+            |row| row.get::<_, String>(3),
+        ).unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+        let plan = plan_rows.join("\n");
+        println!("EXPLAIN QUERY PLAN output (fetch_pending_embeddings):\n{plan}");
+
+        assert!(
+            plan.contains("idx_messages_embed_status") || plan.contains("SEARCH"),
+            "expected the drain query to SEARCH via idx_messages_embed_status, not full-SCAN; got:\n{plan}"
+        );
+        assert!(
+            !plan.to_uppercase().contains("SCAN M"),
+            "must not full-scan the messages table; got:\n{plan}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
