@@ -490,6 +490,44 @@ impl InboundContent {
             }
         }
     }
+
+    /// Extract the bare natural-language text to embed for semantic search (ADR 0016), distinct
+    /// from `display_text()` — no synthetic bracketed labels, no size/duration metadata.
+    ///
+    /// `None` means "not embeddable" and drives write-time `embed_status='skipped'` classification
+    /// (M2.2); `Some(text)` drives `embed_status='pending'`. The returned *string* itself is
+    /// discarded at write time (Option C, ADR 0038) — only `.is_some()` is consulted — the bare
+    /// text is re-derived from the stored `body_text` at drain time (M2.3.9, kind-gated).
+    pub fn embeddable_text(&self) -> Option<String> {
+        match self {
+            Self::Text { body, .. } => {
+                if body.is_empty() { None } else { Some(body.clone()) }
+            }
+            Self::Image { caption, .. }
+            | Self::Video { caption, .. }
+            | Self::Document { caption, .. } => caption.clone(),
+            Self::PollCreated { question, options, .. } => {
+                if options.is_empty() {
+                    Some(question.clone())
+                } else {
+                    Some(format!("{question} | {}", options.join(" | ")))
+                }
+            }
+            Self::Contact { display_name, .. } => Some(display_name.clone()),
+            Self::Location { name, .. } => name.clone(),
+            // Everything else is not genuine natural language (ADR 0016): captionless media,
+            // stickers (even with alt-text), reactions, edits (carries text but ADR 0016 places
+            // it in "skipped" — see ADR 0038), revokes, poll votes, delivery receipts.
+            Self::Audio { .. }
+            | Self::Sticker { .. }
+            | Self::ReactionAdded { .. }
+            | Self::ReactionRemoved { .. }
+            | Self::Edit { .. }
+            | Self::Revoke { .. }
+            | Self::PollVote { .. }
+            | Self::DeliveryReceipt { .. } => None,
+        }
+    }
 }
 
 impl std::fmt::Display for InboundContent {
@@ -2681,9 +2719,24 @@ async fn handle_event(
                     // Persist to history table for search/context
                     let body_text = inbound.content.display_text();
                     let body_opt = if body_text.is_empty() { None } else { Some(body_text.as_str()) };
+                    // M2.2.2: write-time embeddable-text classification (ADR 0016) from the
+                    // InboundContent in hand — `embeddable_text()` (bare NL, distinct from the
+                    // decorated `display_text()` above) drives `embed_status`; its string value
+                    // itself is discarded here (Option C, ADR 0038) — only `.is_some()` matters.
+                    // M2.2.3 (F-C part 2, ADR 0038): the pre-M2 backlog (every row migrated before
+                    // this classifier existed) is tolerated as-is, not reclassified — the raw
+                    // `wa::Message` needed to recover a clean caption/body from the decorated
+                    // `body_text` isn't retained, so a perfect backfill reclassify isn't possible;
+                    // backlog volume is small and stray non-NL text is bounded by the M2.3 3-attempt
+                    // cap. No migration/backfill script is added for this.
+                    let embed_status = if inbound.content.embeddable_text().is_some() {
+                        "pending"
+                    } else {
+                        "skipped"
+                    };
                     if let Err(e) = store.insert_inbound(
                         &inbound.jid, &inbound.sender, &inbound.id,
-                        inbound.content.kind(), body_opt, inbound.timestamp,
+                        inbound.content.kind(), body_opt, inbound.timestamp, embed_status,
                     ).await {
                         debug!(error = %e, "failed to insert inbound history (may be duplicate)");
                     }
@@ -4262,6 +4315,11 @@ impl crate::backfill::BatchSink for LiveBatchSink {
                 ExtractResult::Content(c) => {
                     let body_str = c.display_text();
                     let body_opt = if body_str.is_empty() { None } else { Some(body_str.as_str()) };
+                    // M2.2.2/2.2.3: same write-time classification as the live-ingest call site
+                    // (bridge.rs, ExtractResult::Content branch above) — see that comment for the
+                    // Option C / backlog-tolerance rationale (ADR 0016/0038). Backfilled rows get
+                    // exactly the same classification discipline as live-ingested ones.
+                    let embed_status = if c.embeddable_text().is_some() { "pending" } else { "skipped" };
                     match self
                         .store
                         .insert_message(
@@ -4273,6 +4331,7 @@ impl crate::backfill::BatchSink for LiveBatchSink {
                             ts_secs,
                             from_me,
                             "backfill",
+                            embed_status,
                         )
                         .await
                     {
@@ -4603,5 +4662,239 @@ mod tests {
         let path2 = std::path::Path::new("report.pdf");
         let safe2 = path2.file_name().and_then(|n| n.to_str()).unwrap_or("file");
         assert_eq!(safe2, "report.pdf");
+    }
+
+    // -------------------------------------------------------------------
+    // embeddable_text() — M2.2.1 per-variant classification (ADR 0016)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_embeddable_text_text_body() {
+        let content = InboundContent::Text { body: "hello world".into(), link_preview: None };
+        assert_eq!(content.embeddable_text(), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn test_embeddable_text_text_empty_is_none() {
+        let content = InboundContent::Text { body: String::new(), link_preview: None };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_text_leading_bracket_not_stripped() {
+        // A genuine text message that happens to start with '[' must still embed verbatim —
+        // classification never confuses real text with a synthetic display_text() label.
+        let content = InboundContent::Text { body: "[URGENT] call me".into(), link_preview: None };
+        assert_eq!(content.embeddable_text(), Some("[URGENT] call me".to_string()));
+    }
+
+    #[test]
+    fn test_embeddable_text_image_with_caption() {
+        let content = InboundContent::Image {
+            data: Arc::from(vec![1u8, 2, 3]),
+            mime: "image/jpeg".into(),
+            caption: Some("sunset at the beach".into()),
+            width: None,
+            height: None,
+        };
+        // Bare caption only — NOT the "[image 3B] ..." display_text() label.
+        assert_eq!(content.embeddable_text(), Some("sunset at the beach".to_string()));
+        assert!(!content.display_text().eq(content.embeddable_text().as_deref().unwrap_or("")));
+    }
+
+    #[test]
+    fn test_embeddable_text_image_without_caption_is_none() {
+        let content = InboundContent::Image {
+            data: Arc::from(vec![1u8, 2, 3]),
+            mime: "image/jpeg".into(),
+            caption: None,
+            width: None,
+            height: None,
+        };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_video_with_caption() {
+        let content = InboundContent::Video {
+            data: Arc::from(vec![1u8, 2, 3]),
+            mime: "video/mp4".into(),
+            caption: Some("vacation clip".into()),
+            seconds: Some(10),
+            width: None,
+            height: None,
+            is_gif: false,
+        };
+        assert_eq!(content.embeddable_text(), Some("vacation clip".to_string()));
+    }
+
+    #[test]
+    fn test_embeddable_text_video_without_caption_is_none() {
+        let content = InboundContent::Video {
+            data: Arc::from(vec![1u8, 2, 3]),
+            mime: "video/mp4".into(),
+            caption: None,
+            seconds: Some(10),
+            width: None,
+            height: None,
+            is_gif: true,
+        };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_document_with_caption() {
+        let content = InboundContent::Document {
+            data: Arc::from(vec![1u8, 2, 3]),
+            mime: "application/pdf".into(),
+            filename: "report.pdf".into(),
+            caption: Some("Q3 numbers".into()),
+            page_count: Some(5),
+        };
+        assert_eq!(content.embeddable_text(), Some("Q3 numbers".to_string()));
+    }
+
+    #[test]
+    fn test_embeddable_text_document_without_caption_is_none() {
+        let content = InboundContent::Document {
+            data: Arc::from(vec![1u8, 2, 3]),
+            mime: "application/pdf".into(),
+            filename: "report.pdf".into(),
+            caption: None,
+            page_count: None,
+        };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_audio_is_always_none() {
+        let content = InboundContent::Audio {
+            data: Arc::from(vec![1u8, 2, 3]),
+            mime: "audio/ogg".into(),
+            seconds: Some(5),
+            is_voice: true,
+        };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_sticker_is_always_none() {
+        // Even with sticker_emoji (alt-text) set, stickers are never embeddable (ADR 0016).
+        let content = InboundContent::Sticker {
+            data: Arc::from(vec![1u8, 2, 3]),
+            mime: "image/webp".into(),
+            is_animated: false,
+            sticker_emoji: Some("😀".into()),
+        };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_poll_created_joins_question_and_options() {
+        let content = InboundContent::PollCreated {
+            question: "question".into(),
+            options: vec!["opt1".into(), "opt2".into()],
+            selectable_count: 1,
+        };
+        assert_eq!(content.embeddable_text(), Some("question | opt1 | opt2".to_string()));
+    }
+
+    #[test]
+    fn test_embeddable_text_poll_created_no_options() {
+        let content = InboundContent::PollCreated {
+            question: "question only".into(),
+            options: vec![],
+            selectable_count: 1,
+        };
+        assert_eq!(content.embeddable_text(), Some("question only".to_string()));
+    }
+
+    #[test]
+    fn test_embeddable_text_poll_vote_is_none() {
+        let content = InboundContent::PollVote {
+            poll_id: "p1".into(),
+            selected_options: vec!["opt1".into()],
+        };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_contact_display_name() {
+        let content = InboundContent::Contact {
+            display_name: "Jane Doe".into(),
+            vcard: "BEGIN:VCARD...".into(),
+            additional_contacts: vec![],
+        };
+        assert_eq!(content.embeddable_text(), Some("Jane Doe".to_string()));
+    }
+
+    #[test]
+    fn test_embeddable_text_location_with_name() {
+        let content = InboundContent::Location {
+            lat: 32.1,
+            lon: 34.8,
+            name: Some("Home".into()),
+            address: None,
+            url: None,
+            is_live: false,
+        };
+        assert_eq!(content.embeddable_text(), Some("Home".to_string()));
+    }
+
+    #[test]
+    fn test_embeddable_text_location_without_name_is_none() {
+        let content = InboundContent::Location {
+            lat: 32.1,
+            lon: 34.8,
+            name: None,
+            address: None,
+            url: None,
+            is_live: false,
+        };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_reaction_added_is_none() {
+        let content = InboundContent::ReactionAdded {
+            target_id: "m1".into(),
+            emoji: "👍".into(),
+            target_sender: None,
+        };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_reaction_removed_is_none() {
+        let content = InboundContent::ReactionRemoved { target_id: "m1".into(), target_sender: None };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_edit_is_none() {
+        // Edit carries real text (new_text) but ADR 0016 explicitly places it in "skipped".
+        let content = InboundContent::Edit {
+            target_id: "m1".into(),
+            new_text: "corrected message".into(),
+            mentions: vec![],
+        };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_revoke_is_none() {
+        let content = InboundContent::Revoke { target_id: "m1".into() };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_delivery_receipt_is_none() {
+        let content = InboundContent::DeliveryReceipt {
+            message_ids: vec!["m1".into()],
+            status: crate::bridge_events::DeliveryStatus::Delivered,
+            chat_jid: "chat@s.whatsapp.net".into(),
+            sender: "s@s.whatsapp.net".into(),
+        };
+        assert_eq!(content.embeddable_text(), None);
     }
 }
