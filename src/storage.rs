@@ -1478,6 +1478,10 @@ impl Store {
         batch_size: i64,
     ) -> Result<Vec<PendingEmbeddingRow>> {
         let model_id = active_model_id.to_owned();
+        // SQLite treats a negative LIMIT as unbounded (and 0 as always-empty) — clamp to a sane
+        // floor so a future misconfigured batch_size knob can't silently return everything (< 0)
+        // or nothing (0) instead of erroring loudly.
+        let batch_size = batch_size.max(1);
         self.run(move |c| {
             let mut stmt = c.prepare(
                 "SELECT m.message_id, m.content_kind, m.body_text
@@ -5183,34 +5187,92 @@ mod tests {
             .unwrap()
     }
 
-    /// (m2.2-1) insert_message: `embed_status` is bound explicitly per call and persists exactly
-    /// as passed, across the ADR 0016 classification matrix (image+caption→pending,
-    /// captionless image→skipped, sticker→skipped, poll→pending, reaction→skipped, edit→skipped,
-    /// receipt→skipped) — mirroring what the bridge.rs call sites derive from
-    /// `InboundContent::embeddable_text().is_some()`.
+    /// (m2.2-1) insert_message + `InboundContent::embed_status()` glue: unlike a round-trip test
+    /// that hands `insert_message` the same literal it later asserts on (tautological — it can
+    /// never catch a swapped "pending"/"skipped" ternary at the bridge.rs write call sites), this
+    /// test constructs a *real* `InboundContent` variant per ADR 0016 case, derives `embed_status`
+    /// via the actual `embed_status()` helper the call sites use, checks that derived value
+    /// against a hand-verified expectation, and only THEN writes it through `insert_message` and
+    /// reads it back. If `embed_status()`'s internal classification were ever inverted, the
+    /// `derived_status` assertion below would fail before the row is even written.
     #[tokio::test]
     async fn test_insert_message_embed_status_classification_matrix() {
+        use crate::bridge::InboundContent;
+
         let (store, dir) = open_b2a_store("embed-status-matrix");
 
-        let cases: &[(&str, &str, Option<&str>, &str)] = &[
-            // (message_id, content_kind, body_text, expected embed_status)
-            ("m2-text", "text", Some("hello"), "pending"),
-            ("m2-image-caption", "image", Some("caption text"), "pending"),
-            ("m2-image-no-caption", "image", None, "skipped"),
-            ("m2-sticker", "sticker", None, "skipped"),
-            ("m2-poll", "poll", Some("question | opt1 | opt2"), "pending"),
-            ("m2-reaction", "reaction", Some("[react 👍 on abc123]"), "skipped"),
-            ("m2-edit", "edit", Some("[edit abc123] corrected"), "skipped"),
-            ("m2-receipt", "delivery-receipt", Some("[receipt: delivered for 1 message(s)]"), "skipped"),
+        let text = InboundContent::Text { body: "hello".into(), link_preview: None };
+        let image_caption = InboundContent::Image {
+            data: std::sync::Arc::from(vec![1u8, 2, 3]),
+            mime: "image/jpeg".into(),
+            caption: Some("caption text".into()),
+            width: None,
+            height: None,
+        };
+        let image_no_caption = InboundContent::Image {
+            data: std::sync::Arc::from(vec![1u8, 2, 3]),
+            mime: "image/jpeg".into(),
+            caption: None,
+            width: None,
+            height: None,
+        };
+        let sticker = InboundContent::Sticker {
+            data: std::sync::Arc::from(vec![1u8, 2, 3]),
+            mime: "image/webp".into(),
+            is_animated: false,
+            sticker_emoji: None,
+        };
+        let poll = InboundContent::PollCreated {
+            question: "question".into(),
+            options: vec!["opt1".into(), "opt2".into()],
+            selectable_count: 1,
+        };
+        let reaction = InboundContent::ReactionAdded {
+            target_id: "abc123".into(),
+            emoji: "👍".into(),
+            target_sender: None,
+        };
+        let edit = InboundContent::Edit {
+            target_id: "abc123".into(),
+            new_text: "corrected".into(),
+            mentions: vec![],
+        };
+        let receipt = InboundContent::DeliveryReceipt {
+            message_ids: vec!["m1".into()],
+            status: crate::bridge_events::DeliveryStatus::Delivered,
+            chat_jid: "chat@s.whatsapp.net".into(),
+            sender: "s@s.whatsapp.net".into(),
+        };
+
+        // (message_id, content, ADR-0016 hand-verified expected status — independent of
+        // embed_status()'s own reasoning, so a swapped ternary would trip the assert below).
+        let cases: Vec<(&str, InboundContent, &str)> = vec![
+            ("m2-text", text, "pending"),
+            ("m2-image-caption", image_caption, "pending"),
+            ("m2-image-no-caption", image_no_caption, "skipped"),
+            ("m2-sticker", sticker, "skipped"),
+            ("m2-poll", poll, "pending"),
+            ("m2-reaction", reaction, "skipped"),
+            ("m2-edit", edit, "skipped"),
+            ("m2-receipt", receipt, "skipped"),
         ];
 
-        for (mid, kind, body, expected) in cases {
+        for (mid, content, hand_expected) in &cases {
+            // Mirror the real bridge.rs write call sites exactly: body from display_text(),
+            // embed_status from the embed_status() helper — NOT a literal passed straight through.
+            let body_text = content.display_text();
+            let body_opt = if body_text.is_empty() { None } else { Some(body_text.as_str()) };
+            let derived_status = content.embed_status();
+            assert_eq!(
+                derived_status, *hand_expected,
+                "embed_status() classification drifted from ADR 0016 for {mid}"
+            );
             store.insert_message(
-                "chat@s.whatsapp.net", "s@s.whatsapp.net", mid, kind, *body, 1000, false, "live", expected,
+                "chat@s.whatsapp.net", "s@s.whatsapp.net", mid, content.kind(), body_opt, 1000, false, "live", derived_status,
             ).await.unwrap();
         }
 
-        for (mid, _, _, expected) in cases {
+        for (mid, _, expected) in &cases {
             let got = get_embed_status(&store, mid).await;
             assert_eq!(got.as_deref(), Some(*expected), "embed_status mismatch for {mid}");
         }
@@ -5338,7 +5400,7 @@ mod tests {
         println!("EXPLAIN QUERY PLAN output (fetch_pending_embeddings):\n{plan}");
 
         assert!(
-            plan.contains("idx_messages_embed_status") || plan.contains("SEARCH"),
+            plan.contains("idx_messages_embed_status"),
             "expected the drain query to SEARCH via idx_messages_embed_status, not full-SCAN; got:\n{plan}"
         );
         assert!(

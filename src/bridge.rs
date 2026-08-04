@@ -505,7 +505,7 @@ impl InboundContent {
             }
             Self::Image { caption, .. }
             | Self::Video { caption, .. }
-            | Self::Document { caption, .. } => caption.clone(),
+            | Self::Document { caption, .. } => caption.clone().filter(|c| !c.is_empty()),
             Self::PollCreated { question, options, .. } => {
                 if options.is_empty() {
                     Some(question.clone())
@@ -513,8 +513,10 @@ impl InboundContent {
                     Some(format!("{question} | {}", options.join(" | ")))
                 }
             }
-            Self::Contact { display_name, .. } => Some(display_name.clone()),
-            Self::Location { name, .. } => name.clone(),
+            Self::Contact { display_name, .. } => {
+                if display_name.is_empty() { None } else { Some(display_name.clone()) }
+            }
+            Self::Location { name, .. } => name.clone().filter(|n| !n.is_empty()),
             // Everything else is not genuine natural language (ADR 0016): captionless media,
             // stickers (even with alt-text), reactions, edits (carries text but ADR 0016 places
             // it in "skipped" — see ADR 0038), revokes, poll votes, delivery receipts.
@@ -527,6 +529,14 @@ impl InboundContent {
             | Self::PollVote { .. }
             | Self::DeliveryReceipt { .. } => None,
         }
+    }
+
+    /// Classify write-time `embed_status` (ADR 0016/0038, M2.2) from `embeddable_text()`:
+    /// `"pending"` when there is bare natural-language text to embed, `"skipped"` otherwise.
+    /// Centralizes the classification so both write call sites (live ingest and backfill) derive
+    /// it identically instead of re-deriving the same ternary twice.
+    pub fn embed_status(&self) -> &'static str {
+        if self.embeddable_text().is_some() { "pending" } else { "skipped" }
     }
 }
 
@@ -2720,20 +2730,16 @@ async fn handle_event(
                     let body_text = inbound.content.display_text();
                     let body_opt = if body_text.is_empty() { None } else { Some(body_text.as_str()) };
                     // M2.2.2: write-time embeddable-text classification (ADR 0016) from the
-                    // InboundContent in hand — `embeddable_text()` (bare NL, distinct from the
-                    // decorated `display_text()` above) drives `embed_status`; its string value
-                    // itself is discarded here (Option C, ADR 0038) — only `.is_some()` matters.
+                    // InboundContent in hand — `embed_status()` wraps `embeddable_text()` (bare
+                    // NL, distinct from the decorated `display_text()` above); the text itself is
+                    // discarded here (Option C, ADR 0038) — only pending/skipped classification matters.
                     // M2.2.3 (F-C part 2, ADR 0038): the pre-M2 backlog (every row migrated before
                     // this classifier existed) is tolerated as-is, not reclassified — the raw
                     // `wa::Message` needed to recover a clean caption/body from the decorated
                     // `body_text` isn't retained, so a perfect backfill reclassify isn't possible;
                     // backlog volume is small and stray non-NL text is bounded by the M2.3 3-attempt
                     // cap. No migration/backfill script is added for this.
-                    let embed_status = if inbound.content.embeddable_text().is_some() {
-                        "pending"
-                    } else {
-                        "skipped"
-                    };
+                    let embed_status = inbound.content.embed_status();
                     if let Err(e) = store.insert_inbound(
                         &inbound.jid, &inbound.sender, &inbound.id,
                         inbound.content.kind(), body_opt, inbound.timestamp, embed_status,
@@ -4319,7 +4325,7 @@ impl crate::backfill::BatchSink for LiveBatchSink {
                     // (bridge.rs, ExtractResult::Content branch above) — see that comment for the
                     // Option C / backlog-tolerance rationale (ADR 0016/0038). Backfilled rows get
                     // exactly the same classification discipline as live-ingested ones.
-                    let embed_status = if c.embeddable_text().is_some() { "pending" } else { "skipped" };
+                    let embed_status = c.embed_status();
                     match self
                         .store
                         .insert_message(
@@ -4829,6 +4835,31 @@ mod tests {
     }
 
     #[test]
+    fn test_embeddable_text_contact_empty_display_name_is_none() {
+        // upstream defaults display_name via unwrap_or_default(), so "" is reachable — an empty
+        // name is not genuine NL (ADR 0016).
+        let content = InboundContent::Contact {
+            display_name: String::new(),
+            vcard: "BEGIN:VCARD...".into(),
+            additional_contacts: vec![],
+        };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_image_some_empty_caption_is_none() {
+        // caption is Option<String>; Some("") is reachable and must not be treated as embeddable.
+        let content = InboundContent::Image {
+            data: Arc::from(vec![1u8, 2, 3]),
+            mime: "image/jpeg".into(),
+            caption: Some(String::new()),
+            width: None,
+            height: None,
+        };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
     fn test_embeddable_text_location_with_name() {
         let content = InboundContent::Location {
             lat: 32.1,
@@ -4847,6 +4878,19 @@ mod tests {
             lat: 32.1,
             lon: 34.8,
             name: None,
+            address: None,
+            url: None,
+            is_live: false,
+        };
+        assert_eq!(content.embeddable_text(), None);
+    }
+
+    #[test]
+    fn test_embeddable_text_location_empty_name_is_none() {
+        let content = InboundContent::Location {
+            lat: 32.1,
+            lon: 34.8,
+            name: Some(String::new()),
             address: None,
             url: None,
             is_live: false,
@@ -4896,5 +4940,120 @@ mod tests {
             sender: "s@s.whatsapp.net".into(),
         };
         assert_eq!(content.embeddable_text(), None);
+    }
+
+    // -------------------------------------------------------------------
+    // embed_status() — code-review fix pass: direct coverage of the
+    // classification helper across all 15 InboundContent variants (ADR
+    // 0016/0038). The write-site glue path (construct → embed_status() →
+    // insert_message → read back) is covered separately in
+    // storage.rs::test_insert_message_embed_status_classification_matrix.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_embed_status_matches_embeddable_text_for_all_variants() {
+        let pending: Vec<InboundContent> = vec![
+            InboundContent::Text { body: "hello".into(), link_preview: None },
+            InboundContent::Image {
+                data: Arc::from(vec![1u8]),
+                mime: "image/jpeg".into(),
+                caption: Some("cap".into()),
+                width: None,
+                height: None,
+            },
+            InboundContent::Video {
+                data: Arc::from(vec![1u8]),
+                mime: "video/mp4".into(),
+                caption: Some("cap".into()),
+                seconds: None,
+                width: None,
+                height: None,
+                is_gif: false,
+            },
+            InboundContent::Document {
+                data: Arc::from(vec![1u8]),
+                mime: "application/pdf".into(),
+                filename: "f.pdf".into(),
+                caption: Some("cap".into()),
+                page_count: None,
+            },
+            InboundContent::PollCreated { question: "q".into(), options: vec![], selectable_count: 1 },
+            InboundContent::Contact {
+                display_name: "Jane".into(),
+                vcard: "V".into(),
+                additional_contacts: vec![],
+            },
+            InboundContent::Location {
+                lat: 1.0,
+                lon: 1.0,
+                name: Some("Home".into()),
+                address: None,
+                url: None,
+                is_live: false,
+            },
+        ];
+        for c in &pending {
+            assert_eq!(c.embed_status(), "pending", "expected pending for {}", c.kind());
+        }
+
+        let skipped: Vec<InboundContent> = vec![
+            InboundContent::Image {
+                data: Arc::from(vec![1u8]),
+                mime: "image/jpeg".into(),
+                caption: None,
+                width: None,
+                height: None,
+            },
+            InboundContent::Video {
+                data: Arc::from(vec![1u8]),
+                mime: "video/mp4".into(),
+                caption: None,
+                seconds: None,
+                width: None,
+                height: None,
+                is_gif: false,
+            },
+            InboundContent::Document {
+                data: Arc::from(vec![1u8]),
+                mime: "application/pdf".into(),
+                filename: "f.pdf".into(),
+                caption: None,
+                page_count: None,
+            },
+            InboundContent::Audio {
+                data: Arc::from(vec![1u8]),
+                mime: "audio/ogg".into(),
+                seconds: None,
+                is_voice: false,
+            },
+            InboundContent::Sticker {
+                data: Arc::from(vec![1u8]),
+                mime: "image/webp".into(),
+                is_animated: false,
+                sticker_emoji: None,
+            },
+            InboundContent::Location {
+                lat: 1.0,
+                lon: 1.0,
+                name: None,
+                address: None,
+                url: None,
+                is_live: false,
+            },
+            InboundContent::ReactionAdded { target_id: "m1".into(), emoji: "👍".into(), target_sender: None },
+            InboundContent::ReactionRemoved { target_id: "m1".into(), target_sender: None },
+            InboundContent::Edit { target_id: "m1".into(), new_text: "x".into(), mentions: vec![] },
+            InboundContent::Revoke { target_id: "m1".into() },
+            InboundContent::PollVote { poll_id: "p1".into(), selected_options: vec![] },
+            InboundContent::DeliveryReceipt {
+                message_ids: vec!["m1".into()],
+                status: crate::bridge_events::DeliveryStatus::Delivered,
+                chat_jid: "c@s.whatsapp.net".into(),
+                sender: "s@s.whatsapp.net".into(),
+            },
+        ];
+        for c in &skipped {
+            assert_eq!(c.embed_status(), "skipped", "expected skipped for {}", c.kind());
+        }
     }
 }
