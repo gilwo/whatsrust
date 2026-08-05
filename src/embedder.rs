@@ -544,6 +544,43 @@ impl Embedder for FakeEmbedder {
 }
 
 // ---------------------------------------------------------------------------
+// Cosine similarity — M2.4.1 pure function for semantic reranking
+// ---------------------------------------------------------------------------
+
+/// Compute cosine similarity between two vectors: `dot(a, b) / (||a|| * ||b||)`.
+/// Returns a value in `[-1.0, 1.0]` where:
+///   - `1.0` = identical direction (most similar)
+///   - `0.0` = orthogonal (no similarity)
+///   - `-1.0` = opposite direction
+///
+/// Returns `Err` if the vectors have mismatched dimensions. Returns `Ok(0.0)` if
+/// either vector has zero magnitude (defined behavior, not NaN/panic — a zero-magnitude
+/// vector is orthogonal to everything per ADR 0008).
+///
+/// Used by `WhatsAppBridge::search()` (M2.4.3) to rerank FTS5-recalled candidates
+/// against the query embedding. Pure logic, no I/O.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> anyhow::Result<f32> {
+    if a.len() != b.len() {
+        anyhow::bail!(
+            "cosine_similarity: dimension mismatch (a={}, b={})",
+            a.len(),
+            b.len()
+        );
+    }
+
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    // Zero-magnitude vector → 0.0 (defined, not NaN/panic per M2.4.1 Verify).
+    if mag_a == 0.0 || mag_b == 0.0 {
+        return Ok(0.0);
+    }
+
+    Ok(dot / (mag_a * mag_b))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -827,5 +864,62 @@ mod tests {
             !alive,
             "child process {pid} should be reaped after StdioEmbedder is dropped (kill_on_drop)"
         );
+    }
+
+    // --- M2.4.1: cosine_similarity unit tests ---
+
+    #[test]
+    fn test_cosine_similarity_orthogonal() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0];
+        let sim = cosine_similarity(&a, &b).unwrap();
+        assert!((sim - 0.0).abs() < 1e-6, "orthogonal vectors should have cosine=0");
+    }
+
+    #[test]
+    fn test_cosine_similarity_identical() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![1.0, 2.0, 3.0];
+        let sim = cosine_similarity(&a, &b).unwrap();
+        assert!((sim - 1.0).abs() < 1e-6, "identical vectors should have cosine=1");
+    }
+
+    #[test]
+    fn test_cosine_similarity_opposite() {
+        let a = vec![1.0, 0.0];
+        let b = vec![-1.0, 0.0];
+        let sim = cosine_similarity(&a, &b).unwrap();
+        assert!((sim - (-1.0)).abs() < 1e-6, "opposite vectors should have cosine=-1");
+    }
+
+    #[test]
+    fn test_cosine_similarity_mismatched_dim() {
+        let a = vec![1.0, 2.0];
+        let b = vec![1.0, 2.0, 3.0];
+        let result = cosine_similarity(&a, &b);
+        assert!(
+            result.is_err(),
+            "mismatched dimensions should return Err"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("dimension mismatch"));
+    }
+
+    #[test]
+    fn test_cosine_similarity_zero_magnitude() {
+        let zero = vec![0.0, 0.0, 0.0];
+        let nonzero = vec![1.0, 2.0, 3.0];
+
+        // Zero vs nonzero -> 0.0 (defined, not NaN)
+        let sim1 = cosine_similarity(&zero, &nonzero).unwrap();
+        assert_eq!(sim1, 0.0, "zero-magnitude vector should yield 0.0, not NaN");
+
+        // Nonzero vs zero -> 0.0
+        let sim2 = cosine_similarity(&nonzero, &zero).unwrap();
+        assert_eq!(sim2, 0.0);
+
+        // Zero vs zero -> 0.0
+        let sim3 = cosine_similarity(&zero, &zero).unwrap();
+        assert_eq!(sim3, 0.0);
     }
 }
