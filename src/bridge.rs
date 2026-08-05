@@ -917,7 +917,8 @@ pub struct WhatsAppBridge {
     backfill_queue_depth: i64,
     backfill_max_messages: i64,
     /// Single shared embedder instance (M2.3.10 / ADR 0038). `None` when unconfigured or construction failed.
-    embedder: Option<Arc<dyn crate::embedder::Embedder>>,
+    /// Shared via mutex so `active_model_id()` can access it after `run_bridge` constructs it.
+    embedder: Arc<ParkingMutex<Option<Arc<dyn crate::embedder::Embedder>>>>,
 }
 
 impl WhatsAppBridge {
@@ -941,6 +942,8 @@ impl WhatsAppBridge {
         let subscribed_presence: Arc<DashSet<String>> = Arc::new(DashSet::new());
         let group_cache: GroupCacheHandle = Arc::new(ParkingMutex::new(GroupCache::new()));
         let (event_tx, _event_rx) = crate::bridge_events::new_event_bus();
+        let embedder_handle: Arc<ParkingMutex<Option<Arc<dyn crate::embedder::Embedder>>>> =
+            Arc::new(ParkingMutex::new(None));
 
         // Open store early so bridge methods can access it (e.g. poll key storage)
         let store = Store::new(&config.db_path).expect("failed to open database for bridge");
@@ -964,9 +967,10 @@ impl WhatsAppBridge {
         let et = event_tx.clone();
         let st = store.clone();
         let gc = group_cache.clone();
+        let emb_handle = embedder_handle.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, bn, en, et, st, gc).await
+                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, bn, en, et, st, gc, emb_handle).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -991,7 +995,7 @@ impl WhatsAppBridge {
             backfill_cooldown_secs,
             backfill_queue_depth,
             backfill_max_messages,
-            embedder: None, // Constructed in run_bridge (async context)
+            embedder: embedder_handle, // Populated in run_bridge (async context)
         }
     }
 
@@ -1366,10 +1370,11 @@ impl WhatsAppBridge {
     }
 
     /// Get the active embedder model ID for M2.3.8 circuit breaker; `None` if no embedder configured.
-    /// NOTE: embedder is now constructed in run_bridge (async context), so this always returns None for now.
-    /// The circuit breaker is thus disabled in this implementation. (M2.3.8 will be fully wired in a follow-up.)
     pub fn active_model_id(&self) -> Option<String> {
-        None // TODO(M2.3): thread embedder model_id back to bridge struct or store in metadata
+        self.embedder
+            .lock()
+            .as_ref()
+            .map(|e| e.model_info().model_id)
     }
 
     /// Backfill config values for the API trigger handler.
@@ -2071,6 +2076,7 @@ async fn run_bridge(
     event_tx: tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
     store: Store,
     group_cache: GroupCacheHandle,
+    embedder_handle: Arc<ParkingMutex<Option<Arc<dyn crate::embedder::Embedder>>>>,
 ) -> Result<()> {
     info!("WhatsApp bridge starting");
 
@@ -2090,6 +2096,11 @@ async fn run_bridge(
             None
         }
     };
+
+    // Populate the embedder handle so active_model_id() can access it (M2.3.8 circuit breaker).
+    if let Some(ref emb) = embedder {
+        *embedder_handle.lock() = Some(emb.clone());
+    }
 
     // Recover any messages stuck in 'inflight' from a previous crash
     match store.requeue_stale_inflight(60).await {
@@ -5177,5 +5188,82 @@ mod tests {
         for c in &skipped {
             assert_eq!(c.embed_status(), "skipped", "expected skipped for {}", c.kind());
         }
+    }
+
+    #[tokio::test]
+    async fn test_active_model_id_returns_configured_embedder_model() {
+        // Critical 2 fix: active_model_id() must return the real model ID when an embedder
+        // is configured, not None. This enables the M2.3.8 circuit breaker in production.
+        use crate::embedder::FakeEmbedder;
+
+        // Create a minimal embedder handle and populate it with a fake embedder.
+        let embedder_handle: Arc<ParkingMutex<Option<Arc<dyn crate::embedder::Embedder>>>> =
+            Arc::new(ParkingMutex::new(None));
+        let fake_embedder = Arc::new(FakeEmbedder::new("test-model-123", 8)) as Arc<dyn crate::embedder::Embedder>;
+        *embedder_handle.lock() = Some(fake_embedder.clone());
+
+        // Build a minimal WhatsAppBridge stub to test the accessor.
+        let temp_dir = std::env::temp_dir().join("test_active_model_id");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let db_path = temp_dir.join("test.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let (state_tx, state_rx) = watch::channel(BridgeState::Disconnected);
+        let (qr_tx, qr_rx) = watch::channel::<Option<String>>(None);
+        let outbound_notify = Arc::new(tokio::sync::Notify::new());
+        let backfill_notify = Arc::new(tokio::sync::Notify::new());
+        let embed_notify = Arc::new(tokio::sync::Notify::new());
+        let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> = Arc::new(ParkingMutex::new(None));
+        let cancel = CancellationToken::new();
+        let rr_tx = spawn_scheduler(None, 200);
+        let msg_cache: MsgCache = Arc::new(ParkingMutex::new(BoundedMsgCache::new(MSG_CACHE_CAP)));
+        let send_pacer = Arc::new(SendPacer::with_burst(0, 1));
+        let subscribed_presence: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let group_cache: GroupCacheHandle = Arc::new(ParkingMutex::new(GroupCache::new()));
+        let (event_tx, _event_rx) = crate::bridge_events::new_event_bus();
+        let store = Store::new(&db_path).expect("failed to open test DB");
+        let metrics = Arc::new(BridgeMetrics::new());
+
+        let bridge = WhatsAppBridge {
+            outbound_notify,
+            backfill_notify,
+            embed_notify,
+            state_rx,
+            qr_rx,
+            cancel,
+            client_handle,
+            rr_tx,
+            msg_cache,
+            store,
+            metrics,
+            send_pacer,
+            subscribed_presence,
+            event_tx,
+            group_cache,
+            backfill_cooldown_secs: 300,
+            backfill_queue_depth: 100,
+            backfill_max_messages: 10000,
+            embedder: embedder_handle,
+        };
+
+        // The critical assertion: active_model_id() returns the configured model ID.
+        let model_id = bridge.active_model_id();
+        assert_eq!(
+            model_id,
+            Some("test-model-123".to_string()),
+            "active_model_id() should return the configured embedder's model ID, not None"
+        );
+
+        // Also verify None when no embedder is configured.
+        *bridge.embedder.lock() = None;
+        let none_id = bridge.active_model_id();
+        assert_eq!(
+            none_id,
+            None,
+            "active_model_id() should return None when no embedder is configured"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_file(&db_path);
     }
 }
