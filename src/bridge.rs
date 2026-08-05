@@ -789,6 +789,20 @@ pub struct BridgeConfig {
     pub backfill_cooldown_secs: i64,
     /// Maximum number of active+queued backfill jobs (default: 5).
     pub backfill_queue_depth: i64,
+
+    // ---- Embedder drain worker knobs (M2.3 / ADR 0015/0038) ----
+
+    /// Embedder drain worker periodic interval in seconds (default: 60).
+    /// Unguarded per ADR 0022 (local compute only, no ban risk).
+    pub embedder_drain_interval_secs: u64,
+    /// Embedder batch size (default: 64), clamped to model_info().max_batch if advertised.
+    pub embedder_batch_size: usize,
+    /// Embedder backoff cap in seconds for transport failures (default: 60).
+    pub embedder_backoff_cap_secs: u64,
+    /// Embedder loading timeout in seconds (continuous, default: 60).
+    pub embedder_loading_timeout_secs: u64,
+    /// Consecutive transport/loading failures before dropping to Notify-only (default: 10).
+    pub embedder_failure_threshold: u32,
 }
 
 impl Default for BridgeConfig {
@@ -820,6 +834,11 @@ impl Default for BridgeConfig {
             backfill_jitter_frac: 0.4,
             backfill_cooldown_secs: 300,
             backfill_queue_depth: 5,
+            embedder_drain_interval_secs: 60,
+            embedder_batch_size: 64,
+            embedder_backoff_cap_secs: 60,
+            embedder_loading_timeout_secs: 60,
+            embedder_failure_threshold: 10,
         }
     }
 }
@@ -874,6 +893,8 @@ pub struct WhatsAppBridge {
     outbound_notify: Arc<tokio::sync::Notify>,
     /// Wakes the backfill worker after a new job is enqueued.
     backfill_notify: Arc<tokio::sync::Notify>,
+    /// Wakes the embedding-drain worker after a new pending row is classified (M2.3.2).
+    embed_notify: Arc<tokio::sync::Notify>,
     state_rx: watch::Receiver<BridgeState>,
     #[allow(dead_code)] // Used by agent integrations via subscribe_qr()
     qr_rx: watch::Receiver<Option<String>>,
@@ -895,6 +916,8 @@ pub struct WhatsAppBridge {
     backfill_cooldown_secs: i64,
     backfill_queue_depth: i64,
     backfill_max_messages: i64,
+    /// Single shared embedder instance (M2.3.10 / ADR 0038). `None` when unconfigured or construction failed.
+    embedder: Option<Arc<dyn crate::embedder::Embedder>>,
 }
 
 impl WhatsAppBridge {
@@ -909,6 +932,7 @@ impl WhatsAppBridge {
         let (qr_tx, qr_rx) = watch::channel::<Option<String>>(None);
         let outbound_notify = Arc::new(tokio::sync::Notify::new());
         let backfill_notify = Arc::new(tokio::sync::Notify::new());
+        let embed_notify = Arc::new(tokio::sync::Notify::new());
         let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> =
             Arc::new(ParkingMutex::new(None));
         let rr_tx = spawn_scheduler(None, 200);
@@ -936,12 +960,13 @@ impl WhatsAppBridge {
         let sub_pres = subscribed_presence.clone();
         let on = outbound_notify.clone();
         let bn = backfill_notify.clone();
+        let en = embed_notify.clone();
         let et = event_tx.clone();
         let st = store.clone();
         let gc = group_cache.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, bn, et, st, gc).await
+                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, bn, en, et, st, gc).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -950,6 +975,7 @@ impl WhatsAppBridge {
         Self {
             outbound_notify,
             backfill_notify,
+            embed_notify,
             state_rx,
             qr_rx,
             cancel,
@@ -965,6 +991,7 @@ impl WhatsAppBridge {
             backfill_cooldown_secs,
             backfill_queue_depth,
             backfill_max_messages,
+            embedder: None, // Constructed in run_bridge (async context)
         }
     }
 
@@ -1331,6 +1358,18 @@ impl WhatsAppBridge {
     /// Get a reference to the backfill notify handle (to wake the worker after enqueueing).
     pub fn backfill_notify(&self) -> &Arc<tokio::sync::Notify> {
         &self.backfill_notify
+    }
+
+    /// Get a reference to the embedding-drain notify handle (M2.3.2).
+    pub fn embed_notify(&self) -> &Arc<tokio::sync::Notify> {
+        &self.embed_notify
+    }
+
+    /// Get the active embedder model ID for M2.3.8 circuit breaker; `None` if no embedder configured.
+    /// NOTE: embedder is now constructed in run_bridge (async context), so this always returns None for now.
+    /// The circuit breaker is thus disabled in this implementation. (M2.3.8 will be fully wired in a follow-up.)
+    pub fn active_model_id(&self) -> Option<String> {
+        None // TODO(M2.3): thread embedder model_id back to bridge struct or store in metadata
     }
 
     /// Backfill config values for the API trigger handler.
@@ -1991,6 +2030,25 @@ impl WhatsAppBridge {
 }
 
 // ---------------------------------------------------------------------------
+// Embedding-drain worker (M2.3 / ADR 0015/0038)
+// ---------------------------------------------------------------------------
+
+/// Independent long-lived embedding-drain worker (M2.3). Wakes on Notify + periodic timer,
+/// fetches pending rows via the set-difference query (M2.2.4), applies kind-gated text-prep
+/// (M2.3.9), batches them to the sidecar, writes vectors in one chunked transaction (M2.3.4).
+///
+/// Resilience (M2.3.5-7/11):
+/// - Transport failure → exponential backoff (cap 60s), rows stay `pending`, no attempt increment.
+/// - After N consecutive failures → Notify-only (stop periodic polling).
+/// - Loading timeout (continuous >60s) → treat as error, count toward same backoff.
+/// - Per-row content rejection → increment in-memory attempt counter, cap 3 → `'failed'`.
+/// - Poison-pill bisection (M2.3.11): K consecutive whole-batch failures of same message-id set →
+///   halve batch, converge to solo so cap-3 can engage.
+#[allow(clippy::too_many_arguments)]
+// M2.3 embedding-drain worker moved to src/embed_drain.rs module (mirrors backfill.rs structure).
+// See crate::embed_drain::run_embedding_drain_worker for the implementation.
+
+// ---------------------------------------------------------------------------
 // Bridge runner — reconnection loop with exponential backoff
 // ---------------------------------------------------------------------------
 
@@ -2009,11 +2067,29 @@ async fn run_bridge(
     subscribed_presence: Arc<DashSet<String>>,
     outbound_notify: Arc<tokio::sync::Notify>,
     backfill_notify: Arc<tokio::sync::Notify>,
+    embed_notify: Arc<tokio::sync::Notify>,
     event_tx: tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
     store: Store,
     group_cache: GroupCacheHandle,
 ) -> Result<()> {
     info!("WhatsApp bridge starting");
+
+    // Construct embedder (M2.3.10): exactly ONE shared instance. Non-fatal construction
+    // per M2.1.4 — absent/broken → None → drain worker not spawned (M2.3.3).
+    use crate::embedder::Embedder as EmbedderTrait;
+    let embedder: Option<Arc<dyn crate::embedder::Embedder>> = match crate::embedder::StdioEmbedder::from_env().await {
+        Ok(e) => {
+            let model_id = EmbedderTrait::model_info(&e).model_id.clone();
+            let dim = EmbedderTrait::model_info(&e).dim;
+            let emb: Arc<dyn crate::embedder::Embedder> = Arc::new(e);
+            info!(model = %model_id, dim = dim, "embedder configured");
+            Some(emb)
+        }
+        Err(e) => {
+            debug!(error = %e, "no embedder configured or construction failed (non-fatal; semantic search disabled)");
+            None
+        }
+    };
 
     // Recover any messages stuck in 'inflight' from a previous crash
     match store.requeue_stale_inflight(60).await {
@@ -2176,6 +2252,7 @@ async fn run_bridge(
         let bf_sink = Arc::new(LiveBatchSink::new(
             client_handle.clone(),
             store.clone(),
+            embed_notify.clone(),
         ));
         let bf_store = store.clone();
         let bf_notify = backfill_notify.clone();
@@ -2198,6 +2275,33 @@ async fn run_bridge(
             bf_cancel,
             Some(bf_event_tx),
         ));
+    }
+
+    // Spawn embedding-drain worker (M2.3) — independent long-lived task, NOT in run_bot_session.
+    // No embedder configured → don't spawn (M2.3.3 / ADR 0015 B3 "don't spawn" hardening).
+    if let Some(emb) = embedder {
+        let drain_store = store.clone();
+        let drain_notify = embed_notify.clone();
+        let drain_cancel = cancel.clone();
+        let drain_interval = Duration::from_secs(config.embedder_drain_interval_secs);
+        let drain_batch_size = config.embedder_batch_size;
+        let drain_backoff_cap = Duration::from_secs(config.embedder_backoff_cap_secs);
+        let drain_loading_timeout = Duration::from_secs(config.embedder_loading_timeout_secs);
+        let drain_failure_threshold = config.embedder_failure_threshold;
+        tokio::spawn(async move {
+            crate::embed_drain::run_embedding_drain_worker(
+                emb,
+                drain_store,
+                drain_notify,
+                drain_cancel,
+                drain_interval,
+                drain_batch_size,
+                drain_backoff_cap,
+                drain_loading_timeout,
+                drain_failure_threshold,
+            )
+            .await;
+        });
     }
 
     let mut backoff = Duration::from_secs(1);
@@ -2234,6 +2338,7 @@ async fn run_bridge(
             &send_pacer,
             &subscribed_presence,
             &outbound_notify,
+            &embed_notify,
             &event_tx,
             &group_cache,
             &correlator,
@@ -2339,6 +2444,7 @@ async fn run_bot_session(
     send_pacer: &Arc<SendPacer>,
     subscribed_presence: &Arc<DashSet<String>>,
     outbound_notify: &Arc<tokio::sync::Notify>,
+    embed_notify: &Arc<tokio::sync::Notify>,
     event_tx: &tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
     group_cache: &GroupCacheHandle,
     correlator: &Arc<crate::backfill::HistoryCorrelator>,
@@ -2368,6 +2474,7 @@ async fn run_bot_session(
     let metrics_for_events = metrics.clone();
     let msg_cache_for_events = msg_cache.clone();
     let sub_pres_for_events = subscribed_presence.clone();
+    let embed_notify_for_events = embed_notify.clone();
     let event_tx_for_events = event_tx.clone();
     let gc_for_events = group_cache.clone();
     let correlator_for_events = correlator.clone();
@@ -2398,12 +2505,13 @@ async fn run_bot_session(
             let met = metrics_for_events.clone();
             let mc = msg_cache_for_events.clone();
             let spres = sub_pres_for_events.clone();
+            let emb_notify = embed_notify_for_events.clone();
             let etx = event_tx_for_events.clone();
             let gc = gc_for_events.clone();
             let corr = correlator_for_events.clone();
             async move {
                 let event_owned = (*event).clone();
-                handle_event(event_owned, client, &ch, &itx, &stx, &qtx, &store, &sr, &srr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &etx, &gc, &corr)
+                handle_event(event_owned, client, &ch, &itx, &stx, &qtx, &store, &sr, &srr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &emb_notify, &etx, &gc, &corr)
                     .await;
             }
         });
@@ -2536,6 +2644,7 @@ async fn handle_event(
     metrics: &Arc<BridgeMetrics>,
     msg_cache: &MsgCache,
     subscribed_presence: &Arc<DashSet<String>>,
+    embed_notify: &Arc<tokio::sync::Notify>,
     event_tx: &tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
     group_cache: &GroupCacheHandle,
     correlator: &Arc<crate::backfill::HistoryCorrelator>,
@@ -2745,6 +2854,10 @@ async fn handle_event(
                         inbound.content.kind(), body_opt, inbound.timestamp, embed_status,
                     ).await {
                         debug!(error = %e, "failed to insert inbound history (may be duplicate)");
+                    }
+                    // M2.3.2: fire embed_notify when a row lands 'pending' to wake the drain worker.
+                    if embed_status == "pending" {
+                        embed_notify.notify_one();
                     }
 
                     let inbound_arc = Arc::new(inbound.clone());
@@ -4257,15 +4370,18 @@ pub(crate) struct LiveBatchSink {
     /// Small semaphore for the extract pipeline's download slot parameter.
     /// Backfill uses a separate, tighter limit from the live-ingest semaphore.
     dl_semaphore: Semaphore,
+    /// Wakes the embedding-drain worker when a backfilled row lands 'pending' (M2.3.2).
+    embed_notify: Arc<tokio::sync::Notify>,
 }
 
 impl LiveBatchSink {
     pub fn new(
         client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
         store: Store,
+        embed_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
         // Backfill: 2 concurrent download slots (smaller than live's MAX_CONCURRENT_DOWNLOADS=4)
-        Self { client_handle, store, dl_semaphore: Semaphore::new(2) }
+        Self { client_handle, store, dl_semaphore: Semaphore::new(2), embed_notify }
     }
 }
 
@@ -4341,7 +4457,13 @@ impl crate::backfill::BatchSink for LiveBatchSink {
                         )
                         .await
                     {
-                        Ok(()) => inserted += 1,
+                        Ok(()) => {
+                            inserted += 1;
+                            // M2.3.2: fire embed_notify when a backfilled row lands 'pending'.
+                            if embed_status == "pending" {
+                                self.embed_notify.notify_one();
+                            }
+                        }
                         Err(e) => {
                             tracing::debug!(
                                 msg_id,

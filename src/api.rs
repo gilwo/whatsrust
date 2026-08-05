@@ -1039,6 +1039,15 @@ fn enqueue_outcome_to_response(
                 "limit": limit,
             }).to_string())
         }
+        EnqueueOutcome::EmbedderBacklogFull { pending_count } => {
+            json_response(429, &json!({
+                "ok": false,
+                "code": "rate_limited",
+                "status": "embedder_backlog_full",
+                "pending_count": pending_count,
+                "message": "pathological pending embeddings (>100k); wait for drain",
+            }).to_string())
+        }
     }
 }
 
@@ -1112,6 +1121,7 @@ async fn handle_history_fetch_trigger(bridge: &WhatsAppBridge, body: &[u8]) -> V
 
     // Enqueue the job
     let (cooldown_secs, queue_depth, max_messages) = bridge.backfill_config();
+    let active_model_id = bridge.active_model_id();
     let outcome = match store.enqueue_backfill_job(
         &chat_jid,
         &mode,
@@ -1119,6 +1129,7 @@ async fn handle_history_fetch_trigger(bridge: &WhatsAppBridge, body: &[u8]) -> V
         cooldown_secs,
         queue_depth,
         max_messages,
+        active_model_id.as_deref(),
     ).await {
         Ok(o) => o,
         Err(e) => return json_err(500, &format!("storage error: {e}")),

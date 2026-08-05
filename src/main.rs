@@ -10,9 +10,10 @@
 
 mod api;
 mod backfill;
-mod bridge;
 mod bridge_events;
 mod dedup;
+mod embed_drain;
+mod embedder;
 mod instance_lock;
 mod media_utils;
 mod outbound;
@@ -20,6 +21,7 @@ mod polls;
 pub mod qr;
 mod read_receipts;
 mod storage;
+mod bridge;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -301,6 +303,13 @@ async fn async_main() -> Result<()> {
     let backfill_cooldown_secs: i64 = parse_env_or("WHATSRUST_BACKFILL_COOLDOWN_SECS", bf_default.backfill_cooldown_secs);
     let backfill_queue_depth: i64 = parse_env_or("WHATSRUST_BACKFILL_QUEUE_DEPTH", bf_default.backfill_queue_depth);
 
+    // --- Embedder drain worker knobs (M2.3 / ADR 0015/0038) — unguarded (local compute, no ban risk) ---
+    let embedder_drain_interval_secs: u64 = parse_env_or("WHATSRUST_EMBEDDER_DRAIN_INTERVAL_SECS", bf_default.embedder_drain_interval_secs);
+    let embedder_batch_size: usize = parse_env_or("WHATSRUST_EMBEDDER_BATCH_SIZE", bf_default.embedder_batch_size);
+    let embedder_backoff_cap_secs: u64 = parse_env_or("WHATSRUST_EMBEDDER_BACKOFF_CAP_SECS", bf_default.embedder_backoff_cap_secs);
+    let embedder_loading_timeout_secs: u64 = parse_env_or("WHATSRUST_EMBEDDER_LOADING_TIMEOUT_SECS", bf_default.embedder_loading_timeout_secs);
+    let embedder_failure_threshold: u32 = parse_env_or("WHATSRUST_EMBEDDER_FAILURE_THRESHOLD", bf_default.embedder_failure_threshold);
+
     // --- Fail-closed safety validation (ADR 0022) — MUST run before bridge construction ---
     let safety = BackfillSafety {
         interval_secs: backfill_interval_secs,
@@ -348,6 +357,11 @@ async fn async_main() -> Result<()> {
         backfill_jitter_frac,
         backfill_cooldown_secs,
         backfill_queue_depth,
+        embedder_drain_interval_secs,
+        embedder_batch_size,
+        embedder_backoff_cap_secs,
+        embedder_loading_timeout_secs,
+        embedder_failure_threshold,
         ..Default::default()
     };
 

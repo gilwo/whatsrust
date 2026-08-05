@@ -1551,7 +1551,7 @@ mod tests {
     async fn enqueue_and_claim(store: &Store, chat_jid: &str, kind: &str, value: Option<i64>)
         -> crate::storage::BackfillJobRow
     {
-        let outcome = store.enqueue_backfill_job(chat_jid, kind, value, 0, 0, 0).await.unwrap();
+        let outcome = store.enqueue_backfill_job(chat_jid, kind, value, 0, 0, 0, None).await.unwrap();
         let _job_id = match outcome {
             EnqueueOutcome::Accepted { job_id, .. } => job_id,
             other => panic!("expected Accepted, got {:?}", other),
@@ -1993,7 +1993,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Enqueue a job BEFORE starting the loop
-        store.enqueue_backfill_job("driver-chat@s.whatsapp.net", "all", None, 0, 0, 0)
+        store.enqueue_backfill_job("driver-chat@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await.unwrap();
 
         let store2 = store.clone();
@@ -2058,7 +2058,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel2 = cancel.clone();
 
-        store.enqueue_backfill_job("shutdown-chat@g.us", "all", None, 0, 0, 0).await.unwrap();
+        store.enqueue_backfill_job("shutdown-chat@g.us", "all", None, 0, 0, 0, None).await.unwrap();
 
         let store2 = store.clone();
         let notify2 = notify.clone();
@@ -2190,7 +2190,7 @@ mod tests {
         let (store, dir) = open_b1_store("cancel-guard");
 
         // Enqueue and claim a job, then manually set it to 'cancelled'
-        let outcome = store.enqueue_backfill_job("guard-chat@s.whatsapp.net", "all", None, 0, 0, 0)
+        let outcome = store.enqueue_backfill_job("guard-chat@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await.unwrap();
         let job_id = match outcome {
             EnqueueOutcome::Accepted { job_id, .. } => job_id,
@@ -2343,7 +2343,7 @@ mod tests {
         let (store, dir) = open_b1_store("atomic-progress");
 
         // Enqueue a job so we have a valid job_id
-        let outcome = store.enqueue_backfill_job("atomic-chat@s.whatsapp.net", "all", None, 0, 0, 0)
+        let outcome = store.enqueue_backfill_job("atomic-chat@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await.unwrap();
         let job_id = match outcome {
             EnqueueOutcome::Accepted { job_id, .. } => job_id,
@@ -2791,7 +2791,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Enqueue a job
-        store.enqueue_backfill_job("gate-driver@s.whatsapp.net", "all", None, 0, 0, 0)
+        store.enqueue_backfill_job("gate-driver@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await.unwrap();
 
         let store2 = store.clone();
@@ -2886,7 +2886,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Enqueue a job
-        let outcome = store.enqueue_backfill_job("deferred-driver@s.whatsapp.net", "all", None, 0, 0, 0)
+        let outcome = store.enqueue_backfill_job("deferred-driver@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await.unwrap();
         let job_id = match outcome {
             EnqueueOutcome::Accepted { job_id, .. } => job_id,
@@ -3044,7 +3044,7 @@ mod tests {
         // Set up an event channel to capture SSE events
         let (tx, mut rx) = crate::bridge_events::new_event_bus();
 
-        store.enqueue_backfill_job("fix1-chat@s.whatsapp.net", "all", None, 0, 0, 0)
+        store.enqueue_backfill_job("fix1-chat@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await.unwrap();
 
         let store2 = store.clone();
