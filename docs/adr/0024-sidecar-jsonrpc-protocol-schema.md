@@ -69,3 +69,12 @@ Batch embed request. Response vectors in input order.
 
 **Hardening (2026-06-24, v2 review):**
 - **Loading timeout (B4):** Bridge tracks time-in-loading state; >60s (configurable) continuous loading → treat as error → FTS5 fallback (rows stay pending). >60s model load = misconfig. See ADR 0015.
+
+## Symmetric-protocol constraint (2026-08-30, see ADR 0039)
+
+`embed {texts[]}` is **symmetric**: whatsrust embeds the search *query* with the same call the drain
+worker uses for *documents* — the sidecar cannot distinguish query from passage. Models that require
+asymmetric `"query:"`/`"passage:"` prefixes (the **e5** family) therefore cannot be used correctly
+under this protocol. Only **prefix-free** models are supported for now (MiniLM, bge-m3 — see ADR 0039).
+Adding a query/passage hint to `embed` (or a separate `embed_query` method) is a **future extension**
+required before an e5-class model could be adopted; it also relates to M2.6.7's reconciliation work.
