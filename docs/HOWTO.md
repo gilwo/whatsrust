@@ -197,6 +197,9 @@ whatsrust fetch-status 42
 # Cancel a running backfill job
 whatsrust fetch-cancel 42
 
+# Purge embeddings for a specific model (reclaim disk space)
+whatsrust purge-embeddings paraphrase-multilingual-MiniLM-L12-v2
+
 # Groups
 whatsrust groups
 whatsrust group-info 120363012345678901@g.us
@@ -247,15 +250,76 @@ Cursor, etc.) over JSON-RPC/stdio.
    ```
    Adjust the `command` path to your built binary (debug or release) and add
    any `env` vars you need (e.g. `WHATSRUST_PORT` if not using the default).
-3. 33 tools are exposed (send, reply, react, groups, chat management,
+3. 35 tools are exposed (send, reply, react, groups, chat management,
    status/stories, `whatsrust_search`, `whatsrust_fetch_history`,
-   `whatsrust_fetch_status`, `whatsrust_fetch_cancel`, etc.) — see `README.md`
-   § "MCP server for AI agents" for the full narrative list.
+   `whatsrust_fetch_status`, `whatsrust_fetch_cancel`,
+   `whatsrust_purge_embeddings`, etc.) — see `README.md` § "MCP server
+   for AI agents" for the full narrative list.
 
 **Verification:** the daemon's `/api/status` responding (§3) implies MCP tool
 calls will succeed, since MCP mode has no state of its own beyond the proxy —
 a failed daemon connection surfaces as a tool-call error identical to the
 CLI's connection-refused message in §3.
+
+---
+
+## 5a. Embedder sidecar (optional semantic search)
+
+**Goal:** enable semantic (embedding-based) search on top of the always-on
+FTS5 lexical search. Opt-in via environment variables; gracefully degrades to
+lexical when absent or down.
+
+**Background:** whatsrust ships with FTS5 lexical search (M1, DONE). Semantic
+search (M2.1–M2.5, code-complete; M2.6 + E2E validation pending) layers on top
+via a stateless embedder sidecar (a separate process that embeds text on
+demand). When configured, the bridge embeds the query, recalls FTS candidates,
+reranks by cosine similarity, and appends an additive lexical fallback. When
+the sidecar is absent or down, search is byte-identical to M1 lexical (no
+errors, no blocking).
+
+**Steps:**
+1. Set the embedder command in `.env` (or export directly). `WHATSRUST_EMBEDDER_CMD`
+   is a single executable path; the script path goes in `WHATSRUST_EMBEDDER_ARGS`
+   (whitespace-split into args). There is **no** model-ID env var — the model ID is
+   reported by the sidecar itself via its `model_info` response.
+   ```bash
+   WHATSRUST_EMBEDDER_CMD=".venv-embedder/bin/python3"
+   WHATSRUST_EMBEDDER_ARGS="scripts/embedder-sidecar.py"
+   ```
+   The MVP sidecar (`scripts/embedder-sidecar.py`) requires Python 3.8+ and
+   `sentence-transformers` (`pip install sentence-transformers`, ideally into the
+   `.venv-embedder` venv). The default model (`paraphrase-multilingual-MiniLM-L12-v2`,
+   384-dim, prefix-free) is downloaded on first run (~420 MB) to `~/.cache/huggingface`.
+2. (Recommended) A convenience wrapper `scripts/run-embedder.sh` exists; it `cd`s to
+   the repo root and execs the `.venv-embedder` Python on the sidecar script. To use
+   it, set `WHATSRUST_EMBEDDER_CMD="./scripts/run-embedder.sh"` (no `WHATSRUST_EMBEDDER_ARGS`
+   needed).
+3. Start the daemon as usual (§3). The embedding-drain worker spawns
+   automatically and begins processing `embed_status='pending'` rows in the
+   background (default: 60s interval, 64 msgs/batch). No action required;
+   watch the logs for `embedding-drain` activity.
+4. Search as usual (`whatsrust search "query text"`, or via API/MCP). When
+   embeddings exist for the query and recalled messages, results are reranked
+   by semantic similarity; otherwise falls back to FTS5 lexical.
+
+**Purging embeddings (model switch / disk reclaim):**
+```bash
+# Remove all embeddings for a specific model ID and reclaim disk space
+whatsrust purge-embeddings paraphrase-multilingual-MiniLM-L12-v2
+# Returns: {"ok": true, "model_id": "...", "rows_deleted": N, "bytes_reclaimed": B}
+```
+Per-model purge allows switching embedding models without losing lexical search
+or requiring a schema migration. The drain worker will re-embed pending rows
+for the new active model.
+
+**Verification:** with the sidecar configured, trigger a search and check the
+daemon logs for `sidecar embed` calls. Without the sidecar (or with an invalid
+`WHATSRUST_EMBEDDER_CMD`), search still works (pure lexical) and the logs show
+`no embedder configured` or a sidecar-down warning.
+
+**Note:** End-to-end validation of the semantic search path against a live
+daemon is pending (M2.6). The code is complete but not yet live-tested in a
+real-world scenario. Use at your own risk; report issues to the repo.
 
 ---
 
