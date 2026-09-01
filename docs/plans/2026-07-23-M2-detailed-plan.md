@@ -445,6 +445,16 @@ with a byte-count receipt.
 explicitly reclaim space per-model via API/MCP/CLI with a byte-count receipt; purge is never
 triggered automatically.
 
+> **DONE (2026-09-01).** `Store::purge_embeddings` (single `DELETE FROM embeddings WHERE model_id`
+> call site + bounded `incremental_vacuum` loop + measured before/after footprint), `WhatsAppBridge::purge_embeddings`
+> (WARN when not INCREMENTAL), `POST /api/embeddings/purge`, MCP `whatsrust_purge_embeddings`, CLI
+> `purge-embeddings <model_id>` — all return `{model_id, rows_deleted, bytes_reclaimed}`. Schema stays v8.
+> Tests 2.5.1/2.5.2a-d/2.5.3 (311 lib / 324 bin, green). **Bonus finding folded in:** a pre-existing
+> pragma-ordering bug made `incremental_vacuum` a silent no-op on ALL DBs (WAL was set before
+> auto_vacuum); fixed by ordering `auto_vacuum=INCREMENTAL` first — see ADR 0017 "M2.5 correction".
+> New DBs now reclaim; pre-existing (lineage-v0) DBs stay NONE and report an honest `bytes_reclaimed=0`
+> + WARN. `--vacuum-once` remedy deferred (document-only path chosen). M2.6.7 (inert 2.3.6 semantics) still open.
+
 ---
 
 ## M2.6 — Config, integration test, wiring  [ADR 0023/0024/0025]
