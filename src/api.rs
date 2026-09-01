@@ -435,6 +435,7 @@ async fn handle_status(bridge: &WhatsAppBridge) -> Vec<u8> {
     let state = bridge.state();
     let m = bridge.metrics();
     let queue = bridge.queue_depth().await;
+    let embeddings = bridge.embedding_status_counts().await;
     json_ok(json!({
         "state": format!("{:?}", state),
         "connected": state == BridgeState::Connected,
@@ -447,6 +448,7 @@ async fn handle_status(bridge: &WhatsAppBridge) -> Vec<u8> {
         "last_disconnect_epoch": m.last_disconnect_epoch.load(Ordering::Relaxed),
         "last_inbound_epoch": m.last_inbound_epoch.load(Ordering::Relaxed),
         "last_outbound_epoch": m.last_outbound_epoch.load(Ordering::Relaxed),
+        "embeddings": embeddings,
     }))
 }
 
