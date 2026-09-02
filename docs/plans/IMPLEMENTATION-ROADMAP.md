@@ -1,7 +1,7 @@
 # Implementation Roadmap — Historical Fetch + Semantic/Lexical Search
 
 **Date:** 2026-06-25 (updated 2026-09-01)
-**Status:** **Phase 0 GATE PASSED — GO** (2026-07-01, commit 615d185). **M1 COMPLETE (2026-07-20)** — M1.1/M1.2/M1.3/M1.4 all DONE and the live E2E smoke test passed on a real account (API/CLI/MCP trigger, SSE `backfill` + `storage_alert`, FTS search, cancel→404). **M2 (semantic search) M2.1–M2.5 CODE-COMPLETE (2026-08-31)** — embedder sidecar contract, drain worker, cosine rerank, multi-model purge. MVP Python sidecar built. **M2.6 (config wiring + integration tests) and end-to-end validation PENDING.**
+**Status:** **Phase 0 GATE PASSED — GO** (2026-07-01, commit 615d185). **M1 COMPLETE (2026-07-20)** — M1.1/M1.2/M1.3/M1.4 all DONE and the live E2E smoke test passed on a real account (API/CLI/MCP trigger, SSE `backfill` + `storage_alert`, FTS search, cancel→404). **M2 (semantic search) M2.1–M2.6 CODE-COMPLETE (2026-09-02)** — embedder sidecar contract, drain worker, cosine rerank, multi-model purge, config-wiring/misbehave tests + observability. MVP Python sidecar built. **Only remaining M2 item: live end-to-end validation against a running daemon (hands-on, not automatable).**
 **Design:** `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (3 cold reviews, converged, implementation-ready)
 **Why this is a skeleton:** Phase 0 is a hard GO/NO-GO gate (the wa-rs v0.6.0 dependency adoption). We do not write detailed phase/task plans behind an unvalidated gate — a NO-GO or a fallback-triggering result reshapes everything. Only Phase 0 is planned in detail below; M1/M2 phase detail is deferred to their starts.
 
@@ -83,7 +83,7 @@ The entire feature is conditional on this. **No rebase, no fork, no clone** — 
 
 ---
 
-## Milestone 2 — Semantic search  (M2.1–M2.5 CODE-COMPLETE 2026-08-31, M2.6 + E2E PENDING)
+## Milestone 2 — Semantic search  (M2.1–M2.6 CODE-COMPLETE 2026-09-02; live E2E validation PENDING)
 
 **Goal:** optional semantic search via the embedder sidecar, layered on M1's stored messages.
 
@@ -94,7 +94,7 @@ The entire feature is conditional on this. **No rebase, no fork, no clone** — 
 - ✅ **M2.4 Semantic search path — DONE.** `WhatsAppBridge::search`: embed query → FTS recall (width = max of 200 and limit) → fetch vectors by `(message_id, active_model_id)` → cosine rerank (Rust-side `cosine_similarity()`) → additive lexical fallback (byte-identical to M1 when sidecar absent/down). [ADR 0007/0008/0017/0018]
 - ✅ **M2.5 Multi-model retention & explicit purge — DONE.** `embeddings` PK `(message_id, model_id)` supports model switch without purge; `Store::purge_embeddings(model_id)` deletes one model's rows + `incremental_vacuum`; surfaces: API `POST /api/embeddings/purge`, MCP `whatsrust_purge_embeddings` (35 tools total), CLI `purge-embeddings <model_id>`. Returns `{model_id, rows_deleted, bytes_reclaimed}`. [ADR 0017]
 - ✅ **MVP sidecar BUILT (2026-08-31).** `scripts/embedder-sidecar.py` (Python + sentence-transformers, `paraphrase-multilingual-MiniLM-L12-v2`, 384-dim, prefix-free, multilingual) + `scripts/run-embedder.sh` convenience wrapper. [ADR 0039]
-- [ ] **M2.6 Config, integration test, wiring — PENDING.** Full `.env` / `BridgeConfig` wiring, fake-embedder round-trip integration tests, end-to-end validation against a live daemon. [ADR 0023/0024/0025]
+- ✅ **M2.6 Config, integration test, wiring — DONE (2026-09-02).** Embedder knobs plumbed through `.env`/`BridgeConfig` with config tests (override + absent-is-benign); `.env.example` completed (FAILURE_THRESHOLD); fake-embedder misbehave mode + real-subprocess trust-but-verify integration tests (wrong dim/count/model_id rejected over the process boundary, CI-safe); additive `/api/status` embed-status counts (watchdog already covers footprint); stale multi-worker-backfill comments reworded; inert per-row-rejection semantics reconciled in ADR 0015/0038 (path a — cap-3 dormant pending a protocol signal). **Remaining M2 item: live end-to-end validation against a running daemon with real data (hands-on, not automatable).** [ADR 0023/0024/0025]
 
 **M2 exit criteria (milestone-level):**
 - ✅ With a sidecar configured, semantic search returns relevant results; without one, search cleanly falls back to M1 lexical (no errors, no blocking). — **CODE-COMPLETE, E2E validation pending.**
