@@ -309,18 +309,30 @@ impl StdioEmbedder {
     /// construction-time `model_info` round trip is bounded by
     /// `MODEL_INFO_TIMEOUT` so a stuck sidecar can never block startup.
     pub async fn spawn(cmd: &str, args: &[String]) -> anyhow::Result<Self> {
-        Self::spawn_with(cmd, args, MODEL_INFO_TIMEOUT, DEFAULT_MAX_LINE_BYTES).await
+        Self::spawn_with(cmd, args, &[], MODEL_INFO_TIMEOUT, DEFAULT_MAX_LINE_BYTES).await
+    }
+
+    /// Spawn with custom environment variables (M2.6.4 misbehave testing).
+    #[cfg(feature = "fake-embedder")]
+    pub async fn spawn_with_env(
+        cmd: &str,
+        args: &[String],
+        env_vars: &[(&str, &str)],
+    ) -> anyhow::Result<Self> {
+        Self::spawn_with(cmd, args, env_vars, MODEL_INFO_TIMEOUT, DEFAULT_MAX_LINE_BYTES).await
     }
 
     async fn spawn_with(
         cmd: &str,
         args: &[String],
+        env_vars: &[(&str, &str)],
         model_info_timeout: Duration,
         max_line_bytes: usize,
     ) -> anyhow::Result<Self> {
         let mut command = Command::new(cmd);
         command
             .args(args)
+            .envs(env_vars.iter().map(|(k, v)| (*k, *v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -863,6 +875,84 @@ mod tests {
         assert!(
             !alive,
             "child process {pid} should be reaped after StdioEmbedder is dropped (kill_on_drop)"
+        );
+    }
+
+    // --- M2.6.4: misbehave mode validation (real subprocess, trust-but-verify) ---
+
+    #[cfg(feature = "fake-embedder")]
+    #[tokio::test]
+    async fn test_stdio_embedder_misbehave_wrong_dim_rejected() {
+        let bin = fake_embedder_bin_path();
+        // Spawn with FAKE_EMBEDDER_MISBEHAVE=wrong_dim
+        let embedder = StdioEmbedder::spawn_with_env(
+            bin.to_str().unwrap(),
+            &[],
+            &[("FAKE_EMBEDDER_MISBEHAVE", "wrong_dim")],
+        )
+        .await
+        .expect("spawn fake-embedder with misbehave mode");
+
+        let texts = vec!["test".to_string()];
+        let result = embedder.embed(&texts).await;
+        assert!(
+            result.is_err(),
+            "embed should fail when sidecar returns wrong dimension (trust-but-verify)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("length") || err.to_string().contains("dim"),
+            "error should mention dimension-related mismatch: {err}"
+        );
+    }
+
+    #[cfg(feature = "fake-embedder")]
+    #[tokio::test]
+    async fn test_stdio_embedder_misbehave_wrong_count_rejected() {
+        let bin = fake_embedder_bin_path();
+        let embedder = StdioEmbedder::spawn_with_env(
+            bin.to_str().unwrap(),
+            &[],
+            &[("FAKE_EMBEDDER_MISBEHAVE", "wrong_count")],
+        )
+        .await
+        .expect("spawn fake-embedder with misbehave mode");
+
+        let texts = vec!["a".to_string(), "b".to_string()];
+        let result = embedder.embed(&texts).await;
+        assert!(
+            result.is_err(),
+            "embed should fail when sidecar returns wrong count (trust-but-verify)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("count"),
+            "error should mention count mismatch: {err}"
+        );
+    }
+
+    #[cfg(feature = "fake-embedder")]
+    #[tokio::test]
+    async fn test_stdio_embedder_misbehave_wrong_model_id_rejected() {
+        let bin = fake_embedder_bin_path();
+        let embedder = StdioEmbedder::spawn_with_env(
+            bin.to_str().unwrap(),
+            &[],
+            &[("FAKE_EMBEDDER_MISBEHAVE", "wrong_model_id")],
+        )
+        .await
+        .expect("spawn fake-embedder with misbehave mode");
+
+        let texts = vec!["test".to_string()];
+        let result = embedder.embed(&texts).await;
+        assert!(
+            result.is_err(),
+            "embed should fail when sidecar returns wrong model_id (trust-but-verify)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("model_id"),
+            "error should mention model_id mismatch: {err}"
         );
     }
 

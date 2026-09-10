@@ -1848,6 +1848,28 @@ impl Store {
         .await
     }
 
+    /// Get counts by embed_status for observability (M2.6.5).
+    /// Returns a HashMap keyed by status ('pending', 'embedded', 'failed', 'skipped')
+    /// with the count of messages in each state. Statuses with zero rows are omitted.
+    pub async fn embedding_status_counts(&self) -> Result<std::collections::HashMap<String, i64>> {
+        self.run(|c| {
+            let mut stmt = c
+                .prepare("SELECT embed_status, COUNT(*) FROM messages GROUP BY embed_status")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                .map_err(db_err)?;
+
+            let mut counts = std::collections::HashMap::new();
+            for row_result in rows {
+                let (status, count) = row_result.map_err(db_err)?;
+                counts.insert(status, count);
+            }
+            Ok(counts)
+        })
+        .await
+    }
+
     // -----------------------------------------------------------------------
     // Backup — timestamped snapshots with rotation
     // -----------------------------------------------------------------------
@@ -6406,6 +6428,57 @@ mod tests {
             cli_command_block.contains("model_id"),
             "CLI should send model_id in payload"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M2.6.5: Test embedding_status_counts storage method.
+    #[tokio::test]
+    async fn test_embedding_status_counts() {
+        let dir = std::env::temp_dir().join(format!("test_embed_status_counts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).unwrap();
+
+        // Insert messages with varied embed_status
+        store
+            .run(|c| {
+                c.execute(
+                    "INSERT INTO messages (message_id, chat_jid, sender_jid, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
+                     VALUES (?1, 'chat1@s.whatsapp.net', 'sender1@s.whatsapp.net', 'text', 'hello', 1000, 1000, 0, 'live', 'pending')",
+                    params!["msg1"],
+                )
+                .map_err(db_err)?;
+                c.execute(
+                    "INSERT INTO messages (message_id, chat_jid, sender_jid, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
+                     VALUES (?1, 'chat1@s.whatsapp.net', 'sender1@s.whatsapp.net', 'text', 'world', 2000, 2000, 0, 'live', 'pending')",
+                    params!["msg2"],
+                )
+                .map_err(db_err)?;
+                c.execute(
+                    "INSERT INTO messages (message_id, chat_jid, sender_jid, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
+                     VALUES (?1, 'chat1@s.whatsapp.net', 'sender1@s.whatsapp.net', 'text', 'test', 3000, 3000, 0, 'live', 'skipped')",
+                    params!["msg3"],
+                )
+                .map_err(db_err)?;
+                c.execute(
+                    "INSERT INTO messages (message_id, chat_jid, sender_jid, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
+                     VALUES (?1, 'chat1@s.whatsapp.net', 'sender1@s.whatsapp.net', 'text', 'failed', 4000, 4000, 0, 'live', 'failed')",
+                    params!["msg4"],
+                )
+                .map_err(db_err)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let counts = store.embedding_status_counts().await.unwrap();
+
+        assert_eq!(counts.get("pending"), Some(&2), "should have 2 pending rows");
+        assert_eq!(counts.get("skipped"), Some(&1), "should have 1 skipped row");
+        assert_eq!(counts.get("failed"), Some(&1), "should have 1 failed row");
+        assert_eq!(counts.get("embedded"), None, "should have no embedded rows (omitted from map)");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

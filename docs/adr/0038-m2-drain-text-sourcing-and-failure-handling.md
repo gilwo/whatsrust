@@ -32,6 +32,15 @@ livelock a deterministic oldest-first drain.
    handful of wasted sidecar calls, never data loss; the terminal `failed` write is durable once
    reached). Entries are evicted once a row reaches terminal `failed`. Promotable to a durable table
    later if measured (additive, lossless — message text is the retained source of truth).
+   
+   **v1 accepted behavior (M2.3 code-review C1, reconciled M2.6.7):** The batch-only `embed` protocol
+   (ADR 0024) cannot distinguish a per-item content rejection from a transport failure when a
+   solo-batch fails. Per ADR 0015's safe-default principle, solo-batch failures are treated as
+   transport (row stays `pending`, no increment) — the cap-3 mechanism is **dormant scaffolding** in
+   v1. A genuinely-unembeddable row stays `pending` indefinitely (bisection isolates it, but never
+   wrongly marks it `failed` during a sidecar outage). FTS5 lexical search is unaffected. Activating
+   cap-3 requires adding a positive per-item rejection signal to ADR 0024 (e.g. `rejected_indices`
+   array in the `embed` response) — deferred.
 
 2. **Kind-gated drain text preparation (Option C).** The drain query selects `(content_kind,
    body_text)` and the worker branches by kind to derive the text to embed — **never a blind
@@ -60,9 +69,11 @@ livelock a deterministic oldest-first drain.
 
 4. **Poison-pill batch bisection.** Because the protocol is batch-only, on K consecutive
    whole-batch failures of the *same* message-id set the worker halves the batch, converging to
-   solo-batches so the per-row cap-3 (decision 1) can actually engage and retire the offending row
-   to `failed` — draining the innocent rows meanwhile. Pure whatsrust-side retry logic; no ADR 0024
-   protocol change.
+   solo-batches — draining the innocent rows meanwhile. Pure whatsrust-side retry logic; no ADR 0024
+   protocol change. **v1 note (M2.6.7):** per decision 1's accepted behavior, the offending row is
+   isolated to `pending` (never wrongly `failed` during a sidecar outage), but a genuinely-unembeddable
+   row also stays `pending` indefinitely in v1 (the cap-3 mechanism is dormant). FTS5 lexical search
+   is unaffected.
 
 ## Consequences
 
