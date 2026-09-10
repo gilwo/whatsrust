@@ -451,14 +451,63 @@ impl Embedder for StdioEmbedder {
 /// process, no I/O. `embed` returns canned vectors (`vec![0.1 * (i+1); dim]` per
 /// input, 1-indexed) so higher-level worker/search tests (M2.3/M2.4) can assert
 /// exact output without depending on a real ML model or sidecar process.
+///
+/// Extended with failure-injection modes for Wave A drain-worker integration tests:
+///   - `always_fail` — all `embed()` calls return `Err` (transport failure)
+///   - `reject_text` — reject a specific text content (per-row rejection)
+///   - `health_override` — override the health status (e.g. `Loading`)
+///   - `max_batch` / `max_input_tokens` — advertise limits to test clamping
 pub struct FakeEmbedder {
     model_id: String,
     dim: usize,
+    max_batch: Option<usize>,
+    max_input_tokens: Option<usize>,
+    always_fail: bool,
+    reject_text: Option<String>,
+    health_override: Option<HealthStatus>,
 }
 
 impl FakeEmbedder {
     pub fn new(model_id: impl Into<String>, dim: usize) -> Self {
-        Self { model_id: model_id.into(), dim }
+        Self {
+            model_id: model_id.into(),
+            dim,
+            max_batch: None,
+            max_input_tokens: None,
+            always_fail: false,
+            reject_text: None,
+            health_override: None,
+        }
+    }
+
+    /// Configure `max_batch` limit (for testing batch-size clamping).
+    pub fn with_max_batch(mut self, max_batch: usize) -> Self {
+        self.max_batch = Some(max_batch);
+        self
+    }
+
+    /// Configure `max_input_tokens` limit.
+    pub fn with_max_input_tokens(mut self, max_tokens: usize) -> Self {
+        self.max_input_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Always return transport failure on `embed()` calls.
+    pub fn always_fail(mut self) -> Self {
+        self.always_fail = true;
+        self
+    }
+
+    /// Reject a specific text (by exact match) — returns `Err` when the text is in the batch.
+    pub fn reject_text(mut self, text: impl Into<String>) -> Self {
+        self.reject_text = Some(text.into());
+        self
+    }
+
+    /// Override health status (e.g. report `Loading` continuously for timeout tests).
+    pub fn with_health(mut self, status: HealthStatus) -> Self {
+        self.health_override = Some(status);
+        self
     }
 }
 
@@ -468,12 +517,20 @@ impl Embedder for FakeEmbedder {
         ModelInfo {
             model_id: self.model_id.clone(),
             dim: self.dim,
-            max_batch: None,
-            max_input_tokens: None,
+            max_batch: self.max_batch,
+            max_input_tokens: self.max_input_tokens,
         }
     }
 
     async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        if self.always_fail {
+            anyhow::bail!("fake embedder: always_fail mode");
+        }
+        if let Some(ref reject) = self.reject_text {
+            if texts.iter().any(|t| t == reject) {
+                anyhow::bail!("fake embedder: rejected text '{}'", reject);
+            }
+        }
         Ok(texts
             .iter()
             .enumerate()
@@ -482,7 +539,7 @@ impl Embedder for FakeEmbedder {
     }
 
     async fn health(&self) -> HealthStatus {
-        HealthStatus::Ok
+        self.health_override.clone().unwrap_or(HealthStatus::Ok)
     }
 }
 

@@ -1,8 +1,8 @@
 pub mod api;
 pub mod backfill;
-pub mod bridge;
 pub mod bridge_events;
 pub mod dedup;
+pub mod embed_drain;
 pub mod embedder;
 pub mod instance_lock;
 pub mod mcp;
@@ -12,3 +12,4 @@ pub mod polls;
 pub mod qr;
 pub mod read_receipts;
 pub mod storage;
+pub mod bridge;
