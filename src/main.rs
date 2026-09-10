@@ -1780,6 +1780,13 @@ async fn cli_main(args: &[String]) -> Result<()> {
             print_json_result(status, &resp)?;
             Ok(())
         }
+        "purge-embeddings" => {
+            require_args(args, 2, "purge-embeddings <model_id>")?;
+            let payload = json!({"model_id": args[1]});
+            let (status, resp) = api::cli_post(port, "/api/embeddings/purge", &payload.to_string()).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
         "status-text" => {
             require_args(args, 3, "status-text <recipients> <text>")?;
             let body = json!({

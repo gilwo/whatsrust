@@ -919,6 +919,8 @@ pub struct WhatsAppBridge {
     /// Single shared embedder instance (M2.3.10 / ADR 0038). `None` when unconfigured or construction failed.
     /// Shared via mutex so `active_model_id()` can access it after `run_bridge` constructs it.
     embedder: Arc<ParkingMutex<Option<Arc<dyn crate::embedder::Embedder>>>>,
+    /// Database path, used by purge_embeddings and the watchdog (M2.5).
+    db_path: PathBuf,
 }
 
 impl WhatsAppBridge {
@@ -953,6 +955,7 @@ impl WhatsAppBridge {
         let backfill_cooldown_secs = config.backfill_cooldown_secs;
         let backfill_queue_depth = config.backfill_queue_depth;
         let backfill_max_messages = config.backfill_max_messages;
+        let db_path = config.db_path.clone();
 
         let cancel_clone = cancel.clone();
         let ch = client_handle.clone();
@@ -996,6 +999,7 @@ impl WhatsAppBridge {
             backfill_queue_depth,
             backfill_max_messages,
             embedder: embedder_handle, // Populated in run_bridge (async context)
+            db_path,
         }
     }
 
@@ -1512,6 +1516,33 @@ impl WhatsAppBridge {
         let mut result: Vec<crate::storage::InboundRow> = scored.into_iter().map(|(r, _)| r).collect();
         result.extend(unvectored);
         result.truncate(limit as usize);
+
+        Ok(result)
+    }
+
+    /// Purge all embeddings for a given model and reclaim disk space (M2.5.2).
+    ///
+    /// Delegates to `store.purge_embeddings`, which deletes all `embeddings` rows for the
+    /// given `model_id` and runs a bounded `PRAGMA incremental_vacuum` loop. Returns
+    /// `{model_id, rows_deleted, bytes_reclaimed}`. If the DB's `auto_vacuum` is not
+    /// INCREMENTAL (the case for DBs where tables existed before the pragma was set),
+    /// space reclamation is a permanent no-op — this method emits a `tracing::warn!` in
+    /// that case so the operator is informed.
+    ///
+    /// Per ADR 0017: purge is explicit (never automatic) and losslessly reapplicable.
+    pub async fn purge_embeddings(&self, model_id: &str) -> anyhow::Result<crate::storage::PurgeEmbeddingsResult> {
+        let result = self.store.purge_embeddings(model_id, &self.db_path).await?;
+
+        if !result.auto_vacuum_incremental {
+            tracing::warn!(
+                model_id = %model_id,
+                rows_deleted = result.rows_deleted,
+                "purge_embeddings: space reclamation is a no-op on this DB (auto_vacuum is not INCREMENTAL). \
+                 This happens when tables existed before the pragma was set (lineage v0 DBs). \
+                 The rows are deleted, but disk space is not reclaimed. \
+                 A one-time full VACUUM (locking) is the only way to reclaim space on such DBs."
+            );
+        }
 
         Ok(result)
     }
@@ -4614,6 +4645,63 @@ impl crate::backfill::BatchSink for LiveBatchSink {
 // Tests
 // ---------------------------------------------------------------------------
 
+// Test helper: build a minimal test bridge with an embedder.
+// Marked cfg(test) but pub(crate) so it's accessible from other test modules.
+#[cfg(test)]
+pub(crate) async fn build_test_bridge_with_embedder(
+    db_path: &std::path::Path,
+    embedder: impl crate::embedder::Embedder + 'static,
+) -> WhatsAppBridge {
+    use crate::storage::Store;
+    use parking_lot::Mutex as ParkingMutex;
+    use std::sync::Arc;
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+
+    let cancel = CancellationToken::new();
+    let (_state_tx, state_rx) = watch::channel(BridgeState::Disconnected);
+    let (_qr_tx, qr_rx) = watch::channel::<Option<String>>(None);
+    let outbound_notify = Arc::new(tokio::sync::Notify::new());
+    let backfill_notify = Arc::new(tokio::sync::Notify::new());
+    let embed_notify = Arc::new(tokio::sync::Notify::new());
+    let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> =
+        Arc::new(ParkingMutex::new(None));
+    let rr_tx = spawn_scheduler(None, 200);
+    let msg_cache: MsgCache = Arc::new(ParkingMutex::new(BoundedMsgCache::new(128)));
+    let send_pacer = Arc::new(SendPacer::with_burst(0, 1));
+    let subscribed_presence: Arc<DashSet<String>> = Arc::new(DashSet::new());
+    let group_cache: GroupCacheHandle = Arc::new(ParkingMutex::new(GroupCache::new()));
+    let (event_tx, _event_rx) = crate::bridge_events::new_event_bus();
+    let store = Store::new(&db_path).expect("failed to open test DB");
+    let metrics = Arc::new(BridgeMetrics::new());
+    let embedder_handle = Arc::new(ParkingMutex::new(Some(
+        Arc::new(embedder) as Arc<dyn crate::embedder::Embedder>
+    )));
+
+    WhatsAppBridge {
+        outbound_notify,
+        backfill_notify,
+        embed_notify,
+        state_rx,
+        qr_rx,
+        cancel,
+        client_handle,
+        rr_tx,
+        msg_cache,
+        store,
+        metrics,
+        send_pacer,
+        subscribed_presence,
+        event_tx,
+        group_cache,
+        backfill_cooldown_secs: 300,
+        backfill_queue_depth: 100,
+        backfill_max_messages: 10000,
+        embedder: embedder_handle,
+        db_path: db_path.to_path_buf(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5362,6 +5450,7 @@ mod tests {
             backfill_queue_depth: 100,
             backfill_max_messages: 10000,
             embedder: embedder_handle,
+            db_path: db_path.to_path_buf(),
         };
 
         // The critical assertion: active_model_id() returns the configured model ID.
@@ -5762,53 +5851,5 @@ mod tests {
         assert_eq!(results[0].message_id, "msg1");
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // Helper to build a minimal test bridge with an embedder.
-    async fn build_test_bridge_with_embedder(
-        db_path: &std::path::Path,
-        embedder: impl crate::embedder::Embedder + 'static,
-    ) -> WhatsAppBridge {
-        let cancel = CancellationToken::new();
-        let (_state_tx, state_rx) = watch::channel(BridgeState::Disconnected);
-        let (_qr_tx, qr_rx) = watch::channel::<Option<String>>(None);
-        let outbound_notify = Arc::new(tokio::sync::Notify::new());
-        let backfill_notify = Arc::new(tokio::sync::Notify::new());
-        let embed_notify = Arc::new(tokio::sync::Notify::new());
-        let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> =
-            Arc::new(ParkingMutex::new(None));
-        let rr_tx = spawn_scheduler(None, 200);
-        let msg_cache: MsgCache = Arc::new(ParkingMutex::new(BoundedMsgCache::new(128)));
-        let send_pacer = Arc::new(SendPacer::with_burst(0, 1));
-        let subscribed_presence: Arc<DashSet<String>> = Arc::new(DashSet::new());
-        let group_cache: GroupCacheHandle = Arc::new(ParkingMutex::new(GroupCache::new()));
-        let (event_tx, _event_rx) = crate::bridge_events::new_event_bus();
-        let store = Store::new(&db_path).expect("failed to open test DB");
-        let metrics = Arc::new(BridgeMetrics::new());
-        let embedder_handle = Arc::new(ParkingMutex::new(Some(
-            Arc::new(embedder) as Arc<dyn crate::embedder::Embedder>
-        )));
-
-        WhatsAppBridge {
-            outbound_notify,
-            backfill_notify,
-            embed_notify,
-            state_rx,
-            qr_rx,
-            cancel,
-            client_handle,
-            rr_tx,
-            msg_cache,
-            store,
-            metrics,
-            send_pacer,
-            subscribed_presence,
-            event_tx,
-            group_cache,
-            backfill_cooldown_secs: 300,
-            backfill_queue_depth: 100,
-            backfill_max_messages: 10000,
-            embedder: embedder_handle,
-        }
     }
 }
