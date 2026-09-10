@@ -10,16 +10,18 @@ src/
   outbound.rs        Typed outbound ops (21 OpKinds), payload structs, execute_job()
   media_utils.rs     Media enrichment: image dims + JPEG thumbnails, audio waveform data
   bridge_events.rs   Broadcast event bus: BridgeEvent, OutboundStatusEvent, DeliveryStatus
-  api.rs             REST API (58 endpoints), SSE streaming, CLI HTTP client
-  mcp.rs             MCP server (33 tools, JSON-RPC over stdio)
-  storage.rs         rusqlite Signal Protocol store + typed job queue + v8 unified messages table (FTS5 search) + backfill queue/cursor
+  api.rs             REST API (59 endpoints), SSE streaming, CLI HTTP client
+  mcp.rs             MCP server (35 tools, JSON-RPC over stdio)
+  storage.rs         rusqlite Signal Protocol store + typed job queue + v8 unified messages table (FTS5 search, embed_status) + embeddings (multi-model BLOB vectors) + backfill queue/cursor
   backfill.rs        Historical backfill worker: two-phase on-demand fetch (HistoryCorrelator), FIFO pagination, contained-C targets, pacer, 3-level abort
+  embedder.rs        Embedder trait (sidecar contract), StdioEmbedder (JSON-RPC stdio), FakeEmbedder (test seam), cosine_similarity
+  embed_drain.rs     Embedding-drain worker: set-difference query, batch sidecar calls, in-memory failure tracking, circuit-breaker
   dedup.rs           Generation-tracked DashMap dedup (concurrent-safe, bounded)
   read_receipts.rs   Batched receipt scheduler with flush-before-reply
   polls.rs           Poll crypto (HKDF-SHA256 + AES-256-GCM)
   qr.rs              QR rendering (terminal/PNG/HTML/SVG)
   instance_lock.rs   flock-based single-instance guard (prevents StreamReplaced loops)
-  main.rs            Daemon (REPL + API), CLI client (49 commands), MCP mode
+  main.rs            Daemon (REPL + API), CLI client (50 commands), MCP mode
   lib.rs             Library crate exports (all modules pub, consumed by habb)
 ```
 
@@ -77,13 +79,15 @@ src/
 
 **Atomic BridgeMetrics.** All counters use `AtomicU64` — no locks, no DB reads for health checks. API server is raw TCP (no HTTP framework dependency) with connection semaphore (64) + dedicated SSE semaphore (8).
 
-## Historical fetch & lexical search (M1)
+## Historical fetch & lexical/semantic search (M1 + M2)
 
-M1 (per-chat historical backfill + FTS5 lexical search) is **complete** — all four sub-milestones shipped and live-E2E-validated. It builds a local, searchable message archive alongside the live timeline. M2 (semantic/embedding-based search, sidecar-backed) layers on top of this schema but is **not built yet** (ADR 0006/0008/0015-0017/0024).
+**M1** (per-chat historical backfill + FTS5 lexical search) is **complete** — all four sub-milestones shipped and live-E2E-validated. It builds a local, searchable message archive alongside the live timeline.
+
+**M2** (semantic/embedding-based search, sidecar-backed) sub-milestones M2.1–M2.5 are **code-complete** (embedder sidecar contract + drain worker + cosine rerank + multi-model purge). M2.6 (full config wiring + integration tests) and end-to-end validation against a live daemon are **pending**. Semantic search is **opt-in** via `WHATSRUST_EMBEDDER_CMD` and **dormant** (degrades gracefully to FTS5 lexical) when the sidecar is absent or down. (ADR 0006/0008/0015-0017/0024/0038/0039)
 
 ### Schema (v8)
 
-`messages` is a single unified table for both live and backfilled history: `chat_jid`, `sender_jid`, `message_id` (unique), `content_kind`, `body_text`, `timestamp`, `from_me`, `source` (`'live'` | `'backfill'`), `embed_status` (reserved for M2) (ADR 0009). Sibling tables: `media_refs` (lazily-hydrated media pointers, ADR 0005), `embeddings` (multi-model vector storage, ADR 0017 — unused until M2), `backfill_cursor` (per-chat frontier: oldest known message + `more_remain`/`exhausted` flags, ADR 0003), `backfill_jobs` (durable job queue, ADR 0010/0033), and `metadata` (generic KV singletons, e.g. the storage-watchdog baseline, ADR 0036).
+`messages` is a single unified table for both live and backfilled history: `chat_jid`, `sender_jid`, `message_id` (unique), `content_kind`, `body_text`, `timestamp`, `from_me`, `source` (`'live'` | `'backfill'`), `embed_status` (`'pending'`/`'embedded'`/`'failed'`/`'skipped'` — tracks embedding-drain worker progress) (ADR 0009/0016). Sibling tables: `media_refs` (lazily-hydrated media pointers, ADR 0005), `embeddings` (multi-model BLOB vector storage with composite PK `(message_id, model_id)`, ADR 0017 — M2.1–M2.5 complete, wiring pending), `backfill_cursor` (per-chat frontier: oldest known message + `more_remain`/`exhausted` flags, ADR 0003), `backfill_jobs` (durable job queue, ADR 0010/0033), and `metadata` (generic KV singletons, e.g. the storage-watchdog baseline, ADR 0036).
 
 `messages_fts` is an external-content FTS5 index (`content='messages'`, `content_rowid='id'`, `unicode61 remove_diacritics 2` tokenizer for Hebrew/Arabic/multilingual support) kept in sync by `'delete'`-command AFTER INSERT/UPDATE/DELETE triggers on `messages` (ADR 0019). The v7→v8 upgrade is a staged copy-then-drop migration: pristine pre-migration backup → FTS5 availability probe → migrate inside one transaction → post-commit validation → circuit-breaker pin (blocks retry-looping a broken migration) with `--rollback`/`--migrate` recovery flags (ADR 0028-0032). Everything still runs through the single `Arc<parking_lot::Mutex<Connection>>`.
 
@@ -109,6 +113,16 @@ Abort is **three-level** (ADR 0026): a **BATCH** (send request → await respons
 ### Lexical search
 
 `search_inbound` branches on whether a query is given: with `query=Some(q)`, it joins `messages_fts MATCH` (quote-as-phrase sanitized — embedded `"` doubled, no raw FTS5 operator injection) to `messages` by rowid and orders by `f.rank` ascending (BM25, most-relevant first); with `query=None`, it's a plain chronological browse. One query path, EXPLAIN-verified to hit the FTS5 index (no LIKE fallback) — multilingual by construction via the `unicode61 remove_diacritics 2` tokenizer (ADR 0019/0018).
+
+### Semantic search (M2.1–M2.5 code-complete, M2.6 + E2E validation pending)
+
+**Opt-in via `WHATSRUST_EMBEDDER_CMD`**: when configured, `WhatsAppBridge::search` embeds the query using the sidecar, recalls top-N candidates via FTS5 (recall width = max of 200 and `limit`), fetches their vectors from the `embeddings` table, reranks by cosine similarity (Rust-side, `cosine_similarity()` in `src/embedder.rs`), and appends an **additive lexical fallback** (FTS results that had no embeddings) to fill out the requested limit. When the sidecar is absent or down, search degrades gracefully to pure FTS5 lexical (byte-identical to M1). (ADR 0007/0008)
+
+**Embedder sidecar**: stateless stdio JSON-RPC child process (ADR 0006/0024). The MVP is `scripts/embedder-sidecar.py` (Python + sentence-transformers, `paraphrase-multilingual-MiniLM-L12-v2`, 384-dim, prefix-free, multilingual). The `Embedder` trait (`src/embedder.rs`) abstracts transport; `StdioEmbedder` handles the stdio framing and request/response lifecycle (load timeout, health checks, trust-but-verify validation). A `FakeEmbedder` test seam (`src/embedder.rs`) plus a minimal fake sidecar (`src/bin/fake-embedder.rs`, behind the `fake-embedder` Cargo feature) support round-trip integration tests. (ADR 0025)
+
+**Embedding-drain worker**: independent background task (spawned alongside backfill/prune in `run_bridge`, before the reconnect loop — ADR 0015). Wakes periodically (default 60s), derives work via a set-difference query (`embed_status='pending'` minus already-embedded for the active model), batches text to the sidecar (default 64 msgs/batch), writes successful vectors to the `embeddings` table, and on sidecar/transport failure leaves rows `pending` for retry (never mislabels them). Per-row content-rejection tracking (in-memory `(message_id, model_id)` attempt counter, cap-3 → terminal `embed_status='failed'`) is scaffolded but **currently dormant** — the batch `embed` protocol can't distinguish a content rejection from a transport failure, so the cap-3→`failed` path is deferred until the protocol grows a positive rejection signal (M2.6.7 / ADR 0038). A pathological-pending circuit-breaker back-pressures **new backfill enqueues** (`enqueue_backfill_job` returns `EmbedderBacklogFull`) when the active-model pending backlog exceeds a ceiling (default 100k), so the drain can catch up without the backlog growing unbounded — the drain itself keeps running. Multi-model: `embeddings` PK is `(message_id, model_id)`, so switching models starts a fresh drain for the new model without purging old vectors (ADR 0017).
+
+**Per-model purge**: `Store::purge_embeddings(model_id)` deletes all rows for a given model and runs SQLite `incremental_vacuum` to reclaim space (ADR 0017). Exposed via API `POST /api/embeddings/purge`, MCP tool `whatsrust_purge_embeddings`, and CLI `purge-embeddings <model_id>`. Returns `{model_id, rows_deleted, bytes_reclaimed}`.
 
 ### Progress & observability
 

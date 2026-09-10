@@ -2,7 +2,7 @@
 
 **Type:** Live document — kept up to date as features land. Update the **Status** of an
 item when work starts/completes; add a dated note in its row's detail.
-**Last updated:** 2026-07-16
+**Last updated:** 2026-09-01
 
 This is the single tracking surface for in-flight and planned work on this experimental
 fork. The *why* for each design lives in the ADRs (`docs/adr/`); the *what/how* blueprints
@@ -28,17 +28,16 @@ Per-chat historical backfill (`all` / `since:T` / `count:N`) + local FTS5 (lexic
     - [x] **M1.2 fetch worker + safety/config** — DONE 2026-07-03. Single-FIFO paginating worker (two-phase async on-demand fetch via `HistoryCorrelator`), contained-C target model (`since`/`all`/`count`), 3-level abort, dedicated backfill pacer, daemon-side guards (queue-depth + `max_messages` clamp + cooldown), fail-closed safety config (`WHATSRUST_DANGEROUSLY_ALLOW_*`), dotenvy `.env`. Connection-gating (defer-not-fail when not connected) + LID/PN resolution fixes. **Live-validated end-to-end** (count fetch auto-paginated to exhaustion, 14 msgs stored under phone JID). (ADR 0003/0010/0020/0021/0022/0023/0026/0033/0035)
     - [x] **M1.3 FTS5 lexical search** — DONE 2026-07-13. `search_inbound` rewritten: `query=Some` → FTS5 `messages_fts MATCH` + BM25 `ORDER BY rank` (ascending); `query=None` history browse unchanged. Quote-as-phrase MATCH sanitization (`"`→`""`; operators neutralized). Single FTS path (EXPLAIN-verified: FTS index drives, PK rowid lookup) — no LIKE fallback. Multilingual (Hebrew/Arabic) + injection-safe. 9 tests; suite 188 lib / 203 bin green. API/MCP JSON shape unchanged (now relevance-ranked). (ADR 0019)
     - [x] **M1.4 API/MCP trigger + watchdog** — DONE 2026-07-16. `/api/history-fetch` (trigger/status/cancel) + MCP tools `whatsrust_fetch_history`/`_status`/`_cancel` (→33 MCP tools) + SSE `BackfillProgress` events (fuzzy/precise per target-kind); storage-growth watchdog wired into the periodic prune tick (`wal_checkpoint(PASSIVE)` + `db+wal+shm` stat, ≥50% → WARN + `BridgeEvent::StorageAlert` + baseline reset); temp `WHATSRUST_BACKFILL_TEST` hook retired. **Live E2E passed 2026-07-20** (real account: API/CLI/MCP trigger, SSE `backfill` + `storage_alert` events, FTS search, cancel→404) — **M1 COMPLETE.** (ADR 0011/0013/0034/0036)
-  - [ ] **M2 — semantic search** (layers on M1; = F2 below): sidecar + drain + cosine rerank. Phase breakdown deferred to M2 start. (ADR 0008/0015/0016/0017/0024)
+  - [x] **M2 — semantic search** — 🟡 **M2.1–M2.5 DONE, M2.6 + E2E validation PENDING** (2026-08-31). Code-complete for sub-milestones M2.1 (embedder sidecar contract), M2.2 (embeddable-text classification), M2.3 (drain worker), M2.4 (semantic search path), M2.5 (multi-model purge). **MVP sidecar BUILT** (`scripts/embedder-sidecar.py`: Python + sentence-transformers MiniLM, 384-dim, multilingual). **M2.6 (config wiring + integration tests) and live E2E validation PENDING.** Semantic search is **opt-in** via `WHATSRUST_EMBEDDER_CMD` and **dormant** (degrades to FTS5 lexical) when sidecar absent/down. New surfaces: API `POST /api/embeddings/purge`, MCP `whatsrust_purge_embeddings` (35 tools total), CLI `purge-embeddings <model_id>`. (ADR 0008/0015/0016/0017/0024/0038/0039)
 
-### F2 — Embedder sidecar (implementation) 🔵 Designed
+### F2 — Embedder sidecar (implementation) 🟢 Done (M2.1–M2.5 complete, wiring pending)
 Stateless separate binary, pure vectorizer; stdio JSON-RPC v1; transport-neutral
 `Embedder` trait (HTTP/localhost as future sibling); multilingual model default.
-- **Design:** ADRs 0006, 0015, 0024 (+ 0007/0008/0016/0017/0018). Protocol & validation fully specified.
-- **Status note:** Design complete; implementation is phase 4 of F1 but tracked separately since the
-  sidecar is its own binary/crate. Includes the minimal fake-sidecar test binary (ADR 0025).
-- [ ] `Embedder` trait + stdio JSON-RPC transport (model_info / embed / health, trust-but-verify validation)
-- [ ] Sidecar binary: external-API backend AND/OR local ONNX/GGUF backend (model choice = sidecar's concern)
-- [ ] Drain worker integration (ADR 0015), multi-model store + purge (ADR 0017)
+- **Design:** ADRs 0006, 0015, 0024 (+ 0007/0008/0016/0017/0018/0038/0039). Protocol & validation fully specified.
+- **Status note:** M2.1–M2.5 code-complete (2026-08-31). MVP Python sidecar built. M2.6 (full wiring + integration tests) and E2E validation pending.
+- [x] `Embedder` trait + stdio JSON-RPC transport (model_info / embed / health, trust-but-verify validation) — DONE M2.1
+- [x] Sidecar binary: MVP Python + sentence-transformers (paraphrase-multilingual-MiniLM-L12-v2, 384-dim) — DONE 2026-08-31
+- [x] Drain worker integration (ADR 0015), multi-model store + purge (ADR 0017) — DONE M2.3/M2.5
 
 ### F3 — MCP streamable HTTP transport (on top of stdio) 🔵 Designed-lite / ⚪ needs design pass
 Add MCP Streamable HTTP transport alongside the existing stdio transport — so MCP clients

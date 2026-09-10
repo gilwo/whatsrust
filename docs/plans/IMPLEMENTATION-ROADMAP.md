@@ -1,7 +1,7 @@
 # Implementation Roadmap — Historical Fetch + Semantic/Lexical Search
 
-**Date:** 2026-06-25 (updated 2026-07-01)
-**Status:** **Phase 0 GATE PASSED — GO** (2026-07-01, commit 615d185). **M1 COMPLETE (2026-07-20)** — M1.1/M1.2/M1.3/M1.4 all DONE and the live E2E smoke test passed on a real account (API/CLI/MCP trigger, SSE `backfill` + `storage_alert`, FTS search, cancel→404). **M2 (semantic search) is next** — detail deferred to M2 start.
+**Date:** 2026-06-25 (updated 2026-09-01)
+**Status:** **Phase 0 GATE PASSED — GO** (2026-07-01, commit 615d185). **M1 COMPLETE (2026-07-20)** — M1.1/M1.2/M1.3/M1.4 all DONE and the live E2E smoke test passed on a real account (API/CLI/MCP trigger, SSE `backfill` + `storage_alert`, FTS search, cancel→404). **M2 (semantic search) M2.1–M2.5 CODE-COMPLETE (2026-08-31)** — embedder sidecar contract, drain worker, cosine rerank, multi-model purge. MVP Python sidecar built. **M2.6 (config wiring + integration tests) and end-to-end validation PENDING.**
 **Design:** `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (3 cold reviews, converged, implementation-ready)
 **Why this is a skeleton:** Phase 0 is a hard GO/NO-GO gate (the wa-rs v0.6.0 dependency adoption). We do not write detailed phase/task plans behind an unvalidated gate — a NO-GO or a fallback-triggering result reshapes everything. Only Phase 0 is planned in detail below; M1/M2 phase detail is deferred to their starts.
 
@@ -83,16 +83,23 @@ The entire feature is conditional on this. **No rebase, no fork, no clone** — 
 
 ---
 
-## Milestone 2 — Semantic search  (detail deferred to M2 start; do NOT pre-plan phases)
+## Milestone 2 — Semantic search  (M2.1–M2.5 CODE-COMPLETE 2026-08-31, M2.6 + E2E PENDING)
 
 **Goal:** optional semantic search via the embedder sidecar, layered on M1's stored messages.
 
-**Scope (named only — phase breakdown written at M2 start, informed by what M1 teaches):** stateless stdio embedder sidecar + `Embedder` trait + JSON-RPC protocol (ADR 0024); embedding-drain worker — independent task, set-difference work derivation, multi-model retention + purge, decoupled-with-pathological-ceiling (ADR 0015/0017); embeddable-text classification (ADR 0016); FTS5-recall → cosine-rerank search path (ADR 0008); minimal fake-sidecar integration test (ADR 0025).
+**Phases (detailed in `docs/plans/2026-07-23-M2-detailed-plan.md`):**
+- ✅ **M2.1 Embedder sidecar contract & transport — DONE.** `Embedder` trait (`model_info`/`embed`/`health`), `StdioEmbedder` (JSON-RPC stdio client), `FakeEmbedder` test seam, trust-but-verify validation (dim, model_id, timeout). [ADR 0006/0024/0025]
+- ✅ **M2.2 Embeddable-text classification — DONE.** `InboundContent::embeddable_text()` (NL-only, distinct from `display_text()`), write-time classification (`pending`/`skipped`), set-difference drain query (`embed_status='pending'` minus already-embedded). Backlog tolerance: pre-M2 rows remain `pending` with `display_text()` stored; tolerated per ADR 0038 (small single-user backlog, raw captions unrecoverable). [ADR 0016/0017/0038]
+- ✅ **M2.3 Embedding-drain worker — DONE.** Independent task (spawned alongside backfill/prune, before reconnect loop), periodic wake (default 60s), batch sidecar calls (default 64), transport-failure retry (rows stay `pending`); the in-memory 3-attempt-cap → terminal `failed` path is scaffolded but **dormant** (batch protocol can't distinguish content rejection from transport failure — deferred to M2.6.7); pathological-pending circuit-breaker back-pressures **new backfill enqueues** (`EmbedderBacklogFull`) at a ceiling (default 100k), drain itself keeps running. [ADR 0015/0017/0038]
+- ✅ **M2.4 Semantic search path — DONE.** `WhatsAppBridge::search`: embed query → FTS recall (width = max of 200 and limit) → fetch vectors by `(message_id, active_model_id)` → cosine rerank (Rust-side `cosine_similarity()`) → additive lexical fallback (byte-identical to M1 when sidecar absent/down). [ADR 0007/0008/0017/0018]
+- ✅ **M2.5 Multi-model retention & explicit purge — DONE.** `embeddings` PK `(message_id, model_id)` supports model switch without purge; `Store::purge_embeddings(model_id)` deletes one model's rows + `incremental_vacuum`; surfaces: API `POST /api/embeddings/purge`, MCP `whatsrust_purge_embeddings` (35 tools total), CLI `purge-embeddings <model_id>`. Returns `{model_id, rows_deleted, bytes_reclaimed}`. [ADR 0017]
+- ✅ **MVP sidecar BUILT (2026-08-31).** `scripts/embedder-sidecar.py` (Python + sentence-transformers, `paraphrase-multilingual-MiniLM-L12-v2`, 384-dim, prefix-free, multilingual) + `scripts/run-embedder.sh` convenience wrapper. [ADR 0039]
+- [ ] **M2.6 Config, integration test, wiring — PENDING.** Full `.env` / `BridgeConfig` wiring, fake-embedder round-trip integration tests, end-to-end validation against a live daemon. [ADR 0023/0024/0025]
 
 **M2 exit criteria (milestone-level):**
-- With a sidecar configured, semantic search returns relevant results; without one, search cleanly falls back to M1 lexical (no errors, no blocking).
-- Drain keeps up under normal backfill (the >100k pathological ceiling is the only coupling); model switch + per-model purge work.
-- Multilingual model handles CJK semantically (the lexical gap M1 leaves).
+- ✅ With a sidecar configured, semantic search returns relevant results; without one, search cleanly falls back to M1 lexical (no errors, no blocking). — **CODE-COMPLETE, E2E validation pending.**
+- ✅ Drain keeps up under normal backfill (the >100k pathological ceiling is the only coupling); model switch + per-model purge work. — **CODE-COMPLETE, E2E validation pending.**
+- ⏸️ Multilingual model handles CJK semantically (the lexical gap M1 leaves). — **Deferred to live testing.**
 
 ---
 
