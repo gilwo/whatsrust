@@ -947,7 +947,7 @@ async fn handle_search(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
     };
     let jid = req.query_get("jid");
     let limit: i64 = req.query_get("limit").and_then(|v| v.parse().ok()).unwrap_or(20).max(1).min(200);
-    match bridge.store().search_inbound(jid, Some(q), limit, None).await {
+    match bridge.search(jid, q, limit, None).await {
         Ok(rows) => {
             let count = rows.len();
             json_ok(json!({"messages": rows, "count": count}))

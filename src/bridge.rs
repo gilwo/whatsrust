@@ -1399,6 +1399,123 @@ impl WhatsAppBridge {
         self.state() == BridgeState::Connected && get_client_handle(&self.client_handle).is_some()
     }
 
+    /// Semantic search with FTS5 fallback (M2.4.3-4). When an embedder is configured+healthy
+    /// AND vectors exist for the active model: (1) embed query, (2) FTS5 recall widened to
+    /// ~200 candidates, (3) fetch vectors, (4) cosine-rerank, (5) truncate to limit.
+    /// Otherwise: byte-identical fallback to the M1.3 lexical FTS5/BM25 path.
+    ///
+    /// Returns `InboundRow`-shaped results (shape unchanged from M1.3 — only order differs).
+    /// Additive-only: candidates without active-model vectors are NOT dropped — they keep their
+    /// FTS rank, appended after the cosine-reranked vectorized subset.
+    pub async fn search(
+        &self,
+        chat_jid: Option<&str>,
+        query: &str,
+        limit: i64,
+        before_ts: Option<i64>,
+    ) -> anyhow::Result<Vec<crate::storage::InboundRow>> {
+        use crate::embedder::cosine_similarity;
+
+        // Fallback decision: no embedder, unhealthy, or zero active-model vectors → pure lexical.
+        let embedder_opt = self.embedder.lock().clone();
+        let embedder = match embedder_opt {
+            Some(e) => e,
+            None => {
+                // No embedder configured → fallback (M2.4.4).
+                return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
+            }
+        };
+
+        // Check health (M2.4.4 — unhealthy → fallback).
+        let health = embedder.health().await;
+        if !matches!(health, crate::embedder::HealthStatus::Ok) {
+            return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
+        }
+
+        // Embed the query with a timeout (M2.4.3 step 1, M2.4.4 — query-embed fails → fallback).
+        let query_vec = match tokio::time::timeout(
+            Duration::from_secs(5),
+            embedder.embed(&[query.to_string()])
+        ).await {
+            Ok(Ok(mut vecs)) if !vecs.is_empty() => vecs.remove(0),
+            Ok(Ok(_)) => {
+                // Empty response → fallback.
+                return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
+            }
+            Ok(Err(e)) => {
+                // Embed error → fallback.
+                tracing::debug!("search: query embed failed ({}), falling back to lexical", e);
+                return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
+            }
+            Err(_) => {
+                // Timeout → fallback.
+                tracing::debug!("search: query embed timed out, falling back to lexical");
+                return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
+            }
+        };
+
+        // Check if any vectors exist for the active model (M2.4.4 — zero vectors → fallback).
+        let active_model = match self.active_model_id() {
+            Some(m) => m,
+            None => {
+                // No active model (shouldn't happen given we have an embedder, but defend).
+                return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
+            }
+        };
+
+        // FTS5 recall, widened to recall_width = max(200, limit) (M2.4.3 step 2, review v4-B1).
+        let recall_width = std::cmp::max(200, limit);
+        let candidates = self.store.search_inbound(chat_jid, Some(query), recall_width, before_ts).await?;
+
+        if candidates.is_empty() {
+            // Zero FTS hits → return empty (M2.4.6 deferred — no pure-semantic brute-force).
+            return Ok(candidates);
+        }
+
+        // Fetch vectors for the candidates, filtered to the active model (M2.4.3 step 3).
+        let candidate_ids: Vec<String> = candidates.iter().map(|r| r.message_id.clone()).collect();
+        let vectors = self.store.fetch_embeddings_for_candidates(&candidate_ids, &active_model).await?;
+
+        if vectors.is_empty() {
+            // Zero vectors for active model → fallback (M2.4.4).
+            return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
+        }
+
+        // Cosine-rerank the vectorized subset (M2.4.3 step 4).
+        let mut scored: Vec<(crate::storage::InboundRow, f32)> = Vec::new();
+        let mut unvectored: Vec<crate::storage::InboundRow> = Vec::new();
+
+        for row in candidates {
+            if let Some(candidate_vec) = vectors.get(&row.message_id) {
+                match cosine_similarity(&query_vec, candidate_vec) {
+                    Ok(score) => scored.push((row, score)),
+                    Err(e) => {
+                        // Dimension mismatch / corrupt vector → treat as unvectored, keep FTS rank.
+                        tracing::warn!(
+                            "search: cosine failed for message_id {} ({}), treating as unvectored",
+                            row.message_id,
+                            e
+                        );
+                        unvectored.push(row);
+                    }
+                }
+            } else {
+                // No vector for active model → keep FTS rank (M2.4.3 additive-only).
+                unvectored.push(row);
+            }
+        }
+
+        // Sort scored by cosine descending (higher = more similar).
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Truncate to limit, append unvectored rows after the reranked subset (M2.4.3 step 5).
+        let mut result: Vec<crate::storage::InboundRow> = scored.into_iter().map(|(r, _)| r).collect();
+        result.extend(unvectored);
+        result.truncate(limit as usize);
+
+        Ok(result)
+    }
+
     /// Enqueue a job, wait for the outbound worker to send it, return the WA message ID.
     /// Subscribes to the event bus *before* enqueueing to avoid missing the Sent event.
     async fn enqueue_and_wait(&self, jid: &str, op_kind: crate::outbound::OutboundOpKind, payload_json: &str, payload_blob: Option<Vec<u8>>) -> Result<String> {
@@ -4500,6 +4617,7 @@ impl crate::backfill::BatchSink for LiveBatchSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedder::Embedder;
 
     #[test]
     fn test_normalize_phone() {
@@ -5265,5 +5383,432 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // --- M2.4.3: semantic search integration tests ---
+
+    #[tokio::test]
+    async fn test_search_semantic_rerank_differs_from_bm25() {
+        // (a) All vectored → cosine order differs from BM25.
+        let dir = std::env::temp_dir().join(format!("test_semantic_rerank_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        // Insert 3 messages that all contain the query word "fruit" so FTS5 matches all.
+        // Query: "fruit"
+        // msg1: "fruit apple" (contains query)
+        // msg2: "fruit banana" (contains query)
+        // msg3: "fruit orange" (contains query)
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("fruit apple"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg2",
+                "text",
+                Some("fruit banana"),
+                1001,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg3",
+                "text",
+                Some("fruit orange"),
+                1002,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        // Write embeddings: query "fruit" will be [0.1, 0.1, 0.1] (by FakeEmbedder for single text, i=0 → 0.1*1).
+        // Design vectors so cosine similarity with [0.1, 0.1, 0.1] differs:
+        // msg1 vector: [1.0, 1.0, 1.0] (high cosine: parallel to query)
+        // msg2 vector: [1.0, 0.0, 0.0] (medium cosine: partially aligned)
+        // msg3 vector: [0.0, 1.0, 0.0] (medium cosine: partially aligned, different axis)
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 3);
+        let model_id = fake.model_info().model_id.clone();
+
+        store
+            .write_embedding_batch(
+                &["msg1".to_string(), "msg2".to_string(), "msg3".to_string()],
+                &model_id,
+                3,
+                &[
+                    vec![1.0, 1.0, 1.0],
+                    vec![1.0, 0.0, 0.0],
+                    vec![0.0, 1.0, 0.0],
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Build a test bridge with the fake embedder.
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        // Search for "fruit" — FTS5 will match all 3 messages.
+        // Semantic rerank will reorder by cosine similarity.
+        let results = bridge.search(None, "fruit", 10, None).await.unwrap();
+
+        // All 3 messages should be returned (all vectored, all match FTS5).
+        assert_eq!(results.len(), 3, "all 3 messages should be returned");
+
+        // msg1 should be first (highest cosine similarity with query vector).
+        assert_eq!(results[0].message_id, "msg1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_search_partial_coverage_keeps_unvectored() {
+        // (b) Partial coverage → unvectored candidates survive after the reranked subset.
+        let dir = std::env::temp_dir().join(format!("test_partial_coverage_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        // Insert 3 messages
+        for i in 1..=3 {
+            store
+                .insert_message(
+                    "chat@s.whatsapp.net",
+                    "sender@s.whatsapp.net",
+                    &format!("msg{}", i),
+                    "text",
+                    Some(&format!("text {}", i)),
+                    1000 + i as i64,
+                    false,
+                    "test",
+                    "pending",
+                )
+                .await
+                .unwrap();
+        }
+
+        // Write embeddings for msg1 and msg3 only (msg2 is unvectored).
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 2);
+        let model_id = fake.model_info().model_id.clone();
+
+        store
+            .write_embedding_batch(
+                &["msg1".to_string(), "msg3".to_string()],
+                &model_id,
+                2,
+                &[vec![0.9, 0.1], vec![0.1, 0.9]],
+            )
+            .await
+            .unwrap();
+
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        let results = bridge.search(None, "text", 10, None).await.unwrap();
+
+        // All 3 messages should be returned (unvectored msg2 is NOT dropped).
+        assert_eq!(results.len(), 3, "unvectored message should not be dropped");
+
+        // Check that msg2 is present
+        let msg2_present = results.iter().any(|r| r.message_id == "msg2");
+        assert!(msg2_present, "unvectored msg2 should be present in results");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_search_recall_width_at_small_limit() {
+        // (c) At small limit, recall_width = max(200, limit) surfaces a message BM25-ranked
+        // OUTSIDE the top-limit but semantically most similar. This is ONLY possible if
+        // recall was widened beyond limit. With the old `min(200, limit)` bug, that message
+        // would never be recalled → can't appear in results.
+        //
+        // Setup: 20 messages all matching query "search", but with different BM25 ranks:
+        //   - msg1-msg10: "search" (short → high BM25)
+        //   - msg11-msg14: "search word" (medium → medium BM25)
+        //   - needle (msg15): "search <100 filler words>" (long → LOW BM25, rank ~15)
+        //   - msg16-msg20: "search test" (medium → medium BM25)
+        //
+        // Needle has the vector MOST similar to query (cosine=1), but BM25 ranks it ~15th.
+        // Request limit=5. Assert needle IS in results (proves recall_width pulled it in).
+        let dir = std::env::temp_dir().join(format!("test_recall_width_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        // Insert 10 short messages (high BM25 rank)
+        for i in 1..=10 {
+            store
+                .insert_message(
+                    "chat@s.whatsapp.net",
+                    "sender@s.whatsapp.net",
+                    &format!("msg{}", i),
+                    "text",
+                    Some("search"),
+                    1000 + i as i64,
+                    false,
+                    "test",
+                    "pending",
+                )
+                .await
+                .unwrap();
+        }
+
+        // Insert 4 medium messages (medium BM25 rank)
+        for i in 11..=14 {
+            store
+                .insert_message(
+                    "chat@s.whatsapp.net",
+                    "sender@s.whatsapp.net",
+                    &format!("msg{}", i),
+                    "text",
+                    Some("search word"),
+                    1000 + i as i64,
+                    false,
+                    "test",
+                    "pending",
+                )
+                .await
+                .unwrap();
+        }
+
+        // Insert needle: long message (LOW BM25 rank ~15, but highest cosine)
+        let filler = " filler".repeat(100);
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "needle",
+                "text",
+                Some(&format!("search{}", filler)),
+                1015,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        // Insert 5 more medium messages
+        for i in 16..=20 {
+            store
+                .insert_message(
+                    "chat@s.whatsapp.net",
+                    "sender@s.whatsapp.net",
+                    &format!("msg{}", i),
+                    "text",
+                    Some("search test"),
+                    1000 + i as i64,
+                    false,
+                    "test",
+                    "pending",
+                )
+                .await
+                .unwrap();
+        }
+
+        // Query "search" → FakeEmbedder → [0.1, 0.1, 0.1]
+        // Give needle the vector most similar to query: [1.0, 1.0, 1.0] (cosine = 1.0)
+        // Give others lower-cosine vectors
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 3);
+        let model_id = fake.model_info().model_id.clone();
+
+        let mut message_ids = Vec::new();
+        let mut vectors = Vec::new();
+
+        for i in 1..=10 {
+            message_ids.push(format!("msg{}", i));
+            vectors.push(vec![0.1, 0.0, 0.0]); // low cosine with [0.1, 0.1, 0.1]
+        }
+        for i in 11..=14 {
+            message_ids.push(format!("msg{}", i));
+            vectors.push(vec![0.0, 0.1, 0.0]); // low cosine
+        }
+        message_ids.push("needle".to_string());
+        vectors.push(vec![1.0, 1.0, 1.0]); // HIGH cosine (parallel to query)
+        for i in 16..=20 {
+            message_ids.push(format!("msg{}", i));
+            vectors.push(vec![0.0, 0.0, 0.1]); // low cosine
+        }
+
+        store
+            .write_embedding_batch(&message_ids, &model_id, 3, &vectors)
+            .await
+            .unwrap();
+
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        // Request limit=5 (well under needle's BM25 rank of ~15).
+        // With recall_width = max(200, 5) = 200, needle is recalled and reranked to top.
+        // With recall_width = min(200, 5) = 5, needle is never recalled → can't appear.
+        let results = bridge.search(None, "search", 5, None).await.unwrap();
+
+        // Assert needle is in the results (proves recall was widened beyond limit).
+        let needle_present = results.iter().any(|r| r.message_id == "needle");
+        assert!(
+            needle_present,
+            "needle (BM25 rank ~15, highest cosine) should appear in top-5 results, proving recall_width > limit"
+        );
+
+        // Ideally needle should be first (highest cosine), but we'll just assert presence.
+        // (BM25 rank ~15 > limit=5, so with min(200,5)=5 it would never be recalled.)
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_search_fallback_zero_embeddings() {
+        // (d) Zero embeddings → identical to M1.3 lexical.
+        let dir = std::env::temp_dir().join(format!("test_fallback_zero_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        // Insert 2 messages
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("hello world"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg2",
+                "text",
+                Some("goodbye world"),
+                1001,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        // NO embeddings written — semantic search should fallback to lexical.
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 2);
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        let results = bridge.search(None, "world", 10, None).await.unwrap();
+
+        // Both messages should be returned (lexical FTS5 finds both).
+        assert_eq!(results.len(), 2, "lexical fallback should find both messages");
+
+        // The M1.3 lexical path would return them in BM25 order; this is just confirming
+        // we didn't error out.
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_search_fallback_query_embed_fails() {
+        // (e) Query-embed fails → still returns lexical, no error surfaced.
+        let dir = std::env::temp_dir().join(format!("test_fallback_embed_fail_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("test message"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        // Configure a FakeEmbedder that always fails.
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 2).always_fail();
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        // Search should fallback to lexical (no error surfaced).
+        let results = bridge.search(None, "test", 10, None).await.unwrap();
+
+        assert_eq!(results.len(), 1, "should fallback to lexical and find the message");
+        assert_eq!(results[0].message_id, "msg1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Helper to build a minimal test bridge with an embedder.
+    async fn build_test_bridge_with_embedder(
+        db_path: &std::path::Path,
+        embedder: impl crate::embedder::Embedder + 'static,
+    ) -> WhatsAppBridge {
+        let cancel = CancellationToken::new();
+        let (_state_tx, state_rx) = watch::channel(BridgeState::Disconnected);
+        let (_qr_tx, qr_rx) = watch::channel::<Option<String>>(None);
+        let outbound_notify = Arc::new(tokio::sync::Notify::new());
+        let backfill_notify = Arc::new(tokio::sync::Notify::new());
+        let embed_notify = Arc::new(tokio::sync::Notify::new());
+        let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> =
+            Arc::new(ParkingMutex::new(None));
+        let rr_tx = spawn_scheduler(None, 200);
+        let msg_cache: MsgCache = Arc::new(ParkingMutex::new(BoundedMsgCache::new(128)));
+        let send_pacer = Arc::new(SendPacer::with_burst(0, 1));
+        let subscribed_presence: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let group_cache: GroupCacheHandle = Arc::new(ParkingMutex::new(GroupCache::new()));
+        let (event_tx, _event_rx) = crate::bridge_events::new_event_bus();
+        let store = Store::new(&db_path).expect("failed to open test DB");
+        let metrics = Arc::new(BridgeMetrics::new());
+        let embedder_handle = Arc::new(ParkingMutex::new(Some(
+            Arc::new(embedder) as Arc<dyn crate::embedder::Embedder>
+        )));
+
+        WhatsAppBridge {
+            outbound_notify,
+            backfill_notify,
+            embed_notify,
+            state_rx,
+            qr_rx,
+            cancel,
+            client_handle,
+            rr_tx,
+            msg_cache,
+            store,
+            metrics,
+            send_pacer,
+            subscribed_presence,
+            event_tx,
+            group_cache,
+            backfill_cooldown_secs: 300,
+            backfill_queue_depth: 100,
+            backfill_max_messages: 10000,
+            embedder: embedder_handle,
+        }
     }
 }

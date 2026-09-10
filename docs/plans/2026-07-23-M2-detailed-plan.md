@@ -410,6 +410,24 @@ as the no-sidecar/no-vectors fallback.
 model vectors exist, and falls back byte-for-byte to the M1.3 lexical path otherwise — zero
 API/MCP shape breakage either way.
 
+> ✅ **M2.4 DONE (2026-08-06).** New `WhatsAppBridge::search(chat_jid, query, limit, before_ts) ->
+> Result<Vec<InboundRow>>` orchestrates: embed query (5s timeout) → FTS5 recall via `search_inbound`
+> widened to `recall_width = max(200, limit)` → `Store::fetch_embeddings_for_candidates(ids, model_id)
+> -> HashMap<String, Vec<f32>>` (LE-f32 decode) → `embedder::cosine_similarity(a,b) -> Result<f32>`
+> (pure fn) rerank descending → truncate to `limit`. **Additive-only:** candidates lacking an
+> active-model vector keep FTS rank, appended after the reranked subset (never dropped). **Fallback to
+> the verbatim M1.3 lexical path** on ANY of {no embedder, unhealthy, query-embed fails/times out, no
+> active model, zero candidate vectors} — no error, shape-identical. `api.rs::handle_search` (:950,
+> `query=Some`) switched to `bridge.search()`; `handle_history` (:934, `query=None`) untouched;
+> `mcp.rs` unchanged (HTTP proxy); response shape stays `{messages, count}`. No `matched_by` field
+> (true shape-preservation). `.env.example` gained a multilingual-model recommendation (2.4.5).
+> Pure-semantic brute-force deferred (2.4.6). `CURRENT_SCHEMA_VERSION` stays 8. Suite green:
+> **305 lib / 318 bin** (+14: cosine unit tests, vector-fetch incl. partial coverage, rerank-differs-
+> from-BM25, fallback×2, and a recall-width test **independently flip-checked** to fail under the old
+> `min(200,limit)` and pass under `max` — guards the v4-B1 regression). Review-fix pass rewrote the
+> initially-vacuous recall-width test into a discriminating one (needle: low BM25 rank + highest
+> cosine, must surface in top-5). [ADR 0007/0008/0017/0018]
+
 ---
 
 ## M2.5 — Multi-model retention & explicit purge  [ADR 0017]
