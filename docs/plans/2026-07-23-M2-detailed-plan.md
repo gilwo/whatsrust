@@ -348,6 +348,27 @@ outages never count against that cap), **a single poison-pill message can't live
 (bisection, 2.3.11), and the pathological-pending case throttles only new backfill *enqueues*
 (and only when an embedder is active — 2.3.8), never in-flight jobs.
 
+> ✅ **M2.3 DONE (2026-08-05).** Landed as ONE wave (planned A/B split collapsed — the impl agent
+> implemented 2.3.8 alongside Wave A, and since it was integrated + green + no-op when no embedder is
+> configured, it was folded in rather than reverted). New `src/embed_drain.rs`: pure helpers
+> `prepare_text_for_embedding` (kind-gated Option-C text-prep, char-boundary-safe truncation),
+> `AttemptTracker` (in-memory cap-3, evict-on-`failed`), `LoadingTimer` (injectable clock,
+> continuous-not-cumulative), `BisectionTracker`/`bisect_batch_size` (poison-pill), and
+> `run_embedding_drain_worker` (Notify + periodic timer, `max_batch` clamp, backoff→notify-only,
+> one-TX batch write). Bridge wiring: `embed_notify` field+accessor fired from both write sites when a
+> row lands `pending`; single shared `embedder: Option<Arc<dyn Embedder>>` built once in `start()` via
+> `StdioEmbedder::from_env()` (non-fatal → `None` → worker not spawned); `active_model_id()` accessor;
+> spawned as an independent long-lived task sharing `cancel`. **2.3.8** circuit breaker composed into
+> `enqueue_backfill_job`'s atomic closure (bounded anti-join `COUNT`, `LIMIT threshold+1`, no-op when
+> `active_model_id` is `None`), new `EnqueueOutcome::EmbedderBacklogFull` → `api.rs` 429; `PENDING_THRESHOLD`
+> is `cfg`-gated (prod 100_000 / test 50 — no prod weakening). New `Store` methods
+> `write_embedding_batch`, `mark_embedding_failed`. `FakeEmbedder` extended with failure-injection
+> hooks (`always_fail`/`reject_text`/`with_health`/`with_max_batch`/`with_max_input_tokens`).
+> `CURRENT_SCHEMA_VERSION` stays 8. Suite green: **291 lib / 304 bin** (+10: 6 drain-worker integration
+> incl. deterministic poison-pill isolation + transport-resilience, 4 circuit-breaker). Touched
+> `api.rs`/`backfill.rs` beyond the Wave-A file list (the 2.3.8 fold-in + ~25 call-site churn).
+> Delegated over 3 passes (initial + 2 corrective for missing loop-level/breaker tests). [ADR 0015/0017/0024/0027/0038]
+
 ---
 
 ## M2.4 — Semantic search path  [ADR 0007/0008/0017/0018]

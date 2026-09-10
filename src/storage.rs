@@ -1014,6 +1014,8 @@ pub enum EnqueueOutcome {
     Cooldown { retry_after_secs: i64 },
     /// Global queue is at capacity; no new jobs accepted until existing ones drain.
     QueueFull { limit: i64 },
+    /// Pathological pending embeddings for the active model (>100k unvectored); wait for drain (M2.3.8).
+    EmbedderBacklogFull { pending_count: i64 },
 }
 
 impl Store {
@@ -1502,6 +1504,59 @@ impl Store {
         .await
     }
 
+    /// Write a batch of embeddings in one chunked transaction (M2.3.4 / ADR 0027).
+    /// Called by the drain worker after successful `embed()` calls.
+    pub async fn write_embedding_batch(
+        &self,
+        message_ids: &[String],
+        model_id: &str,
+        dim: usize,
+        vectors: &[Vec<f32>],
+    ) -> Result<()> {
+        let model_id = model_id.to_owned();
+        let rows_data: Vec<(String, Vec<u8>)> = message_ids
+            .iter()
+            .zip(vectors.iter())
+            .map(|(msg_id, vec)| {
+                let blob = vec
+                    .iter()
+                    .flat_map(|f| f.to_le_bytes())
+                    .collect::<Vec<u8>>();
+                (msg_id.clone(), blob)
+            })
+            .collect();
+        let dim_i64 = dim as i64;
+
+        self.run(move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(db_err)?;
+            for (msg_id, blob) in &rows_data {
+                tx.execute(
+                    "INSERT OR REPLACE INTO embeddings (message_id, model_id, dim, vec) VALUES (?1, ?2, ?3, ?4)",
+                    params![msg_id, model_id, dim_i64, blob],
+                )
+                .map_err(db_err)?;
+            }
+            tx.commit().map_err(db_err)
+        })
+        .await
+    }
+
+    /// Mark a message's embed_status as 'failed' after too many attempts (M2.3.6).
+    pub async fn mark_embedding_failed(&self, message_id: &str) -> Result<()> {
+        let msg_id = message_id.to_owned();
+        self.run(move |conn| {
+            conn.execute(
+                "UPDATE messages SET embed_status = 'failed' WHERE message_id = ?1",
+                params![msg_id],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Delete all inbound messages for a chat (e.g. when the chat is deleted).
     pub async fn delete_inbound_chat(&self, chat_jid: &str) -> Result<u32> {
         let jid = chat_jid.to_owned();
@@ -1746,6 +1801,7 @@ impl Store {
     /// # Parameters
     /// - `queue_depth_limit`: maximum allowed active+queued+paused jobs across all chats (0 = unlimited).
     /// - `max_messages`: for `"count"` jobs, clamp `target_value` to this ceiling (0 = no clamp).
+    /// - `active_model_id`: for M2.3.8 pathological-pending circuit breaker; `None` = no embedder configured → skip check.
     pub async fn enqueue_backfill_job(
         &self,
         chat_jid: &str,
@@ -1754,9 +1810,11 @@ impl Store {
         cooldown_secs: i64,
         queue_depth_limit: i64,
         max_messages: i64,
+        active_model_id: Option<&str>,
     ) -> Result<EnqueueOutcome> {
         let jid = chat_jid.to_owned();
         let kind = target_kind.to_owned();
+        let active_model_id = active_model_id.map(|s| s.to_owned());
         let ts = now_secs();
         self.run(move |c| {
             let tx = c.unchecked_transaction().map_err(db_err)?;
@@ -1812,6 +1870,32 @@ impl Store {
                 if depth >= queue_depth_limit {
                     tx.commit().map_err(db_err)?;
                     return Ok(EnqueueOutcome::QueueFull { limit: queue_depth_limit });
+                }
+            }
+
+            // 3b. Pathological-pending embeddings circuit breaker (M2.3.8 / ADR 0015 R3):
+            // count the active-model set-difference (bounded to 100k+1), NOT raw `pending`.
+            // No active model → NO-OP (v3-B2): skip the check entirely when embedder is absent.
+            if let Some(ref model_id) = active_model_id {
+                #[cfg(not(test))]
+                const PENDING_THRESHOLD: i64 = 100_000;
+                #[cfg(test)]
+                const PENDING_THRESHOLD: i64 = 50; // Lower threshold for tests (avoids seeding 100k rows)
+                let pending_count: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM (
+                             SELECT 1 FROM messages m
+                             LEFT JOIN embeddings e ON m.message_id = e.message_id AND e.model_id = ?1
+                             WHERE e.message_id IS NULL AND m.embed_status = 'pending'
+                             LIMIT ?2
+                         )",
+                        params![model_id, PENDING_THRESHOLD + 1],
+                        |row| row.get(0),
+                    )
+                    .map_err(db_err)?;
+                if pending_count > PENDING_THRESHOLD {
+                    tx.commit().map_err(db_err)?;
+                    return Ok(EnqueueOutcome::EmbedderBacklogFull { pending_count });
                 }
             }
 
@@ -4112,7 +4196,7 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-enqueue-dedup");
 
         let outcome1 = store
-            .enqueue_backfill_job("chat1@s.whatsapp.net", "all", None, 0, 0, 0)
+            .enqueue_backfill_job("chat1@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await
             .unwrap();
         let job_id = match outcome1 {
@@ -4123,7 +4207,7 @@ mod tests {
 
         // Second enqueue for same chat → AlreadyActive
         let outcome2 = store
-            .enqueue_backfill_job("chat1@s.whatsapp.net", "count", Some(50), 0, 0, 0)
+            .enqueue_backfill_job("chat1@s.whatsapp.net", "count", Some(50), 0, 0, 0, None)
             .await
             .unwrap();
         match outcome2 {
@@ -4150,7 +4234,7 @@ mod tests {
 
         // Enqueue with cooldown_secs = 3600 (1 hour)
         let outcome = store
-            .enqueue_backfill_job("chat2@s.whatsapp.net", "all", None, 3600, 0, 0)
+            .enqueue_backfill_job("chat2@s.whatsapp.net", "all", None, 3600, 0, 0, None)
             .await
             .unwrap();
         match outcome {
@@ -4179,7 +4263,7 @@ mod tests {
 
         // Enqueue with cooldown_secs = 3600 (1 hour) — should pass
         let outcome = store
-            .enqueue_backfill_job("chat3@s.whatsapp.net", "all", None, 3600, 0, 0)
+            .enqueue_backfill_job("chat3@s.whatsapp.net", "all", None, 3600, 0, 0, None)
             .await
             .unwrap();
         match outcome {
@@ -4197,7 +4281,7 @@ mod tests {
 
         // Enqueue two jobs for different chats
         let out1 = store
-            .enqueue_backfill_job("chatA@s.whatsapp.net", "all", None, 0, 0, 0)
+            .enqueue_backfill_job("chatA@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await
             .unwrap();
         let id1 = match out1 {
@@ -4206,7 +4290,7 @@ mod tests {
         };
 
         let out2 = store
-            .enqueue_backfill_job("chatB@s.whatsapp.net", "count", Some(100), 0, 0, 0)
+            .enqueue_backfill_job("chatB@s.whatsapp.net", "count", Some(100), 0, 0, 0, None)
             .await
             .unwrap();
         let id2 = match out2 {
@@ -4304,7 +4388,7 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-case-guard");
 
         let out = store
-            .enqueue_backfill_job("chatGuard@g.us", "all", None, 0, 0, 0)
+            .enqueue_backfill_job("chatGuard@g.us", "all", None, 0, 0, 0, None)
             .await
             .unwrap();
         let job_id = match out {
@@ -4337,7 +4421,7 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-case-guard-failed");
 
         let out = store
-            .enqueue_backfill_job("chatFail@g.us", "count", Some(100), 0, 0, 0)
+            .enqueue_backfill_job("chatFail@g.us", "count", Some(100), 0, 0, 0, None)
             .await
             .unwrap();
         let job_id = match out {
@@ -4361,7 +4445,7 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-fetched");
 
         let out = store
-            .enqueue_backfill_job("chatFetch@s.whatsapp.net", "count", Some(500), 0, 0, 0)
+            .enqueue_backfill_job("chatFetch@s.whatsapp.net", "count", Some(500), 0, 0, 0, None)
             .await
             .unwrap();
         let job_id = match out {
@@ -4387,7 +4471,7 @@ mod tests {
 
         // Two chats, two jobs
         let out1 = store
-            .enqueue_backfill_job("listA@s.whatsapp.net", "all", None, 0, 0, 0)
+            .enqueue_backfill_job("listA@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await
             .unwrap();
         let id1 = match out1 {
@@ -4395,7 +4479,7 @@ mod tests {
             other => panic!("{:?}", other),
         };
         store
-            .enqueue_backfill_job("listB@s.whatsapp.net", "count", Some(50), 0, 0, 0)
+            .enqueue_backfill_job("listB@s.whatsapp.net", "count", Some(50), 0, 0, 0, None)
             .await
             .unwrap();
 
@@ -4451,20 +4535,20 @@ mod tests {
 
         // Enqueue two jobs for different chats with limit=2
         let o1 = store
-            .enqueue_backfill_job("fullA@s.whatsapp.net", "all", None, 0, 2, 0)
+            .enqueue_backfill_job("fullA@s.whatsapp.net", "all", None, 0, 2, 0, None)
             .await
             .unwrap();
         assert!(matches!(o1, EnqueueOutcome::Accepted { .. }), "first job must be accepted");
 
         let o2 = store
-            .enqueue_backfill_job("fullB@s.whatsapp.net", "all", None, 0, 2, 0)
+            .enqueue_backfill_job("fullB@s.whatsapp.net", "all", None, 0, 2, 0, None)
             .await
             .unwrap();
         assert!(matches!(o2, EnqueueOutcome::Accepted { .. }), "second job must be accepted");
 
         // Third job hits the limit (depth == 2 == limit)
         let o3 = store
-            .enqueue_backfill_job("fullC@s.whatsapp.net", "all", None, 0, 2, 0)
+            .enqueue_backfill_job("fullC@s.whatsapp.net", "all", None, 0, 2, 0, None)
             .await
             .unwrap();
         match o3 {
@@ -4486,7 +4570,7 @@ mod tests {
         for i in 0..10u32 {
             let jid = format!("chat{}@s.whatsapp.net", i);
             let outcome = store
-                .enqueue_backfill_job(&jid, "all", None, 0, 0, 0)
+                .enqueue_backfill_job(&jid, "all", None, 0, 0, 0, None)
                 .await
                 .unwrap();
             assert!(
@@ -4504,7 +4588,7 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-clamp");
 
         let outcome = store
-            .enqueue_backfill_job("clampChat@s.whatsapp.net", "count", Some(100_000), 0, 0, 50_000)
+            .enqueue_backfill_job("clampChat@s.whatsapp.net", "count", Some(100_000), 0, 0, 50_000, None)
             .await
             .unwrap();
         match outcome {
@@ -4527,7 +4611,7 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-no-clamp");
 
         let outcome = store
-            .enqueue_backfill_job("noclampChat@s.whatsapp.net", "count", Some(1_000), 0, 0, 50_000)
+            .enqueue_backfill_job("noclampChat@s.whatsapp.net", "count", Some(1_000), 0, 0, 50_000, None)
             .await
             .unwrap();
         match outcome {
@@ -4549,7 +4633,7 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-all-no-clamp");
 
         let outcome = store
-            .enqueue_backfill_job("allChat@s.whatsapp.net", "all", None, 0, 0, 50_000)
+            .enqueue_backfill_job("allChat@s.whatsapp.net", "all", None, 0, 0, 50_000, None)
             .await
             .unwrap();
         match outcome {
@@ -4569,7 +4653,7 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-zero-max");
 
         let outcome = store
-            .enqueue_backfill_job("zeroclamp@s.whatsapp.net", "count", Some(9999), 0, 0, 0)
+            .enqueue_backfill_job("zeroclamp@s.whatsapp.net", "count", Some(9999), 0, 0, 0, None)
             .await
             .unwrap();
         match outcome {
@@ -4596,13 +4680,13 @@ mod tests {
         let (store, dir) = open_backfill_store("bf-order");
 
         // Fill the queue to capacity with other chats
-        store.enqueue_backfill_job("orderX@s.whatsapp.net", "all", None, 0, 2, 0).await.unwrap();
-        store.enqueue_backfill_job("orderY@s.whatsapp.net", "all", None, 0, 2, 0).await.unwrap();
+        store.enqueue_backfill_job("orderX@s.whatsapp.net", "all", None, 0, 2, 0, None).await.unwrap();
+        store.enqueue_backfill_job("orderY@s.whatsapp.net", "all", None, 0, 2, 0, None).await.unwrap();
 
         // Enqueue a job for orderX again — must get AlreadyActive, NOT QueueFull,
         // because the per-chat check comes first.
         let o = store
-            .enqueue_backfill_job("orderX@s.whatsapp.net", "count", Some(100), 0, 2, 0)
+            .enqueue_backfill_job("orderX@s.whatsapp.net", "count", Some(100), 0, 2, 0, None)
             .await
             .unwrap();
         assert!(
@@ -5406,6 +5490,251 @@ mod tests {
         assert!(
             !plan.to_uppercase().contains("SCAN M"),
             "must not full-scan the messages table; got:\n{plan}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M2.3.8: Circuit breaker tests (Wave A Gap 2) ---
+
+    #[tokio::test]
+    async fn test_circuit_breaker_does_not_trip_when_rows_already_vectored() {
+        // (a) seed >threshold pending rows that ALL have active-model vectors → breaker does NOT trip.
+        let dir = std::env::temp_dir().join(format!("test_circuit_breaker_a_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).unwrap();
+
+        // Seed 60 pending rows (>50 test threshold)
+        for i in 0..60 {
+            store
+                .insert_message(
+                    "chat@s.whatsapp.net",
+                    "sender@s.whatsapp.net",
+                    &format!("msg{}", i),
+                    "text",
+                    Some("hello"),
+                    1000 + i,
+                    false,
+                    "test",
+                    "pending",
+                )
+                .await
+                .unwrap();
+        }
+
+        // Write vectors for ALL of them (for the active model)
+        let message_ids: Vec<String> = (0..60).map(|i| format!("msg{}", i)).collect();
+        let vectors: Vec<Vec<f32>> = (0..60).map(|_| vec![0.1_f32; 4]).collect();
+        store
+            .write_embedding_batch(&message_ids, "test-model", 4, &vectors)
+            .await
+            .unwrap();
+
+        // Try to enqueue a backfill job with the active model — should succeed (no backlog)
+        let outcome = store
+            .enqueue_backfill_job(
+                "test-chat@s.whatsapp.net",
+                "all",
+                None,
+                0,
+                5,
+                50_000,
+                Some("test-model"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, EnqueueOutcome::Accepted { .. }),
+            "breaker should NOT trip when all pending rows are already vectored; got {:?}",
+            outcome
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_trips_when_pending_unvectored_exceeds_threshold() {
+        // (b) seed >threshold pending-and-unvectored rows → breaker trips; after draining, succeeds.
+        let dir = std::env::temp_dir().join(format!("test_circuit_breaker_b_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).unwrap();
+
+        // Seed 60 pending rows (>50 test threshold), NO vectors
+        for i in 0..60 {
+            store
+                .insert_message(
+                    "chat@s.whatsapp.net",
+                    "sender@s.whatsapp.net",
+                    &format!("msg{}", i),
+                    "text",
+                    Some("hello"),
+                    1000 + i,
+                    false,
+                    "test",
+                    "pending",
+                )
+                .await
+                .unwrap();
+        }
+
+        // Try to enqueue — should be rejected (backlog full)
+        let outcome = store
+            .enqueue_backfill_job(
+                "test-chat@s.whatsapp.net",
+                "all",
+                None,
+                0,
+                5,
+                50_000,
+                Some("test-model"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, EnqueueOutcome::EmbedderBacklogFull { .. }),
+            "breaker should trip when pending-unvectored >threshold; got {:?}",
+            outcome
+        );
+
+        // Now write vectors for most of them (bring below threshold)
+        let message_ids: Vec<String> = (0..50).map(|i| format!("msg{}", i)).collect();
+        let vectors: Vec<Vec<f32>> = (0..50).map(|_| vec![0.1_f32; 4]).collect();
+        store
+            .write_embedding_batch(&message_ids, "test-model", 4, &vectors)
+            .await
+            .unwrap();
+
+        // Try again — should succeed now (backlog drained below threshold)
+        let outcome2 = store
+            .enqueue_backfill_job(
+                "test-chat@s.whatsapp.net",
+                "all",
+                None,
+                0,
+                5,
+                50_000,
+                Some("test-model"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome2, EnqueueOutcome::Accepted { .. }),
+            "breaker should NOT trip after draining below threshold; got {:?}",
+            outcome2
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_count_uses_index() {
+        // (c) EXPLAIN QUERY PLAN shows the breaker count uses idx_messages_embed_status.
+        let dir = std::env::temp_dir().join(format!("test_circuit_breaker_c_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).unwrap();
+
+        // Seed a few rows to make the query meaningful
+        for i in 0..5 {
+            store
+                .insert_message(
+                    "chat@s.whatsapp.net",
+                    "sender@s.whatsapp.net",
+                    &format!("msg{}", i),
+                    "text",
+                    Some("hello"),
+                    1000 + i,
+                    false,
+                    "test",
+                    "pending",
+                )
+                .await
+                .unwrap();
+        }
+
+        // Run EXPLAIN QUERY PLAN on the breaker's count query
+        let conn = store.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(*) FROM (
+                     SELECT 1 FROM messages m
+                     LEFT JOIN embeddings e ON m.message_id = e.message_id AND e.model_id = ?1
+                     WHERE e.message_id IS NULL AND m.embed_status = 'pending'
+                     LIMIT ?2
+                 )",
+            )
+            .unwrap();
+        let plan_rows: Vec<String> = stmt
+            .query_map(params!["test-model", 51_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let plan = plan_rows.join("\n");
+        println!("EXPLAIN QUERY PLAN output (circuit breaker count):\n{plan}");
+
+        assert!(
+            plan.contains("idx_messages_embed_status"),
+            "expected circuit breaker count to SEARCH via idx_messages_embed_status; got:\n{plan}"
+        );
+        assert!(
+            !plan.to_uppercase().contains("SCAN M"),
+            "must not full-scan messages table; got:\n{plan}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_noop_when_no_active_model() {
+        // (d) active_model_id = None + many lifetime pending → breaker skipped, enqueue succeeds.
+        let dir = std::env::temp_dir().join(format!("test_circuit_breaker_d_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).unwrap();
+
+        // Seed 100 pending rows (way over threshold)
+        for i in 0..100 {
+            store
+                .insert_message(
+                    "chat@s.whatsapp.net",
+                    "sender@s.whatsapp.net",
+                    &format!("msg{}", i),
+                    "text",
+                    Some("hello"),
+                    1000 + i,
+                    false,
+                    "test",
+                    "pending",
+                )
+                .await
+                .unwrap();
+        }
+
+        // Try to enqueue with NO active model (None) — should succeed (breaker skipped)
+        let outcome = store
+            .enqueue_backfill_job(
+                "test-chat@s.whatsapp.net",
+                "all",
+                None,
+                0,
+                5,
+                50_000,
+                None, // No active model → breaker is NO-OP
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, EnqueueOutcome::Accepted { .. }),
+            "breaker should be NO-OP when no active model, even with 100 pending rows; got {:?}",
+            outcome
         );
 
         let _ = std::fs::remove_dir_all(&dir);
