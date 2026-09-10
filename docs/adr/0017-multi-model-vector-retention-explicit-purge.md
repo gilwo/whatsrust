@@ -73,3 +73,21 @@ open item is resolved to **in-memory** for M2 v1 — a process-local `(message_i
 map owned by the drain worker, cap 3 → `embed_status='failed'`. **No `embed_failures` table, no schema
 bump** (`CURRENT_SCHEMA_VERSION` stays 8). Accepted tradeoff: attempt counts reset on daemon restart
 (benign). Promotable to a durable table later (additive, lossless). See ADR 0038.
+
+## M2.5 correction — pragma-ordering bug (2026-09-01)
+
+Implementing the explicit per-model purge (M2.5.2) surfaced a **pre-existing latent bug**: the
+`PRAGMA incremental_vacuum` used both by this purge and by the storage watchdog (`storage.rs`) was a
+**silent no-op on every database**, not just on lineage-v0 ones. Root cause: `auto_vacuum` can only be
+changed on a pristine, never-written database, but the connection-setup batch ran `PRAGMA
+journal_mode = WAL` (which writes to the file) **before** `PRAGMA auto_vacuum = INCREMENTAL`, so the
+auto_vacuum change was silently ignored and every freshly-created DB stayed `NONE`. Verified with raw
+`sqlite3`: WAL-first → `auto_vacuum=0`; auto_vacuum-first → `auto_vacuum=2`.
+
+**Fix:** `auto_vacuum = INCREMENTAL` is now the FIRST pragma in the batch, before `journal_mode = WAL`.
+Newly-created DBs now get `INCREMENTAL`, so `incremental_vacuum` (purge + watchdog) actually reclaims
+space. **Pre-existing DBs stay `NONE`** — a reorder cannot retroactively fix an already-written file;
+only a full `VACUUM` would, which is deliberately out of scope (R-prior5 forbids locking VACUUM).
+The purge therefore reports `bytes_reclaimed` from a **measured** before/after on-disk footprint and
+emits a WARN when `auto_vacuum` is not `INCREMENTAL`, so a stuck DB yields an honest, diagnosable
+`0 bytes reclaimed` instead of a false claim.

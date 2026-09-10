@@ -261,6 +261,10 @@ fn tool_definitions() -> Vec<Value> {
                 "message_id":{"type":"string","description":"ID returned when status was posted"},
                 "privacy":{"type":"string"}
             },"required":["recipients","message_id"]})),
+        tool_def("whatsrust_purge_embeddings", "Purge all embeddings for a given model and reclaim disk space (M2.5)",
+            json!({"type":"object","properties":{
+                "model_id":{"type":"string","description":"Model ID to purge embeddings for"}
+            },"required":["model_id"]})),
     ]
 }
 
@@ -335,6 +339,7 @@ fn call_tool(name: &str, args: &Value, port: u16) -> Value {
         "whatsrust_status_image" => http_post(port, "/api/status-image", args),
         "whatsrust_status_video" => http_post(port, "/api/status-video", args),
         "whatsrust_status_revoke" => http_post(port, "/api/status-revoke", args),
+        "whatsrust_purge_embeddings" => http_post(port, "/api/embeddings/purge", args),
         _ => Err(format!("unknown tool: {name}")),
     };
 

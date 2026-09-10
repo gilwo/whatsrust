@@ -420,6 +420,9 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         ("GET", "/api/history-fetch") => handle_history_fetch_status(bridge, req).await,
         ("POST", "/api/history-fetch/cancel") => handle_history_fetch_cancel(bridge, &req.body).await,
 
+        // Embeddings purge (M2.5)
+        ("POST", "/api/embeddings/purge") => handle_purge_embeddings(bridge, &req.body).await,
+
         _ => json_err(404, "not found"),
     }
 }
@@ -1184,6 +1187,11 @@ struct HistoryFetchCancelReq {
     job_id: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct PurgeEmbeddingsReq {
+    model_id: Option<String>,
+}
+
 /// POST /api/history-fetch/cancel — cancel a backfill job.
 async fn handle_history_fetch_cancel(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: HistoryFetchCancelReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
@@ -1195,6 +1203,24 @@ async fn handle_history_fetch_cancel(bridge: &WhatsAppBridge, body: &[u8]) -> Ve
         Ok(0) => json_err(404, "job not found"),
         Ok(_) => json_ok(json!({"job_id": job_id, "status": "cancelled"})),
         Err(e) => json_err(500, &e.to_string()),
+    }
+}
+
+async fn handle_purge_embeddings(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: PurgeEmbeddingsReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+
+    let model_id = match req.model_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(m) => m,
+        None => return json_err(400, "model_id is required"),
+    };
+
+    match bridge.purge_embeddings(model_id).await {
+        Ok(result) => json_ok(json!({
+            "model_id": result.model_id,
+            "rows_deleted": result.rows_deleted,
+            "bytes_reclaimed": result.bytes_reclaimed,
+        })),
+        Err(e) => json_err(500, &format!("purge failed: {e}")),
     }
 }
 
