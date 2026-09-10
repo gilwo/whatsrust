@@ -60,3 +60,11 @@ Embedding models can be monolingual (English-only) or multilingual (100+ languag
 **Deferred:**
 - Trigram FTS5 index as fallback for CJK-without-embedder (option C) — additive, can be added later if needed
 - Language detection (not needed; embedder handles all languages)
+
+## Model rollout (2026-08-30, see ADR 0039)
+
+Concrete model path chosen: **MVP `paraphrase-multilingual-MiniLM-L12-v2`** (384-dim, prefix-free) via
+a Python sidecar → evolve to **`BAAI/bge-m3`** (1024-dim, prefix-free). The **e5** family listed above
+as an example is **excluded for now**: it needs asymmetric `"query:"`/`"passage:"` prefixes that the
+current symmetric `embed()` protocol can't express (see ADR 0024/0039). Prefix-free models only until
+the protocol grows a query/passage hint.
