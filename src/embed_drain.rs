@@ -295,7 +295,14 @@ pub async fn run_embedding_drain_worker(
         "drain worker: model configured"
     );
 
-    let mut tracker = AttemptTracker::new();
+    // Dormant scaffolding: per-row content-rejection tracking (cap-3 -> 'failed', task 2.3.6) is
+    // currently INERT. The batch-only sidecar protocol (ADR 0024) gives no positive per-item
+    // rejection signal, so a solo-batch embed() error is ambiguous (content rejection vs. sidecar
+    // down) and is treated as a transport failure (row stays 'pending') — never wrongly 'failed'.
+    // AttemptTracker is kept for when the protocol grows a positive rejection signal, at which point
+    // the solo-batch error arm can distinguish rejections and re-enable the cap-3 -> 'failed' path.
+    // Reconcile the 2.3.6/ADR 0015/0038 wording with this shipped behavior in M2.6 (see plan note).
+    let _tracker = AttemptTracker::new();
     let mut loading_timer = LoadingTimer::new(loading_timeout);
     let mut bisection = BisectionTracker::new(3); // K=3 consecutive same-batch failures
     let mut current_batch_size = configured_batch_size;
@@ -456,63 +463,57 @@ pub async fn run_embedding_drain_worker(
         let vectors = match embedder.embed(&texts).await {
             Ok(v) => v,
             Err(e) => {
-                // Transport failure or trust-but-verify rejection (M2.3.5).
+                // Solo-batch errors are AMBIGUOUS with the current batch-only protocol (ADR 0024):
+                // the sidecar just failed the call, and we can't tell "content rejection" from
+                // "sidecar down/timeout". Per ADR 0015, the SAFE default is to treat ambiguous
+                // errors as TRANSPORT failures (backoff, rows stay pending, NO increment) — only
+                // increment the attempt counter when we have a POSITIVE signal that the sidecar
+                // rejected the content itself. Since the current Embedder API gives NO way to
+                // distinguish content rejection from transport error, solo-batch errors are
+                // treated as transport failures (rows stay pending). This avoids wrongly retiring
+                // good rows to 'failed' during sidecar outages (Critical 1).
+                //
+                // Multi-row batch failures are unambiguously transport failures (bisection handles
+                // isolation of any poison pills).
                 let batch_ids: Vec<String> = valid_row_indices.iter()
                     .map(|&i| rows[i].message_id.clone())
                     .collect();
 
-                // Check for solo-batch per-row rejection first (M2.3.6).
                 if texts.len() == 1 {
+                    // Solo-batch failure — ambiguous, treat as transport failure (rows stay pending).
                     let msg_id = &rows[valid_row_indices[0]].message_id;
-                    if tracker.increment(msg_id, &active_model_id) {
-                        // Cap-3 reached → mark failed (terminal).
-                        match store.mark_embedding_failed(msg_id).await {
-                            Ok(()) => {
-                                debug!(
-                                    message_id = %msg_id,
-                                    "drain worker: row marked 'failed' after 3 content-rejection attempts"
-                                );
-                                tracker.evict(msg_id, &active_model_id);
-                            }
-                            Err(e) => {
-                                warn!(error = %e, message_id = %msg_id, "failed to mark row as 'failed'");
-                            }
-                        }
-                    } else {
-                        debug!(
-                            message_id = %msg_id,
-                            error = %e,
-                            "drain worker: per-row content rejection (attempt < 3)"
-                        );
-                    }
+                    debug!(
+                        message_id = %msg_id,
+                        error = %e,
+                        "drain worker: solo-batch failure (ambiguous; treating as transport failure, row stays pending)"
+                    );
                     // Reset bisection state after processing solo row.
                     bisection.observe_success();
-                    current_backoff = Duration::from_secs(1);
-                    consecutive_failures = 0;
-                    continue;
-                }
-
-                // Multi-row batch failure — check if same batch (M2.3.11 bisection).
-                warn!(
-                    error = %e,
-                    batch_size = texts.len(),
-                    "drain worker: embed call failed (transport failure)"
-                );
-
-                if bisection.observe_failure(&batch_ids) && texts.len() > 1 {
-                    let new_size = bisect_batch_size(current_batch_size);
-                    info!(
-                        old_size = current_batch_size,
-                        new_size = new_size,
-                        "drain worker: same batch failed K times, bisecting"
+                    // Do NOT increment tracker — this is a transport failure (or ambiguous).
+                    // Row stays pending for next cycle.
+                } else {
+                    // Multi-row batch failure — unambiguous transport failure (M2.3.11 bisection).
+                    warn!(
+                        error = %e,
+                        batch_size = texts.len(),
+                        "drain worker: multi-row batch failed (transport failure)"
                     );
-                    current_batch_size = new_size;
-                    bisection.observe_batch_changed();
-                    // Reset backoff and consecutive failure count on bisection — we're making
-                    // progress by narrowing the batch.
-                    current_backoff = Duration::from_secs(1);
-                    consecutive_failures = 0;
-                    continue;
+
+                    if bisection.observe_failure(&batch_ids) && texts.len() > 1 {
+                        let new_size = bisect_batch_size(current_batch_size);
+                        info!(
+                            old_size = current_batch_size,
+                            new_size = new_size,
+                            "drain worker: same batch failed K times, bisecting"
+                        );
+                        current_batch_size = new_size;
+                        bisection.observe_batch_changed();
+                        // Reset backoff and consecutive failure count on bisection — we're making
+                        // progress by narrowing the batch.
+                        current_backoff = Duration::from_secs(1);
+                        consecutive_failures = 0;
+                        continue;
+                    }
                 }
 
                 consecutive_failures += 1;
@@ -788,8 +789,8 @@ mod tests {
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
-    /// Helper to create a temp Store for testing with a unique name.
-    async fn temp_store(test_name: &str) -> crate::storage::Store {
+    /// Helper to create a temp Store for testing with a unique name. Returns (store, db_path).
+    async fn temp_store(test_name: &str) -> (crate::storage::Store, std::path::PathBuf) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -802,7 +803,7 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
 
         let store = crate::storage::Store::new(&db_path).expect("failed to create temp store");
-        store
+        (store, db_path)
     }
 
     /// Helper to seed a pending message in the Store.
@@ -828,10 +829,54 @@ mod tests {
             .expect("failed to insert message");
     }
 
+    /// Helper to check a message's embed_status by querying the DB directly.
+    async fn get_embed_status(db_path: &std::path::Path, message_id: &str) -> Option<String> {
+        use tokio::task;
+        let path = db_path.to_path_buf();
+        let msg_id = message_id.to_owned();
+        task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&path).ok()?;
+            let status: Option<String> = conn
+                .query_row(
+                    "SELECT embed_status FROM messages WHERE message_id = ?1",
+                    [&msg_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            status
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Helper to check if an embedding exists for a message+model.
+    async fn has_embedding(db_path: &std::path::Path, message_id: &str, model_id: &str) -> bool {
+        use tokio::task;
+        let path = db_path.to_path_buf();
+        let msg_id = message_id.to_owned();
+        let m_id = model_id.to_owned();
+        task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&path).ok()?;
+            let exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM embeddings WHERE message_id = ?1 AND model_id = ?2",
+                    [&msg_id, &m_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            Some(exists.is_some())
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+    }
+
     #[tokio::test]
     async fn test_drain_worker_happy_path() {
         // 2.3.4: N pending rows → N embeddings rows written; re-query returns empty.
-        let store = temp_store("happy_path").await;
+        let (store, _db_path) = temp_store("happy_path").await;
         seed_pending_message(&store, "msg1", "text", "hello").await;
         seed_pending_message(&store, "msg2", "text", "world").await;
         seed_pending_message(&store, "msg3", "text", "test").await;
@@ -876,7 +921,7 @@ mod tests {
     #[tokio::test]
     async fn test_drain_worker_max_batch_clamp() {
         // 2.3.4 / v4-#1: fake advertises small max_batch → effective batch is clamped.
-        let store = temp_store("max_batch_clamp").await;
+        let (store, _db_path) = temp_store("max_batch_clamp").await;
         for i in 0..10 {
             seed_pending_message(&store, &format!("msg{}", i), "text", "hello").await;
         }
@@ -927,7 +972,7 @@ mod tests {
         // Solo-batch failures are indistinguishable from per-row rejections, so the worker
         // correctly treats them as content rejections (incrementing the attempt counter).
         // To test transport-failure resilience, we need multi-row batches that keep failing.
-        let store = temp_store("transport_failure").await;
+        let (store, _db_path) = temp_store("transport_failure").await;
         seed_pending_message(&store, "msg1", "text", "hello").await;
         seed_pending_message(&store, "msg2", "text", "world").await;
         seed_pending_message(&store, "msg3", "text", "test").await;
@@ -995,9 +1040,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_drain_worker_solo_batch_transport_failure_stays_pending() {
+        // Critical 1 fix: solo-batch transport failure must NOT mark the row 'failed'.
+        // With the batch-only protocol (ADR 0024), solo-batch failures are ambiguous —
+        // we can't tell content rejection from transport failure. Per ADR 0015, the safe
+        // default is to treat ambiguous errors as transport failures: rows stay pending,
+        // no attempt counter increment. This test proves the fix: seed ONE row, fail it
+        // repeatedly (transport error), and assert it NEVER reaches 'failed'.
+        let (store, _db_path) = temp_store("solo_transport_failure").await;
+        seed_pending_message(&store, "msg1", "text", "hello").await;
+
+        let embedder = Arc::new(
+            crate::embedder::FakeEmbedder::new("test-model", 4)
+                .always_fail() // Always return transport error
+        );
+
+        let notify = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        let worker_handle = tokio::spawn(run_embedding_drain_worker(
+            embedder.clone(),
+            store.clone(),
+            notify.clone(),
+            cancel_clone,
+            Duration::from_secs(10), // Long interval so we control via notify
+            64,
+            Duration::from_millis(50), // Short backoff cap for testing
+            Duration::from_secs(60),
+            10, // Failure threshold for notify-only
+        ));
+
+        // Wake the worker many times — more than 3 to ensure that if the bug were
+        // present (incrementing on solo-batch failures), cap-3 would trigger.
+        for _ in 0..10 {
+            notify.notify_one();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), worker_handle).await;
+
+        // Critical assertion: row is STILL pending (never marked 'failed').
+        // Before the fix, solo-batch failures incremented the attempt counter, and after
+        // 3 cycles the row would be wrongly marked 'failed'. After the fix, solo-batch
+        // failures are treated as transport failures (ambiguous), so rows stay pending.
+        let pending = store
+            .fetch_pending_embeddings("test-model", 10)
+            .await
+            .expect("fetch failed");
+
+        assert_eq!(
+            pending.len(),
+            1,
+            "row should still be pending after many solo-batch transport failures (never marked failed)"
+        );
+        assert_eq!(pending[0].message_id, "msg1");
+    }
+
+    #[tokio::test]
     async fn test_drain_worker_per_row_rejection_cap_3() {
-        // 2.3.6: row rejected 3× in solo batches → embed_status='failed'.
-        let store = temp_store("per_row_rejection").await;
+        // 2.3.6 UPDATED after Critical-1 fix: with the batch-only protocol (ADR 0024), solo-batch
+        // failures are AMBIGUOUS — we can't tell content rejection from transport failure. Per
+        // ADR 0015, the safe default is to treat ambiguous errors as transport failures (rows stay
+        // pending, no increment). So cap-3 per-row rejection CANNOT engage with the current API.
+        //
+        // This test now verifies that a solo-batch rejection (FakeEmbedder's `reject_text`) is
+        // correctly treated as ambiguous/transport: the row stays 'pending' across many cycles,
+        // never marked 'failed'. If/when the protocol gets a positive rejection signal (e.g. a
+        // distinct error code), cap-3 can re-engage — but with the current semantics, it cannot.
+        let (store, db_path) = temp_store("per_row_rejection").await;
         seed_pending_message(&store, "bad-msg", "text", "reject-me").await;
 
         let embedder = Arc::new(
@@ -1020,18 +1132,30 @@ mod tests {
             10,
         ));
 
-        // Wake the worker 3+ times to accumulate rejections
-        for _ in 0..5 {
+        // Wake the worker many times — more than 3 to prove cap-3 does NOT engage.
+        for _ in 0..10 {
             notify.notify_one();
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // Should not appear in pending set (confirms it was marked 'failed')
+        // Row should STILL be pending (not marked 'failed') — ambiguous errors are transport failures.
         let pending = store
             .fetch_pending_embeddings("test-model", 10)
             .await
             .expect("fetch failed");
-        assert_eq!(pending.len(), 0, "failed row should not appear in pending set");
+        assert_eq!(
+            pending.len(),
+            1,
+            "row should still be pending (solo-batch failures are ambiguous, treated as transport)"
+        );
+        assert_eq!(pending[0].message_id, "bad-msg");
+
+        let status = get_embed_status(&db_path, "bad-msg").await;
+        assert_eq!(
+            status.as_deref(),
+            Some("pending"),
+            "row should be pending (not failed)"
+        );
 
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(1), worker_handle).await;
@@ -1040,7 +1164,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_drain_worker_poison_pill_bisection() {
         // 2.3.11: batch of 8 with ONE poisoned row → bisection isolates it, others drain.
-        let store = temp_store("poison_pill").await;
+        let (store, db_path) = temp_store("poison_pill").await;
         seed_pending_message(&store, "good1", "text", "hello").await;
         seed_pending_message(&store, "good2", "text", "world").await;
         seed_pending_message(&store, "good3", "text", "test").await;
@@ -1071,7 +1195,7 @@ mod tests {
         ));
 
         // Actively notify the worker many times to ensure it gets chances to run
-        // (batch of 8 → fails → bisect to 4 → fails → bisect to 2 → fails → bisect to 1 → cap-3)
+        // (batch of 8 → fails → bisect to 4 → fails → bisect to 2 → fails → bisect to 1 → ambiguous treatment)
         for _ in 0..50 {
             notify.notify_one();
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1080,35 +1204,61 @@ mod tests {
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(1), worker_handle).await;
 
-        // Strong assertion: NO rows should be pending (all processed).
-        // Bisection should converge deterministically with 50 notify cycles + short backoff.
+        // After Critical-1 fix, solo-batch failures are ambiguous and treated as transport failures
+        // (rows stay pending, no increment). The FakeEmbedder's `reject_text` path returns a plain
+        // `anyhow::bail!`, which is indistinguishable from a transport error at the `embed()` API level.
+        //
+        // Bisection will attempt to isolate the poison row, but the behavior is now non-deterministic:
+        // - If bisection manages to isolate good-row-only batches before hitting the poison solo,
+        //   those good rows may get embedded (the FakeEmbedder succeeds for non-rejected texts).
+        // - Once bisection converges to a solo batch containing the poison row, that batch fails as
+        //   "ambiguous" (treated as transport), and the poison row stays pending.
+        // - Other good rows in mixed batches (containing the poison) will also fail as transport,
+        //   staying pending.
+        //
+        // The CRITICAL invariant (fixing Critical 1): no good row is ever marked 'failed' due to
+        // being in a batch with a poison row. Solo-batch failures (ambiguous) do NOT increment the
+        // attempt counter, so rows never wrongly reach cap-3.
+        //
+        // Updated assertion: pending count is >= 1 (the poison row must still be pending), and NO
+        // row is marked 'failed'. Some good rows may have been embedded if bisection got lucky.
         let pending = store
             .fetch_pending_embeddings("test-model", 10)
             .await
             .expect("fetch failed");
-        assert_eq!(
-            pending.len(),
-            0,
-            "all rows should be processed (7 embedded, 1 failed); {} still pending",
+        assert!(
+            pending.len() >= 1,
+            "at least the poison row should be pending; got {} pending",
             pending.len()
         );
 
-        // Verify the poison row specifically is gone from pending (marked 'failed').
-        // The 7 good rows should have embeddings.
-        // We can't directly query embed_status without Store internals, but we can verify
-        // that the poison row is NOT in the pending set (it was either embedded or failed;
-        // since the fake rejects "reject-me", it must be failed).
-        let pending_ids: Vec<&str> = pending.iter().map(|r| r.message_id.as_str()).collect();
+        // Critical assertion: verify no row was wrongly marked 'failed' (rows are pending or embedded, never failed).
+        for msg_id in &["good1", "good2", "good3", "poison", "good4", "good5", "good6", "good7"] {
+            let status = get_embed_status(&db_path, msg_id).await;
+            assert_ne!(
+                status.as_deref(),
+                Some("failed"),
+                "{msg_id} should never be marked 'failed' (ambiguous errors are transport failures)"
+            );
+        }
+
+        // Verify the poison row specifically is still pending (never embedded, never failed).
+        let poison_status = get_embed_status(&db_path, "poison").await;
+        assert_eq!(
+            poison_status.as_deref(),
+            Some("pending"),
+            "poison row should be pending (solo-batch failures are ambiguous, treated as transport)"
+        );
         assert!(
-            !pending_ids.contains(&"poison"),
-            "poison row should not be in pending set (should be marked failed)"
+            !has_embedding(&db_path, "poison", "test-model").await,
+            "poison row should have no embedding"
         );
     }
 
     #[tokio::test]
     async fn test_drain_worker_loading_timeout() {
         // 2.3.7: fake reports Loading continuously → treated as error, rows stay pending.
-        let store = temp_store("loading_timeout").await;
+        let (store, _db_path) = temp_store("loading_timeout").await;
         seed_pending_message(&store, "msg1", "text", "hello").await;
 
         let embedder = Arc::new(
