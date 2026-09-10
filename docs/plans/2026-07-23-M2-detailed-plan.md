@@ -368,6 +368,25 @@ outages never count against that cap), **a single poison-pill message can't live
 > incl. deterministic poison-pill isolation + transport-resilience, 4 circuit-breaker). Touched
 > `api.rs`/`backfill.rs` beyond the Wave-A file list (the 2.3.8 fold-in + ~25 call-site churn).
 > Delegated over 3 passes (initial + 2 corrective for missing loop-level/breaker tests). [ADR 0015/0017/0024/0027/0038]
+>
+> **Post-implementation code review (2026-08-05) found + fixed 2 CRITICALs:** (C1) solo-batch
+> `embed()` failures were incrementing the per-row attempt counter and could wrongly mark a *good* row
+> `failed` during a sidecar outage (bisection converges good batches to solo). Fixed: with the
+> batch-only protocol (ADR 0024) a solo-batch error is AMBIGUOUS (content rejection vs. transport),
+> so per ADR 0015's safe default it's now treated as a **transport failure** — row stays `pending`,
+> never `failed`, no increment. **Consequence: per-row content rejection (2.3.6, cap-3 → `failed`) is
+> now INERT** — a genuine poison-pill row stays `pending` indefinitely rather than retiring to
+> `failed` (FTS5 lexical unaffected). `AttemptTracker` kept as dormant scaffolding
+> (`embed_drain.rs:298`). (C2) `WhatsAppBridge::active_model_id()` returned a hardcoded `None` (TODO
+> stub), which **entirely disabled the 2.3.8 circuit breaker in production** (tests passed only
+> because they bound `active_model_id` directly). Fixed: the single shared embedder now lives in an
+> `Arc<parking_lot::Mutex<Option<Arc<dyn Embedder>>>>` field populated in `run_bridge`, and
+> `active_model_id()` reads `model_info().model_id` from it. Both fixes have dedicated regression
+> tests (`test_drain_worker_solo_batch_transport_failure_stays_pending`,
+> `test_active_model_id_returns_configured_embedder_model`). Suite green: **293 lib / 306 bin**.
+> **→ DEFERRED TO M2.6 (user decision 2026-08-05):** reconcile the 2.3.6 / ADR 0015 / ADR 0038 wording
+> with the shipped "solo-batch = transport, cap-3 deferred" behavior, OR add a positive per-item
+> rejection signal to ADR 0024 and re-enable cap-3. See M2.6.7.
 
 ---
 
@@ -424,6 +443,7 @@ the M1 watchdog story still holds (or explicitly extend it).
 | 2.6.4 | Add the "misbehave"-mode integration test: spawn the fake-sidecar (misbehave on) as a real child via `StdioEmbedder` → prove trust-but-verify (2.1.5) rejects the malformed batch over a real process boundary (the happy-path real-subprocess round-trip already lands in 2.1.8). | `cargo test` runs it as a real subprocess test; CI-safe (no live network, no live WA, no flaky timing). |
 | 2.6.5 | Watchdog/observability cross-check (ADR 0013): the existing storage-growth watchdog (`bridge.rs:2030-2115`) measures whole-file footprint, so `embeddings`-table growth is already implicitly covered (there is no `embed_failures` table — F-D is in-memory) — confirm this holds. Separately decide whether a `pending`-count-specific surfacing (e.g. a periodic log line or a `/api/status` field) is in scope for M2 or deferred, since ADR 0013 measures bytes, not embed-status backlog. | Decision recorded; if implemented, a test/log-format assertion; if deferred, noted here as a follow-up (non-blocking for M2 exit). |
 | 2.6.6 | **Reword the stale "deferred to M2" multi-worker-backfill comments (F-K, review v4-#7):** `bridge.rs:727-729`, `main.rs:327-331` (runtime `warn!`), `.env.example:82/117` — drop the "M2" promise (semantic-search M2 does NOT deliver multi-worker backfill; single-worker FIFO stands per ADR 0026) or name it as a future item. Doc/comment-only, no behavior change. | Grep shows no remaining comment implying multi-worker backfill lands in *this* M2. |
+| 2.6.7 | **Reconcile the inert per-row-rejection semantics (deferred from M2.3 review, user decision 2026-08-05).** The M2.3 code-review fix made 2.3.6 (cap-3 → `failed`) INERT: the batch-only protocol (ADR 0024) can't distinguish a content rejection from a transport failure, so solo-batch errors are treated as transport (row stays `pending`, never wrongly `failed`; `AttemptTracker` dormant at `embed_drain.rs:298`). Decide + apply ONE: (a) update the 2.3.6/2.3.11 task text + ADR 0015 (cap-3) + ADR 0038 to document "solo-batch = ambiguous = transport; cap-3 deferred pending a protocol signal" as the accepted v1 behavior; OR (b) add a positive per-item rejection signal to ADR 0024 (e.g. a `rejected_indices` array in the `embed` response) + fake-sidecar support + `StdioEmbedder` parsing + re-enable cap-3 → `failed`, evicting the dormant-scaffolding note. (a) is the low-scope path; (b) is real added scope. | The chosen path is applied; docs/ADRs and code agree; if (b), a poison-pill row reaches `failed` again with a test proving it. |
 
 **M2.6 exit:** embedder config is fully plumbed through `.env`/`BridgeConfig`/`.env.example`; a
 real (non-fake, real-subprocess) stdio JSON-RPC round-trip is covered by CI-safe tests; the
