@@ -1557,6 +1557,78 @@ impl Store {
         .await
     }
 
+    /// Fetch embeddings for a set of message IDs filtered to the active model (M2.4.3).
+    /// Returns a map of `message_id -> Vec<f32>`. Vectors are decoded from little-endian
+    /// f32 BLOBs (matching `write_embedding_batch`'s encoding). Messages without a vector
+    /// for the given model are absent from the result map (NOT an error — partial coverage
+    /// during drain catch-up is routine).
+    pub async fn fetch_embeddings_for_candidates(
+        &self,
+        message_ids: &[String],
+        model_id: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
+        if message_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let ids = message_ids.to_vec();
+        let model = model_id.to_owned();
+
+        self.run(move |conn| {
+            // Construct IN clause placeholders
+            let placeholders = (0..ids.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT message_id, vec, dim FROM embeddings WHERE model_id = ?1 AND message_id IN ({})",
+                placeholders
+            );
+
+            let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+            let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(model)];
+            for id in &ids {
+                params_vec.push(Box::new(id.clone()));
+            }
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+
+            let rows = stmt
+                .query_map(params_refs.as_slice(), |row| {
+                    let message_id: String = row.get(0)?;
+                    let blob: Vec<u8> = row.get(1)?;
+                    let dim: i64 = row.get(2)?;
+                    Ok((message_id, blob, dim))
+                })
+                .map_err(db_err)?;
+
+            let mut result = std::collections::HashMap::new();
+            for row in rows {
+                let (message_id, blob, dim) = row.map_err(db_err)?;
+                // Decode little-endian f32 BLOB (M2.3.4 / write_embedding_batch encoding).
+                if blob.len() % 4 != 0 {
+                    return Err(db_err(rusqlite::Error::InvalidQuery));
+                }
+                let vector: Vec<f32> = blob
+                    .chunks_exact(4)
+                    .map(|chunk| {
+                        let arr: [u8; 4] = chunk.try_into().expect("chunks_exact(4) guarantees 4 bytes");
+                        f32::from_le_bytes(arr)
+                    })
+                    .collect();
+
+                if vector.len() != dim as usize {
+                    return Err(db_err(rusqlite::Error::InvalidQuery));
+                }
+
+                result.insert(message_id, vector);
+            }
+
+            Ok(result)
+        })
+        .await
+    }
+
     /// Delete all inbound messages for a chat (e.g. when the chat is deleted).
     pub async fn delete_inbound_chat(&self, chat_jid: &str) -> Result<u32> {
         let jid = chat_jid.to_owned();
@@ -5736,6 +5808,115 @@ mod tests {
             "breaker should be NO-OP when no active model, even with 100 pending rows; got {:?}",
             outcome
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M2.4: fetch_embeddings_for_candidates tests ---
+
+    #[tokio::test]
+    async fn test_fetch_embeddings_for_candidates_basic() {
+        let dir = std::env::temp_dir().join(format!("test_fetch_emb_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).unwrap();
+
+        // Insert a message
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("hello"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        // Write an embedding for model A
+        let vec_a = vec![0.1, 0.2, 0.3];
+        store
+            .write_embedding_batch(&["msg1".to_string()], "modelA", 3, &[vec_a.clone()])
+            .await
+            .unwrap();
+
+        // Fetch for model A
+        let result = store
+            .fetch_embeddings_for_candidates(&["msg1".to_string()], "modelA")
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let fetched = result.get("msg1").unwrap();
+        assert_eq!(fetched.len(), 3);
+        assert!((fetched[0] - 0.1).abs() < 1e-6);
+        assert!((fetched[1] - 0.2).abs() < 1e-6);
+        assert!((fetched[2] - 0.3).abs() < 1e-6);
+
+        // Fetch for model B (no vectors) → empty result
+        let result_b = store
+            .fetch_embeddings_for_candidates(&["msg1".to_string()], "modelB")
+            .await
+            .unwrap();
+        assert_eq!(result_b.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_embeddings_partial_coverage() {
+        let dir = std::env::temp_dir().join(format!("test_fetch_partial_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).unwrap();
+
+        // Insert 3 messages
+        for i in 1..=3 {
+            store
+                .insert_message(
+                    "chat@s.whatsapp.net",
+                    "sender@s.whatsapp.net",
+                    &format!("msg{}", i),
+                    "text",
+                    Some("hello"),
+                    1000 + i as i64,
+                    false,
+                    "test",
+                    "pending",
+                )
+                .await
+                .unwrap();
+        }
+
+        // Write embeddings for msg1 and msg3 only (msg2 is unvectored)
+        store
+            .write_embedding_batch(
+                &["msg1".to_string(), "msg3".to_string()],
+                "modelA",
+                2,
+                &[vec![0.1, 0.2], vec![0.3, 0.4]],
+            )
+            .await
+            .unwrap();
+
+        // Fetch all three candidate IDs
+        let result = store
+            .fetch_embeddings_for_candidates(
+                &["msg1".to_string(), "msg2".to_string(), "msg3".to_string()],
+                "modelA",
+            )
+            .await
+            .unwrap();
+
+        // Should return only msg1 and msg3 (msg2 absent from map, not an error)
+        assert_eq!(result.len(), 2);
+        assert!(result.contains_key("msg1"));
+        assert!(result.contains_key("msg3"));
+        assert!(!result.contains_key("msg2"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
