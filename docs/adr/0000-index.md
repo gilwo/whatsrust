@@ -51,6 +51,7 @@ This directory contains Architecture Decision Records (ADRs) for the whatsrust p
 | [0036](0036-metadata-kv-table.md) | Generic metadata KV table for singleton scalars | 2026-06-22 | Accepted |
 | [0037](0037-enable-history-sync-for-dm-tctokens.md) | Enable history sync by default to obtain 1:1-DM trusted-contact tokens | 2026-07-01 | Accepted |
 | [0038](0038-m2-drain-text-sourcing-and-failure-handling.md) | M2 embedding-drain text sourcing and failure handling | 2026-07-23 | Accepted |
+| [0039](0039-embedding-model-rollout-mvp-minilm-to-bge-m3.md) | Embedding-model rollout: MVP MiniLM (Python sidecar) → bge-m3; prefix-free only | 2026-08-30 | Accepted |
 
 ## Revised ADRs
 
@@ -82,4 +83,4 @@ The following ADRs received M2-refinement pointers during M2 planning (2026-07-2
 
 ## Future ADRs
 
-Start numbering at 0039. Follow the established format. Keep each ADR focused on one decision.
+Start numbering at 0040. Follow the established format. Keep each ADR focused on one decision.
