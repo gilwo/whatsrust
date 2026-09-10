@@ -29,6 +29,7 @@ Two failure modes exist:
 **Per-row content rejection** (sidecar rejects specific text):
 - Increment that row's attempt counter
 - Cap 3 attempts → `embed_status='failed'` (terminal state)
+- **v1 accepted behavior (M2.3 code-review C1, reconciled M2.6.7):** The batch-only `embed` protocol (ADR 0024) cannot distinguish per-item content rejection from transport failure when a solo-batch fails. Per the safe-default principle above, solo-batch failures are treated as transport (row stays `pending`, no increment) — the cap-3 mechanism is dormant scaffolding in v1. A genuinely-unembeddable row stays `pending` indefinitely (bisection isolates it, but never wrongly marks it `failed` during a sidecar outage). FTS5 lexical search is unaffected. Activating cap-3 requires adding a positive per-item rejection signal to ADR 0024 (e.g. `rejected_indices` array in the `embed` response) — deferred.
 
 ## Consequences
 

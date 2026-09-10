@@ -772,9 +772,9 @@ pub struct BridgeConfig {
     /// Maximum concurrent backfill jobs (default: 1).
     /// Guarded: ceiling 3 (WHATSRUST_DANGEROUSLY_ALLOW_HIGH_CONCURRENCY to override).
     ///
-    /// **NOTE (M1):** this field is validated for safety but is **not yet wired** into the
-    /// worker — M1 runs a single-FIFO backfill worker regardless of this value.
-    /// Multi-worker support is deferred to M2. A startup warn! is emitted when > 1.
+    /// **NOTE:** this field is validated for safety but is **not yet wired** into the
+    /// worker — single-FIFO backfill is the standing design (ADR 0026).
+    /// Multi-worker concurrency is a potential future enhancement. A startup warn! is emitted when > 1.
     pub backfill_max_concurrent: u32,
     /// Maximum messages per backfill request (daemon-side clamp, default: 50000).
     /// Guarded: ceiling 50000 (WHATSRUST_DANGEROUSLY_ALLOW_HUGE_FETCH to override).
@@ -1392,6 +1392,12 @@ impl WhatsAppBridge {
 
     pub async fn queue_depth(&self) -> i64 {
         self.store.outbound_queue_depth().await.unwrap_or(-1)
+    }
+
+    /// Get embedding status counts for observability (M2.6.5).
+    /// Returns counts by embed_status ('pending', 'embedded', 'failed', 'skipped').
+    pub async fn embedding_status_counts(&self) -> std::collections::HashMap<String, i64> {
+        self.store.embedding_status_counts().await.unwrap_or_default()
     }
 
     /// Get the current QR code data (None if already paired or not yet generated).
