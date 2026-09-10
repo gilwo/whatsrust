@@ -101,6 +101,47 @@ The entire feature is conditional on this. **No rebase, no fork, no clone** — 
 - ✅ Drain keeps up under normal backfill (the >100k pathological ceiling is the only coupling); model switch + per-model purge work. — **CODE-COMPLETE, E2E validation pending.**
 - ⏸️ Multilingual model handles CJK semantically (the lexical gap M1 leaves). — **Deferred to live testing.**
 
+**M2 code-review follow-ups (2026-09-02, deferred — none block push or live E2E).**
+Capstone `review` of the M2 diff (`27972e3`..HEAD). Findings orchestrator-verified against the
+code. None are correctness/security defects in normal operation; all are defense-in-depth hardening
+against a *trusted* sidecar or rare inputs. Fix opportunistically or during a later hardening pass.
+
+*Real items to fix later:*
+- [ ] **(Med, defense-in-depth) Bounded sidecar line read** — `StdioEmbedder` reads a line via
+  `read_until` into a `Vec` and checks the 16 MiB cap *after* the allocation (`src/embedder.rs`
+  ~read_line_bounded). A runaway/buggy sidecar could OOM before the cap fires. Read in chunks and
+  check accumulated size before each chunk (true hard bound). Reviewer "M6".
+- [ ] **(Med, defense-in-depth) Timeout on `fetch_embeddings_for_candidates`** in
+  `WhatsAppBridge::search` (`src/bridge.rs:1487`): query-embed has a 5s timeout, the candidate
+  vector fetch does not. NOTE: this is a property of the whole single-`Mutex<Connection>` storage
+  layer (the M1 lexical fallback `search_inbound` has no timeout either), **not an M2 regression** —
+  if fixed, apply consistently, not just to the semantic path. Reviewer "H2".
+- [ ] **(Low) cosine epsilon** — `cosine_similarity` (`src/embedder.rs`) uses exact `== 0.0`
+  zero-magnitude guard; use `< 1e-9` to avoid `Inf`/huge values from near-zero vectors. Reviewer "M4".
+- [ ] **(Low) `max_input_tokens` floor** — a sidecar advertising `0` would truncate all text to
+  empty (`src/embed_drain.rs` prepare_text_for_embedding); treat an unreasonably small value as
+  absent + WARN. Reviewer "M2".
+- [ ] **(Low) Surface purge non-INCREMENTAL warning to the caller** — the WARN is log-only; the
+  API/CLI/MCP response shows `bytes_reclaimed: 0` with no inline reason. Consider a `warning` field
+  or CLI note. Reviewer "M1".
+- [ ] **(Low) Poison-pill-at-tail visibility** — a genuinely unembeddable row at the tail keeps the
+  drain waking (bounded by backoff + notify-only quiescence); add a loud log after N solo failures
+  for operator visibility (do NOT auto-`failed` — that's the deferred M2.6.7 cap-3 path). Reviewer "M3".
+- [ ] **(Nit) L1** fake-embedder: env-configurable `max_batch`/`max_input_tokens` (incl. omitting
+  them) to exercise the no-advertised-limit path. **L2** cfg-gate the dormant `AttemptTracker`. **L3**
+  document the 100-iteration `incremental_vacuum` cap in `purge_embeddings`.
+
+*Double-checked and DISMISSED (do not re-investigate):*
+- **H1 "missing partial-coverage additive test" — FALSE.** `test_search_partial_coverage_keeps_unvectored`
+  exists (`src/bridge.rs:5580`) and covers exactly the M2.4.3 (b) additive-survival case.
+- **H3 "no discriminating recall-width test" — FALSE.** `test_search_recall_width_at_small_limit`
+  (`src/bridge.rs:5634`) is a real flip-check (needle recalled under `max(200,limit)`, not under
+  `min`), asserting the needle reaches top-5 → proves widening, not reorder.
+- The review cited a stale "305 lib / 318 bin" test count (from the M2.4 done-note); actual suite is
+  **312 lib / 327 bin** green (+ fake-embedder suite 333) — the reviewer read notes, not `cargo test`.
+- **M5 (LoadingTimer / `Instant` monotonicity)** — premise is largely incorrect (`Instant` is
+  monotonic and unaffected by NTP); no action beyond an optional doc note.
+
 ---
 
 ## Notes
