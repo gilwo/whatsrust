@@ -293,7 +293,8 @@ errors, no blocking).
 2. (Recommended) A convenience wrapper `scripts/run-embedder.sh` exists; it `cd`s to
    the repo root and execs the `.venv-embedder` Python on the sidecar script. To use
    it, set `WHATSRUST_EMBEDDER_CMD="./scripts/run-embedder.sh"` (no `WHATSRUST_EMBEDDER_ARGS`
-   needed).
+   needed). **Quick start:** `make sidecar-setup` (creates the venv), `make sidecar-smoke`
+   (protocol check), `make run-semantic` (runs the daemon with the sidecar enabled).
 3. Start the daemon as usual (§3). The embedding-drain worker spawns
    automatically and begins processing `embed_status='pending'` rows in the
    background (default: 60s interval, 64 msgs/batch). No action required;
