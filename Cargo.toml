@@ -5,6 +5,9 @@ edition = "2021"
 description = "Pure Rust WhatsApp bridge — lean, single-binary, no Baileys"
 license = "MIT"
 repository = "https://github.com/199-biotechnologies/whatsrust"
+# Two [[bin]] targets exist (whatsrust + the feature-gated fake-embedder), so a
+# bare `cargo run` / `make run` can't pick one without this. Pin the daemon.
+default-run = "whatsrust"
 
 [lib]
 name = "whatsrust"
