@@ -53,6 +53,7 @@ This directory contains Architecture Decision Records (ADRs) for the whatsrust p
 | [0038](0038-m2-drain-text-sourcing-and-failure-handling.md) | M2 embedding-drain text sourcing and failure handling | 2026-07-23 | Accepted |
 | [0039](0039-embedding-model-rollout-mvp-minilm-to-bge-m3.md) | Embedding-model rollout: MVP MiniLM (Python sidecar) → bge-m3; prefix-free only | 2026-08-30 | Accepted |
 | [0040](0040-python-free-embedder-sidecar-rust-candle.md) | Python-free embedder sidecar: Rust + candle | 2026-09-22 | Accepted |
+| [0041](0041-hybrid-recall-bounded-vector-scan.md) | Hybrid recall: bounded vector scan alongside FTS5 | 2026-09-26 | Accepted |
 
 ## Revised ADRs
 
@@ -84,4 +85,4 @@ The following ADRs received M2-refinement pointers during M2 planning (2026-07-2
 
 ## Future ADRs
 
-Start numbering at 0041. Follow the established format. Keep each ADR focused on one decision.
+Start numbering at 0042. Follow the established format. Keep each ADR focused on one decision.
