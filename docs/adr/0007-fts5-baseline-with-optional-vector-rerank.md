@@ -42,3 +42,6 @@ Every vector is stamped with `(model_id, dim)`. Refuse cross-model cosine compar
 **Future:**
 - Pure-semantic queries (no lexical match) → optional bounded brute-force cosine over recency/chat-scoped subset (deferred to v2)
 - Hybrid scoring (lexical score × semantic score) for richer ranking (deferred)
+
+**Update (2026-09-26):** the pure-semantic item above is now implemented as hybrid recall: a bounded
+vector scan merged with FTS5 candidates, with a similarity floor for vector-only hits. See ADR 0041.
