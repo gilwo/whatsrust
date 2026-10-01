@@ -32,9 +32,9 @@ Two constraints shaped the answer:
    end-to-end operation flow and the *value* of semantic search on real Hebrew/Arabic data; light,
    CPU-friendly, and **prefix-free** (works with the current symmetric protocol, no ADR 0024 change).
 2. **Evolve:** upgrade to **`BAAI/bge-m3`** (1024-dim, prefix-free, stronger multilingual) once value
-   is confirmed, and/or reimplement the sidecar in **Rust/Go** for a Python-free deploy — decided at
-   that time based on the state of things. Neither step requires a protocol change (both models are
-   prefix-free).
+   is confirmed, and/or reimplement the sidecar for a Python-free deploy. The runtime reimplementation
+   was **decided in ADR 0040 (2026-09-22): Rust + `candle`** (pure-Rust, no Python/C deps). Neither step
+   requires a protocol change (both models are prefix-free).
 
 **Prefix-free models only (for now).** The e5 family is excluded until/unless the protocol grows a
 query/passage hint. `.env.example`'s recommendation is updated accordingly (MiniLM → bge-m3; e5
