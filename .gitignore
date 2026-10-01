@@ -12,6 +12,7 @@ review-pack/
 .mcp.json
 .env
 .venv-embedder/
+embedder-rs/target/
 # Session-tracking artifacts (personal, machine-local; not part of the repo)
 *.md.compact.md
 whatsrust-project_*.md
