@@ -309,6 +309,8 @@ async fn async_main() -> Result<()> {
     let embedder_backoff_cap_secs: u64 = parse_env_or("WHATSRUST_EMBEDDER_BACKOFF_CAP_SECS", bf_default.embedder_backoff_cap_secs);
     let embedder_loading_timeout_secs: u64 = parse_env_or("WHATSRUST_EMBEDDER_LOADING_TIMEOUT_SECS", bf_default.embedder_loading_timeout_secs);
     let embedder_failure_threshold: u32 = parse_env_or("WHATSRUST_EMBEDDER_FAILURE_THRESHOLD", bf_default.embedder_failure_threshold);
+    let semantic_min_score: f32 = parse_env_or("WHATSRUST_SEMANTIC_MIN_SCORE", bf_default.semantic_min_score);
+    let semantic_scan_cap: usize = parse_env_or("WHATSRUST_SEMANTIC_SCAN_CAP", bf_default.semantic_scan_cap);
 
     // --- Fail-closed safety validation (ADR 0022) — MUST run before bridge construction ---
     let safety = BackfillSafety {
@@ -362,6 +364,8 @@ async fn async_main() -> Result<()> {
         embedder_backoff_cap_secs,
         embedder_loading_timeout_secs,
         embedder_failure_threshold,
+        semantic_min_score,
+        semantic_scan_cap,
         ..Default::default()
     };
 

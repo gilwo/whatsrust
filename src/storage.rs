@@ -1644,6 +1644,122 @@ impl Store {
         .await
     }
 
+    /// Fetch all vectorized messages in scope for hybrid vector recall (ADR 0041).
+    /// Returns `(InboundRow, Vec<f32>)` for every row with a vector for the given model
+    /// within the same scope as `search_inbound`: matching `chat_jid` filter (or all chats
+    /// when `None`), satisfying `before_ts` bound, and applying the same inbound-row filtering
+    /// as `search_inbound`. This ensures lexical and vector recall agree on which rows are eligible.
+    pub async fn fetch_scoped_vectors(
+        &self,
+        model_id: &str,
+        chat_jid: Option<&str>,
+        before_ts: Option<i64>,
+    ) -> Result<Vec<(InboundRow, Vec<f32>)>> {
+        let model = model_id.to_owned();
+        let cj = chat_jid.map(|s| s.to_owned());
+        let before = before_ts.unwrap_or(i64::MAX);
+
+        self.run(move |conn| {
+            // Same scope as search_inbound: timestamp < before_ts, optional chat_jid filter.
+            // Join embeddings to get only rows with vectors for the active model.
+            let mut sql = String::from(
+                "SELECT m.id, m.chat_jid, m.sender_jid, m.message_id, m.content_kind, m.body_text, m.timestamp, e.vec, e.dim
+                 FROM messages m
+                 JOIN embeddings e ON m.message_id = e.message_id
+                 WHERE e.model_id = ?1 AND m.timestamp < ?2"
+            );
+            let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+                Box::new(model),
+                Box::new(before),
+            ];
+            if let Some(ref jid) = cj {
+                sql.push_str(&format!(" AND m.chat_jid = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(jid.clone()));
+            }
+
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+            let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+            let rows = stmt
+                .query_map(params_refs.as_slice(), |row| {
+                    let inbound = InboundRow {
+                        id: row.get(0)?,
+                        chat_jid: row.get(1)?,
+                        sender_jid: row.get(2)?,
+                        message_id: row.get(3)?,
+                        content_kind: row.get(4)?,
+                        body_text: row.get(5)?,
+                        timestamp: row.get(6)?,
+                    };
+                    let blob: Vec<u8> = row.get(7)?;
+                    let dim: i64 = row.get(8)?;
+                    Ok((inbound, blob, dim))
+                })
+                .map_err(db_err)?;
+
+            let mut result = Vec::new();
+            for row in rows {
+                let (inbound, blob, dim) = row.map_err(db_err)?;
+                // Decode little-endian f32 BLOB (same as fetch_embeddings_for_candidates).
+                if blob.len() % 4 != 0 {
+                    return Err(db_err(rusqlite::Error::InvalidQuery));
+                }
+                let vector: Vec<f32> = blob
+                    .chunks_exact(4)
+                    .map(|chunk| {
+                        let arr: [u8; 4] = chunk.try_into().expect("chunks_exact(4) guarantees 4 bytes");
+                        f32::from_le_bytes(arr)
+                    })
+                    .collect();
+
+                if vector.len() != dim as usize {
+                    return Err(db_err(rusqlite::Error::InvalidQuery));
+                }
+
+                result.push((inbound, vector));
+            }
+
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Count how many vectorized rows exist in scope (for scan-cap decision, ADR 0041).
+    pub async fn count_scoped_vectors(
+        &self,
+        model_id: &str,
+        chat_jid: Option<&str>,
+        before_ts: Option<i64>,
+    ) -> Result<usize> {
+        let model = model_id.to_owned();
+        let cj = chat_jid.map(|s| s.to_owned());
+        let before = before_ts.unwrap_or(i64::MAX);
+
+        self.run(move |conn| {
+            let mut sql = String::from(
+                "SELECT COUNT(*) FROM messages m
+                 JOIN embeddings e ON m.message_id = e.message_id
+                 WHERE e.model_id = ?1 AND m.timestamp < ?2"
+            );
+            let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+                Box::new(model),
+                Box::new(before),
+            ];
+            if let Some(ref jid) = cj {
+                sql.push_str(&format!(" AND m.chat_jid = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(jid.clone()));
+            }
+
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+            let count: i64 = conn
+                .query_row(&sql, params_refs.as_slice(), |row| row.get(0))
+                .map_err(db_err)?;
+            Ok(count as usize)
+        })
+        .await
+    }
+
     /// Delete all inbound messages for a chat (e.g. when the chat is deleted).
     pub async fn delete_inbound_chat(&self, chat_jid: &str) -> Result<u32> {
         let jid = chat_jid.to_owned();
@@ -1851,20 +1967,72 @@ impl Store {
     /// Get counts by embed_status for observability (M2.6.5).
     /// Returns a HashMap keyed by status ('pending', 'embedded', 'failed', 'skipped')
     /// with the count of messages in each state. Statuses with zero rows are omitted.
-    pub async fn embedding_status_counts(&self) -> Result<std::collections::HashMap<String, i64>> {
-        self.run(|c| {
-            let mut stmt = c
-                .prepare("SELECT embed_status, COUNT(*) FROM messages GROUP BY embed_status")
-                .map_err(db_err)?;
-            let rows = stmt
-                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
-                .map_err(db_err)?;
+    /// Per-active-model embedding counts (ADR 0041). Returns a map with keys:
+    /// - `model_id`: the active model ID (null string when no embedder is active)
+    /// - `embedded`: rows with a vector for the active model
+    /// - `pending`: embeddable rows lacking a vector for the active model
+    /// - `failed`: rows with `embed_status='failed'`
+    /// - `skipped`: rows with `embed_status='skipped'`
+    ///
+    /// When `active_model_id` is None, returns only `failed`/`skipped` counts with `model_id: null`.
+    pub async fn embedding_status_counts(
+        &self,
+        active_model_id: Option<&str>,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let model_opt = active_model_id.map(|s| s.to_owned());
 
+        self.run(move |c| {
             let mut counts = std::collections::HashMap::new();
-            for row_result in rows {
-                let (status, count) = row_result.map_err(db_err)?;
-                counts.insert(status, count);
+
+            if let Some(ref model) = model_opt {
+                // With an active model: compute embedded and pending counts.
+                counts.insert("model_id".to_string(), 0); // Placeholder for string value
+
+                // embedded: rows with a vector for the active model.
+                let embedded: i64 = c
+                    .query_row(
+                        "SELECT COUNT(*) FROM embeddings WHERE model_id = ?1",
+                        params![model],
+                        |row| row.get(0),
+                    )
+                    .map_err(db_err)?;
+                counts.insert("embedded".to_string(), embedded);
+
+                // pending: embeddable rows without a vector for the active model (drain set-difference).
+                let pending: i64 = c
+                    .query_row(
+                        "SELECT COUNT(*) FROM messages m
+                         LEFT JOIN embeddings e ON m.message_id = e.message_id AND e.model_id = ?1
+                         WHERE e.message_id IS NULL AND m.embed_status = 'pending'",
+                        params![model],
+                        |row| row.get(0),
+                    )
+                    .map_err(db_err)?;
+                counts.insert("pending".to_string(), pending);
+            } else {
+                // No active model: omit embedded count, report model_id as null.
+                counts.insert("model_id".to_string(), -1); // Placeholder for null
             }
+
+            // failed and skipped counts (from embed_status column).
+            let failed: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE embed_status = 'failed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(db_err)?;
+            counts.insert("failed".to_string(), failed);
+
+            let skipped: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE embed_status = 'skipped'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(db_err)?;
+            counts.insert("skipped".to_string(), skipped);
+
             Ok(counts)
         })
         .await
@@ -6432,7 +6600,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M2.6.5: Test embedding_status_counts storage method.
+    /// M2.6.5: Test embedding_status_counts storage method (updated ADR 0041).
     #[tokio::test]
     async fn test_embedding_status_counts() {
         let dir = std::env::temp_dir().join(format!("test_embed_status_counts_{}", std::process::id()));
@@ -6458,6 +6626,12 @@ mod tests {
                 .map_err(db_err)?;
                 c.execute(
                     "INSERT INTO messages (message_id, chat_jid, sender_jid, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
+                     VALUES (?1, 'chat1@s.whatsapp.net', 'sender1@s.whatsapp.net', 'text', 'pending_but_embedded', 2500, 2500, 0, 'live', 'pending')",
+                    params!["msg2b"],
+                )
+                .map_err(db_err)?;
+                c.execute(
+                    "INSERT INTO messages (message_id, chat_jid, sender_jid, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
                      VALUES (?1, 'chat1@s.whatsapp.net', 'sender1@s.whatsapp.net', 'text', 'test', 3000, 3000, 0, 'live', 'skipped')",
                     params!["msg3"],
                 )
@@ -6473,12 +6647,32 @@ mod tests {
             .await
             .unwrap();
 
-        let counts = store.embedding_status_counts().await.unwrap();
+        // Write a vector for msg2b (so it's embedded, not pending).
+        store
+            .write_embedding_batch(
+                &["msg2b".to_string()],
+                "test-model",
+                3,
+                &[vec![0.1, 0.2, 0.3]],
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(counts.get("pending"), Some(&2), "should have 2 pending rows");
+        // Test with active model.
+        let counts = store.embedding_status_counts(Some("test-model")).await.unwrap();
+
+        assert_eq!(counts.get("embedded"), Some(&1), "msg2b should be embedded");
+        assert_eq!(counts.get("pending"), Some(&2), "msg1 and msg2 should be pending (lack vector)");
         assert_eq!(counts.get("skipped"), Some(&1), "should have 1 skipped row");
         assert_eq!(counts.get("failed"), Some(&1), "should have 1 failed row");
-        assert_eq!(counts.get("embedded"), None, "should have no embedded rows (omitted from map)");
+
+        // Test with no active model.
+        let counts_no_model = store.embedding_status_counts(None).await.unwrap();
+
+        assert_eq!(counts_no_model.get("embedded"), None, "no embedded count when no active model");
+        assert_eq!(counts_no_model.get("pending"), None, "no pending count when no active model");
+        assert_eq!(counts_no_model.get("skipped"), Some(&1), "should have 1 skipped row");
+        assert_eq!(counts_no_model.get("failed"), Some(&1), "should have 1 failed row");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

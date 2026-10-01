@@ -73,3 +73,11 @@ starting small costs nothing later.
 - **ADR 0024** (protocol) — records that the current symmetric `embed()` excludes prefix-asymmetric
   (e5) models; a query/passage hint is a future extension.
 - **ADR 0017** (multi-model retention) — the switch-is-free property that makes MVP-first lossless.
+
+**Implementation note (2026-09-30, rollout complete):** the "evolve" step is done — the Rust
+sidecar (ADR 0040) now supports both models behind `--model minilm|bge-m3`
+(`WHATSRUST_EMBEDDER_MODEL` also works), and **bge-m3 is the default for `make run-semantic`**
+(`EMBED_MODEL ?= bge-m3` in the Makefile). MiniLM stays fully selectable
+(`make run-semantic EMBED_MODEL=minilm`) for the lighter/faster tradeoff. `WHATSRUST_SEMANTIC_MIN_SCORE`
+defaults to 0.55, calibrated for bge-m3 (ADR 0041); it is conservative for MiniLM — re-measure with
+`make calibrate EMBED_MODEL=minilm` before relying on MiniLM's vector-only recall.

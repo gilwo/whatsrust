@@ -83,7 +83,7 @@ src/
 
 **M1** (per-chat historical backfill + FTS5 lexical search) is **complete** — all four sub-milestones shipped and live-E2E-validated. It builds a local, searchable message archive alongside the live timeline.
 
-**M2** (semantic/embedding-based search, sidecar-backed) sub-milestones M2.1–M2.5 are **code-complete** (embedder sidecar contract + drain worker + cosine rerank + multi-model purge). M2.6 (full config wiring + integration tests) and end-to-end validation against a live daemon are **pending**. Semantic search is **opt-in** via `WHATSRUST_EMBEDDER_CMD` and **dormant** (degrades gracefully to FTS5 lexical) when the sidecar is absent or down. (ADR 0006/0008/0015-0017/0024/0038/0039)
+**M2** (semantic/embedding-based search, sidecar-backed) is **code-complete** (embedder sidecar contract + drain worker + hybrid recall, ADR 0041, + multi-model purge); end-to-end validation against a live daemon is **pending**. Semantic search is **opt-in** via `WHATSRUST_EMBEDDER_CMD` and **dormant** (degrades gracefully to FTS5 lexical) when the sidecar is absent or down. (ADR 0006/0008/0015-0017/0024/0038/0039/0041)
 
 ### Schema (v8)
 
@@ -114,11 +114,31 @@ Abort is **three-level** (ADR 0026): a **BATCH** (send request → await respons
 
 `search_inbound` branches on whether a query is given: with `query=Some(q)`, it joins `messages_fts MATCH` (quote-as-phrase sanitized — embedded `"` doubled, no raw FTS5 operator injection) to `messages` by rowid and orders by `f.rank` ascending (BM25, most-relevant first); with `query=None`, it's a plain chronological browse. One query path, EXPLAIN-verified to hit the FTS5 index (no LIKE fallback) — multilingual by construction via the `unicode61 remove_diacritics 2` tokenizer (ADR 0019/0018).
 
-### Semantic search (M2.1–M2.5 code-complete, M2.6 + E2E validation pending)
+### Semantic search: hybrid recall (ADR 0041; M2.1–M2.6 code-complete, live E2E validation pending)
 
-**Opt-in via `WHATSRUST_EMBEDDER_CMD`**: when configured, `WhatsAppBridge::search` embeds the query using the sidecar, recalls top-N candidates via FTS5 (recall width = max of 200 and `limit`), fetches their vectors from the `embeddings` table, reranks by cosine similarity (Rust-side, `cosine_similarity()` in `src/embedder.rs`), and appends an **additive lexical fallback** (FTS results that had no embeddings) to fill out the requested limit. When the sidecar is absent or down, search degrades gracefully to pure FTS5 lexical (byte-identical to M1). (ADR 0007/0008)
+**Opt-in via `WHATSRUST_EMBEDDER_CMD`**: when configured and the query embeds successfully,
+`WhatsAppBridge::search` unions two candidate sets — **lexical** (FTS5, recall width = max of 200
+and `limit`, unchanged from M1) and **vector** (a bounded brute-force cosine scan of every stored
+vector for the active model in the search scope, same top-N width). Lexical candidates are always
+kept (a semantic score never drops a word-matched hit). Vector-only candidates (no lexical match —
+the case cross-language/paraphrase queries need) are admitted only when
+`cosine ≥ WHATSRUST_SEMANTIC_MIN_SCORE` (default 0.55, calibrated for bge-m3 — ADR 0041); the vector
+scan itself is skipped (falling back to the M2.4 lexical-recall-plus-rerank path) when the scope holds
+more than `WHATSRUST_SEMANTIC_SCAN_CAP` vectors (default 50000). When no embedder is active, or the
+query-embed call fails/times out, search is byte-identical to M1 lexical. (ADR 0007/0008/0041)
 
-**Embedder sidecar**: stateless stdio JSON-RPC child process (ADR 0006/0024). Primary: `embedder-rs/` (native Rust, candle-based, `paraphrase-multilingual-MiniLM-L12-v2`, 384-dim, prefix-free, multilingual; ADR 0040 — Python-free deploy). Legacy reference: `scripts/embedder-sidecar.py` (Python + sentence-transformers, parity-verified). The `Embedder` trait (`src/embedder.rs`) abstracts transport; `StdioEmbedder` handles the stdio framing and request/response lifecycle (load timeout, health checks, trust-but-verify validation). A `FakeEmbedder` test seam (`src/embedder.rs`) plus a minimal fake sidecar (`src/bin/fake-embedder.rs`, behind the `fake-embedder` Cargo feature) support round-trip integration tests. (ADR 0025)
+**Embedder sidecar**: stateless stdio JSON-RPC child process (ADR 0006/0024). Primary: `embedder-rs/`
+(native Rust, candle-based; ADR 0040 — Python-free deploy), selectable via `--model minilm|bge-m3`
+(or `WHATSRUST_EMBEDDER_MODEL`) — **`BAAI/bge-m3`** (1024-dim) is the default for `make run-semantic`
+(stronger multilingual/cross-language recall, `max_batch: 8`); `paraphrase-multilingual-MiniLM-L12-v2`
+(384-dim, lighter/faster) stays selectable (`make run-semantic EMBED_MODEL=minilm`). Both are
+prefix-free and load in the background at startup (`model_info` answers instantly; `health` reports
+`loading` → `ok`). Legacy reference: `scripts/embedder-sidecar.py` (Python + sentence-transformers,
+MiniLM only, parity-verified). The `Embedder` trait (`src/embedder.rs`) abstracts transport;
+`StdioEmbedder` handles the stdio framing and request/response lifecycle (load timeout, health
+checks, trust-but-verify validation). A `FakeEmbedder` test seam (`src/embedder.rs`) plus a minimal
+fake sidecar (`src/bin/fake-embedder.rs`, behind the `fake-embedder` Cargo feature) support round-trip
+integration tests. (ADR 0025/0039)
 
 **Embedding-drain worker**: independent background task (spawned alongside backfill/prune in `run_bridge`, before the reconnect loop — ADR 0015). Wakes periodically (default 60s), derives work via a set-difference query (`embed_status='pending'` minus already-embedded for the active model), batches text to the sidecar (default 64 msgs/batch), writes successful vectors to the `embeddings` table, and on sidecar/transport failure leaves rows `pending` for retry (never mislabels them). Per-row content-rejection tracking (in-memory `(message_id, model_id)` attempt counter, cap-3 → terminal `embed_status='failed'`) is scaffolded but **currently dormant** — the batch `embed` protocol can't distinguish a content rejection from a transport failure, so the cap-3→`failed` path is deferred until the protocol grows a positive rejection signal (M2.6.7 / ADR 0038). A pathological-pending circuit-breaker back-pressures **new backfill enqueues** (`enqueue_backfill_job` returns `EmbedderBacklogFull`) when the active-model pending backlog exceeds a ceiling (default 100k), so the drain can catch up without the backlog growing unbounded — the drain itself keeps running. Multi-model: `embeddings` PK is `(message_id, model_id)`, so switching models starts a fresh drain for the new model without purging old vectors (ADR 0017).
 

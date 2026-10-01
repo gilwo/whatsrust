@@ -82,3 +82,30 @@ are interchangeable under the same `model_id`.
 
 **Supersedes:** the Python sidecar (ADR 0039 / spec §3) as the *deployment* target, once validated.
 ADR 0039's model-rollout decision (MiniLM → bge-m3, prefix-free) still stands — only the runtime changes.
+
+**Implementation note (2026-09-30, bge-m3 added; commit `8221260`):** the Rust sidecar now serves
+**bge-m3** (`BAAI/bge-m3`, XLM-RoBERTa-large, 1024-dim, CLS-token pooling) alongside MiniLM, selected
+via `--model minilm|bge-m3` (default `minilm`; `WHATSRUST_EMBEDDER_MODEL` env var also works, and is
+inherited by the child process so `WHATSRUST_EMBEDDER_ARGS="--model bge-m3"` and the env var are
+equivalent). bge-m3's `main` revision on Hugging Face ships only `pytorch_model.bin`; its weights load
+memory-mapped from a community safetensors conversion at `refs/pr/130`, with config/tokenizer taken
+from `main` — both revisions are pinned by commit hash and the resolved commit is checked after
+lookup (`verify_pinned_commit`), so an upstream force-push fails loudly instead of drifting silently.
+bge-m3 advertises `max_batch: 8` (a 32-text batch measured ~7s; capped at 8 keeps a batch to ~0.5s so
+a concurrent query doesn't stall behind a full drain batch) — the daemon already clamps
+`embedder_batch_size` to the advertised `max_batch`. The model loads on a background thread at
+startup so `model_info` stays instant and `health` reports `loading` → `ok` (or `error`); an `embed`
+call made before load finishes blocks until the background thread finishes (see
+`EagerModel::wait_for_load`), which is expected, not a bug. Apple's Accelerate BLAS backend was
+measured 2-3x slower than the plain backend for this model and was not adopted.
+
+**Cold-cache download fix (same commit):** Hugging Face answers some `resolve` requests with a
+relative `307 Location` that the pinned `hf-hub 0.3.2` can't follow, which silently broke first-run
+downloads for both models (masked on machines with an already-warm cache). Files are now looked up in
+the local hf-hub cache first (no network if present), and on a genuine miss fetched with a plain
+`ureq` GET (which follows redirects itself) into a `<filename>.tmp-<pid>` sibling file that's renamed
+into place on success; `HF_HUB_CACHE` is honored. Parity with Python `sentence-transformers` was
+re-verified at cosine 1.000000 for both models. Known gap: if the GET or the write fails partway
+through, the `.tmp-<pid>` file is left behind (no cleanup-on-error path) — harmless (a stray file in
+the HF cache, cleaned up by a retry that reuses the same pid-based name only by coincidence) but worth
+fixing opportunistically (tracked in `docs/plans/IMPLEMENTATION-ROADMAP.md`'s M2 review follow-ups).

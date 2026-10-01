@@ -803,6 +803,13 @@ pub struct BridgeConfig {
     pub embedder_loading_timeout_secs: u64,
     /// Consecutive transport/loading failures before dropping to Notify-only (default: 10).
     pub embedder_failure_threshold: u32,
+    /// Minimum cosine similarity floor for vector-only candidates (ADR 0041, default: 0.55).
+    /// Calibrated for bge-m3, the default model (`make run-semantic`); re-measure with
+    /// `make calibrate` when switching models — the floor is model-specific.
+    /// Lexical candidates are always kept regardless of this threshold.
+    pub semantic_min_score: f32,
+    /// Maximum vectors to scan per query before falling back to lexical-only (ADR 0041, default: 50000).
+    pub semantic_scan_cap: usize,
 }
 
 impl Default for BridgeConfig {
@@ -839,6 +846,8 @@ impl Default for BridgeConfig {
             embedder_backoff_cap_secs: 60,
             embedder_loading_timeout_secs: 60,
             embedder_failure_threshold: 10,
+            semantic_min_score: 0.55,
+            semantic_scan_cap: 50_000,
         }
     }
 }
@@ -921,6 +930,10 @@ pub struct WhatsAppBridge {
     embedder: Arc<ParkingMutex<Option<Arc<dyn crate::embedder::Embedder>>>>,
     /// Database path, used by purge_embeddings and the watchdog (M2.5).
     db_path: PathBuf,
+    /// Minimum cosine similarity floor for vector-only candidates (ADR 0041).
+    semantic_min_score: f32,
+    /// Maximum vectors to scan per query before falling back to lexical-only (ADR 0041).
+    semantic_scan_cap: usize,
 }
 
 impl WhatsAppBridge {
@@ -956,6 +969,8 @@ impl WhatsAppBridge {
         let backfill_queue_depth = config.backfill_queue_depth;
         let backfill_max_messages = config.backfill_max_messages;
         let db_path = config.db_path.clone();
+        let semantic_min_score = config.semantic_min_score;
+        let semantic_scan_cap = config.semantic_scan_cap;
 
         let cancel_clone = cancel.clone();
         let ch = client_handle.clone();
@@ -1000,6 +1015,8 @@ impl WhatsAppBridge {
             backfill_max_messages,
             embedder: embedder_handle, // Populated in run_bridge (async context)
             db_path,
+            semantic_min_score,
+            semantic_scan_cap,
         }
     }
 
@@ -1396,8 +1413,27 @@ impl WhatsAppBridge {
 
     /// Get embedding status counts for observability (M2.6.5).
     /// Returns counts by embed_status ('pending', 'embedded', 'failed', 'skipped').
-    pub async fn embedding_status_counts(&self) -> std::collections::HashMap<String, i64> {
-        self.store.embedding_status_counts().await.unwrap_or_default()
+    pub async fn embedding_status_counts(&self) -> serde_json::Value {
+        let active_model = self.active_model_id();
+        let counts = self
+            .store
+            .embedding_status_counts(active_model.as_deref())
+            .await
+            .unwrap_or_default();
+
+        // Build JSON object with model_id as a string (or null).
+        let mut obj = serde_json::Map::new();
+        if let Some(model) = active_model {
+            obj.insert("model_id".to_string(), serde_json::json!(model));
+            obj.insert("embedded".to_string(), serde_json::json!(counts.get("embedded").copied().unwrap_or(0)));
+            obj.insert("pending".to_string(), serde_json::json!(counts.get("pending").copied().unwrap_or(0)));
+        } else {
+            obj.insert("model_id".to_string(), serde_json::Value::Null);
+        }
+        obj.insert("failed".to_string(), serde_json::json!(counts.get("failed").copied().unwrap_or(0)));
+        obj.insert("skipped".to_string(), serde_json::json!(counts.get("skipped").copied().unwrap_or(0)));
+
+        serde_json::Value::Object(obj)
     }
 
     /// Get the current QR code data (None if already paired or not yet generated).
@@ -1473,54 +1509,129 @@ impl WhatsAppBridge {
             }
         };
 
-        // FTS5 recall, widened to recall_width = max(200, limit) (M2.4.3 step 2, review v4-B1).
-        let recall_width = std::cmp::max(200, limit);
-        let candidates = self.store.search_inbound(chat_jid, Some(query), recall_width, before_ts).await?;
+        // ADR 0041: Hybrid recall (lexical + vector). Check scan cap before vector recall.
+        let vector_count = self.store.count_scoped_vectors(&active_model, chat_jid, before_ts).await?;
 
-        if candidates.is_empty() {
-            // Zero FTS hits → return empty (M2.4.6 deferred — no pure-semantic brute-force).
-            return Ok(candidates);
-        }
-
-        // Fetch vectors for the candidates, filtered to the active model (M2.4.3 step 3).
-        let candidate_ids: Vec<String> = candidates.iter().map(|r| r.message_id.clone()).collect();
-        let vectors = self.store.fetch_embeddings_for_candidates(&candidate_ids, &active_model).await?;
-
-        if vectors.is_empty() {
+        if vector_count == 0 {
             // Zero vectors for active model → fallback (M2.4.4).
             return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
         }
 
-        // Cosine-rerank the vectorized subset (M2.4.3 step 4).
-        let mut scored: Vec<(crate::storage::InboundRow, f32)> = Vec::new();
-        let mut unvectored: Vec<crate::storage::InboundRow> = Vec::new();
+        if vector_count > self.semantic_scan_cap {
+            // Scan cap exceeded → skip vector recall, fall back to M2.4 rerank-only path.
+            tracing::debug!(
+                "search: vector count ({}) exceeds scan cap ({}), skipping vector recall",
+                vector_count,
+                self.semantic_scan_cap
+            );
+            // M2.4 path: FTS5 recall + rerank the lexical candidates.
+            let recall_width = std::cmp::max(200, limit);
+            let candidates = self.store.search_inbound(chat_jid, Some(query), recall_width, before_ts).await?;
 
-        for row in candidates {
-            if let Some(candidate_vec) = vectors.get(&row.message_id) {
-                match cosine_similarity(&query_vec, candidate_vec) {
-                    Ok(score) => scored.push((row, score)),
+            if candidates.is_empty() {
+                return Ok(candidates);
+            }
+
+            let candidate_ids: Vec<String> = candidates.iter().map(|r| r.message_id.clone()).collect();
+            let vectors = self.store.fetch_embeddings_for_candidates(&candidate_ids, &active_model).await?;
+
+            let mut scored: Vec<(crate::storage::InboundRow, f32)> = Vec::new();
+            let mut unvectored: Vec<crate::storage::InboundRow> = Vec::new();
+
+            for row in candidates {
+                if let Some(candidate_vec) = vectors.get(&row.message_id) {
+                    match cosine_similarity(&query_vec, candidate_vec) {
+                        Ok(score) => scored.push((row, score)),
+                        Err(e) => {
+                            tracing::warn!(
+                                "search: cosine failed for message_id {} ({}), treating as unvectored",
+                                row.message_id,
+                                e
+                            );
+                            unvectored.push(row);
+                        }
+                    }
+                } else {
+                    unvectored.push(row);
+                }
+            }
+
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut result: Vec<crate::storage::InboundRow> = scored.into_iter().map(|(r, _)| r).collect();
+            result.extend(unvectored);
+            result.truncate(limit as usize);
+
+            return Ok(result);
+        }
+
+        // ADR 0041: Hybrid recall.
+        // 1. Lexical recall (unchanged from M2.4).
+        let recall_width = std::cmp::max(200, limit);
+        let lexical_candidates = self.store.search_inbound(chat_jid, Some(query), recall_width, before_ts).await?;
+
+        // 2. Vector recall: brute-force cosine over all scoped vectors.
+        let vector_candidates = self.store.fetch_scoped_vectors(&active_model, chat_jid, before_ts).await?;
+
+        // 3. Merge: union deduplicated by message_id, applying MIN_SCORE filter to vector-only hits.
+        let lexical_set: std::collections::HashSet<String> = lexical_candidates
+            .iter()
+            .map(|r| r.message_id.clone())
+            .collect();
+
+        // Score lexical candidates (they all get kept, regardless of score).
+        let mut scored: Vec<(crate::storage::InboundRow, f32, bool)> = Vec::new(); // (row, score, is_lexical)
+        let mut unvectored_lexical: Vec<crate::storage::InboundRow> = Vec::new();
+
+        for row in lexical_candidates {
+            // Try to find its vector for scoring.
+            if let Some((_, vec)) = vector_candidates.iter().find(|(vr, _)| vr.message_id == row.message_id) {
+                match cosine_similarity(&query_vec, vec) {
+                    Ok(score) => scored.push((row, score, true)), // is_lexical=true
                     Err(e) => {
-                        // Dimension mismatch / corrupt vector → treat as unvectored, keep FTS rank.
                         tracing::warn!(
-                            "search: cosine failed for message_id {} ({}), treating as unvectored",
+                            "search: cosine failed for lexical candidate {} ({}), keeping without score",
                             row.message_id,
                             e
                         );
-                        unvectored.push(row);
+                        unvectored_lexical.push(row);
                     }
                 }
             } else {
-                // No vector for active model → keep FTS rank (M2.4.3 additive-only).
-                unvectored.push(row);
+                // Lexical candidate with no vector → keep in FTS order.
+                unvectored_lexical.push(row);
             }
         }
 
-        // Sort scored by cosine descending (higher = more similar).
+        // Score vector-only candidates (apply MIN_SCORE filter).
+        for (vrow, vec) in vector_candidates {
+            if !lexical_set.contains(&vrow.message_id) {
+                // Vector-only candidate.
+                match cosine_similarity(&query_vec, &vec) {
+                    Ok(score) => {
+                        if score >= self.semantic_min_score {
+                            scored.push((vrow, score, false)); // is_lexical=false
+                        }
+                        // else: below MIN_SCORE, discard.
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "search: cosine failed for vector-only candidate {} ({}), discarding",
+                            vrow.message_id,
+                            e
+                        );
+                        // Discard: no lexical match, can't compute score.
+                    }
+                }
+            }
+        }
+
+        // Sort scored by cosine descending.
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Truncate to limit, append unvectored rows after the reranked subset (M2.4.3 step 5).
-        let mut result: Vec<crate::storage::InboundRow> = scored.into_iter().map(|(r, _)| r).collect();
-        result.extend(unvectored);
+        // Assemble final result: scored candidates (vector-ranked), then unvectored lexical in FTS order.
+        let mut result: Vec<crate::storage::InboundRow> = scored.into_iter().map(|(r, _, _)| r).collect();
+        result.extend(unvectored_lexical);
         result.truncate(limit as usize);
 
         Ok(result)
@@ -4705,6 +4816,8 @@ pub(crate) async fn build_test_bridge_with_embedder(
         backfill_max_messages: 10000,
         embedder: embedder_handle,
         db_path: db_path.to_path_buf(),
+        semantic_min_score: 0.3,
+        semantic_scan_cap: 50_000,
     }
 }
 
@@ -5457,6 +5570,8 @@ mod tests {
             backfill_max_messages: 10000,
             embedder: embedder_handle,
             db_path: db_path.to_path_buf(),
+            semantic_min_score: 0.25,
+            semantic_scan_cap: 50_000,
         };
 
         // The critical assertion: active_model_id() returns the configured model ID.
@@ -5857,5 +5972,326 @@ mod tests {
         assert_eq!(results[0].message_id, "msg1");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- ADR 0041: Hybrid recall tests ---
+
+    #[tokio::test]
+    async fn test_hybrid_recall_cross_language_no_overlap_baseline() {
+        // Flip-check: confirm the old M2.4 behavior (FTS-only recall) returns EMPTY for this query.
+        // This test documents what the OLD code did, before ADR 0041 added vector recall.
+        // It should pass on the current hybrid code by artificially disabling vector recall.
+        let dir = std::env::temp_dir().join(format!("test_cross_lang_baseline_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        // Same setup as the main test.
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "target",
+                "text",
+                Some("קייטנה מעולה"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 3);
+        let model_id = fake.model_info().model_id.clone();
+
+        store
+            .write_embedding_batch(
+                &["target".to_string()],
+                &model_id,
+                3,
+                &[vec![0.1, 0.1, 0.1]],
+            )
+            .await
+            .unwrap();
+
+        let mut bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+        // Artificially set scan_cap to 0 to force fallback to M2.4 rerank-only (no vector recall).
+        bridge.semantic_scan_cap = 0;
+
+        // Search for "summer camp" — FTS5 finds nothing (no word overlap).
+        // With scan_cap=0, vector recall is skipped → returns empty (M2.4 behavior).
+        let results = bridge.search(None, "summer camp", 10, None).await.unwrap();
+
+        assert_eq!(results.len(), 0, "M2.4 baseline (FTS-only) should return empty for cross-language query");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_recall_cross_language_no_overlap() {
+        // Key test: FakeEmbedder returns vec![0.1; dim] for all texts, so the query vector
+        // is all-equal components. Seed a target row whose body shares NO words with the query
+        // and whose stored vector is parallel (all-equal components, cosine ≈ 1.0), and a
+        // distractor with an orthogonal vector (cosine ≈ 0.0, below MIN_SCORE). The target
+        // should be returned via vector recall; the distractor should NOT.
+        //
+        // This test MUST FAIL on the current M2.4 code (FTS finds nothing → returns empty).
+        let dir = std::env::temp_dir().join(format!("test_cross_lang_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        // Query: "summer camp" (no Hebrew/Arabic words).
+        // Target: "קייטנה מעולה" (Hebrew for "excellent summer camp", zero FTS overlap).
+        // Distractor: "בלופי הוא חתול" (Hebrew for "Bloppy is a cat", zero FTS overlap).
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "target",
+                "text",
+                Some("קייטנה מעולה"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "distractor",
+                "text",
+                Some("בלופי הוא חתול"),
+                1001,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        // FakeEmbedder returns [0.1; dim] for all inputs, so query vector is [0.1, 0.1, 0.1].
+        // Target vector: parallel to query → [0.1, 0.1, 0.1] (cosine = 1.0).
+        // Distractor vector: orthogonal (alternating +/−) → [0.1, -0.1, 0.1] (cosine ≈ 0.33).
+        // With MIN_SCORE = 0.3, distractor should be admitted (just above threshold).
+        // Let's use a tighter orthogonal: [1.0, -1.0, 0.0] → cosine ≈ 0.0 (below threshold).
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 3);
+        let model_id = fake.model_info().model_id.clone();
+
+        store
+            .write_embedding_batch(
+                &["target".to_string(), "distractor".to_string()],
+                &model_id,
+                3,
+                &[
+                    vec![0.1, 0.1, 0.1],    // parallel to query
+                    vec![1.0, -1.0, 0.0],   // orthogonal (cosine ≈ 0.0)
+                ],
+            )
+            .await
+            .unwrap();
+
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        // Search for "summer camp" — FTS5 finds nothing (no word overlap).
+        // Vector recall should find both, but only target passes MIN_SCORE.
+        let results = bridge.search(None, "summer camp", 10, None).await.unwrap();
+
+        assert_eq!(results.len(), 1, "only target should pass MIN_SCORE filter");
+        assert_eq!(results[0].message_id, "target", "target should be returned via vector recall");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_recall_lexical_always_kept() {
+        // A lexical hit whose vector scores below MIN_SCORE is still returned.
+        let dir = std::env::temp_dir().join(format!("test_lex_always_kept_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        // Seed a message that matches FTS5 but has a low cosine score.
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("fruit apple"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 3);
+        let model_id = fake.model_info().model_id.clone();
+
+        // Query "fruit" → [0.1, 0.1, 0.1]. msg1 vector: orthogonal → [1.0, -1.0, 0.0] (cosine ≈ 0.0).
+        store
+            .write_embedding_batch(
+                &["msg1".to_string()],
+                &model_id,
+                3,
+                &[vec![1.0, -1.0, 0.0]],
+            )
+            .await
+            .unwrap();
+
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        let results = bridge.search(None, "fruit", 10, None).await.unwrap();
+
+        // msg1 should be returned (lexical hit, always kept regardless of score).
+        assert_eq!(results.len(), 1, "lexical hit should be kept even with low cosine");
+        assert_eq!(results[0].message_id, "msg1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_recall_scan_cap_fallback() {
+        // With scan cap set low, vector recall is skipped and behaviour equals M2.4 rerank-only.
+        let dir = std::env::temp_dir().join(format!("test_scan_cap_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        // Seed 3 messages.
+        for i in 1..=3 {
+            store
+                .insert_message(
+                    "chat@s.whatsapp.net",
+                    "sender@s.whatsapp.net",
+                    &format!("msg{}", i),
+                    "text",
+                    Some(&format!("text {}", i)),
+                    1000 + i as i64,
+                    false,
+                    "test",
+                    "pending",
+                )
+                .await
+                .unwrap();
+        }
+
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 2);
+        let model_id = fake.model_info().model_id.clone();
+
+        // Give all 3 vectors.
+        store
+            .write_embedding_batch(
+                &["msg1".to_string(), "msg2".to_string(), "msg3".to_string()],
+                &model_id,
+                2,
+                &[vec![0.1, 0.1], vec![0.2, 0.2], vec![0.3, 0.3]],
+            )
+            .await
+            .unwrap();
+
+        // Build a bridge with scan_cap = 2 (only 2 vectors allowed).
+        let mut bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+        bridge.semantic_scan_cap = 2;
+
+        // Search for "text" — 3 vectors exceed cap → fallback to M2.4 rerank-only.
+        let results = bridge.search(None, "text", 10, None).await.unwrap();
+
+        // All 3 should be returned (FTS5 finds all, rerank happens on the lexical candidates).
+        assert_eq!(results.len(), 3, "scan cap fallback should still return lexical results");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_recall_no_embedder_unchanged() {
+        // No embedder → behaviour is byte-identical to M1 lexical.
+        let dir = std::env::temp_dir().join(format!("test_no_embedder_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("hello world"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        // Build bridge with no embedder.
+        let bridge = build_test_bridge_without_embedder(&db_path).await;
+
+        let results = bridge.search(None, "world", 10, None).await.unwrap();
+
+        assert_eq!(results.len(), 1, "no embedder → lexical search works");
+        assert_eq!(results[0].message_id, "msg1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Helper to build a bridge with no embedder.
+    async fn build_test_bridge_without_embedder(db_path: &std::path::Path) -> WhatsAppBridge {
+        use crate::storage::Store;
+        use parking_lot::Mutex as ParkingMutex;
+        use std::sync::Arc;
+        use tokio::sync::watch;
+        use tokio_util::sync::CancellationToken;
+
+        let cancel = CancellationToken::new();
+        let (_state_tx, state_rx) = watch::channel(BridgeState::Disconnected);
+        let (_qr_tx, qr_rx) = watch::channel::<Option<String>>(None);
+        let outbound_notify = Arc::new(tokio::sync::Notify::new());
+        let backfill_notify = Arc::new(tokio::sync::Notify::new());
+        let embed_notify = Arc::new(tokio::sync::Notify::new());
+        let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> =
+            Arc::new(ParkingMutex::new(None));
+        let rr_tx = spawn_scheduler(None, 200);
+        let msg_cache: MsgCache = Arc::new(ParkingMutex::new(BoundedMsgCache::new(128)));
+        let send_pacer = Arc::new(SendPacer::with_burst(0, 1));
+        let subscribed_presence: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let group_cache: GroupCacheHandle = Arc::new(ParkingMutex::new(GroupCache::new()));
+        let (event_tx, _event_rx) = crate::bridge_events::new_event_bus();
+        let store = Store::new(&db_path).expect("failed to open test DB");
+        let metrics = Arc::new(BridgeMetrics::new());
+        let embedder_handle = Arc::new(ParkingMutex::new(None)); // No embedder
+
+        WhatsAppBridge {
+            outbound_notify,
+            backfill_notify,
+            embed_notify,
+            state_rx,
+            qr_rx,
+            cancel,
+            client_handle,
+            rr_tx,
+            msg_cache,
+            store,
+            metrics,
+            send_pacer,
+            subscribed_presence,
+            event_tx,
+            group_cache,
+            backfill_cooldown_secs: 300,
+            backfill_queue_depth: 100,
+            backfill_max_messages: 10000,
+            embedder: embedder_handle,
+            db_path: db_path.to_path_buf(),
+            semantic_min_score: 0.25,
+            semantic_scan_cap: 50_000,
+        }
     }
 }

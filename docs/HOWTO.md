@@ -266,78 +266,158 @@ CLI's connection-refused message in §3.
 ## 5a. Embedder sidecar (optional semantic search)
 
 **Goal:** enable semantic (embedding-based) search on top of the always-on
-FTS5 lexical search. Opt-in via environment variables; gracefully degrades to
-lexical when absent or down.
+FTS5 lexical search, with **hybrid recall** (ADR 0041): paraphrase and
+cross-language queries that share no words with a message can still find it,
+not just get it reordered. Opt-in via environment variables; gracefully
+degrades to pure lexical when the sidecar is absent or down.
 
-**Background:** whatsrust ships with FTS5 lexical search (M1, DONE). Semantic
-search (M2.1–M2.6 code-complete; live E2E validation pending) layers on top
-via a stateless embedder sidecar (a separate process that embeds text on
-demand). When configured, the bridge embeds the query, recalls FTS candidates,
-reranks by cosine similarity, and appends an additive lexical fallback. When
-the sidecar is absent or down, search is byte-identical to M1 lexical (no
-errors, no blocking).
+### How the sidecar works
 
-**Steps (Rust sidecar, primary):**
-1. Build the native Rust embedder sidecar (ADR 0040 — Python-free):
-   ```bash
-   make embedder-build
-   # Produces: embedder-rs/target/release/whatsrust-embedder
-   ```
-   This is a separate crate (`embedder-rs/`) so candle stays out of the daemon
-   build. No Python, no venv.
-2. Set the embedder command in `.env` (or export directly):
-   ```bash
-   WHATSRUST_EMBEDDER_CMD="/absolute/path/to/whatsrust/embedder-rs/target/release/whatsrust-embedder"
-   ```
-   Use an absolute path. There is **no** `WHATSRUST_EMBEDDER_ARGS` needed. The
-   model ID is reported by the sidecar itself via its `model_info` response
-   (default: `paraphrase-multilingual-MiniLM-L12-v2`, 384-dim, prefix-free).
-3. (Recommended shortcut) Use `make run-semantic` — it builds the sidecar and
-   wires it via `WHATSRUST_EMBEDDER_CMD` automatically (absolute path, no
-   manual `.env` edit needed). Test the sidecar standalone with `make embedder-smoke`
-   (pipes `model_info` + one `embed` request and prints the responses).
-4. On first run, the sidecar downloads ~420 MB of weights to `~/.cache/huggingface`
-   (lazy, on first `embed`, ~2s). `model_info` answers instantly; no blocking.
-5. Start the daemon (§3, or just `make run-semantic` if using the shortcut).
-   The embedding-drain worker spawns automatically and begins processing
-   `embed_status='pending'` rows in the background (default: 60s interval,
-   64 msgs/batch). No action required. Confirm in the log: `embedder configured model=… dim=…`
-   then `embedding-drain worker starting`.
-6. Search as usual (`whatsrust search "query text"`, or via API/MCP). When
-   embeddings exist for the query and recalled messages, results are reranked
-   by semantic similarity; otherwise falls back to FTS5 lexical.
+The daemon never embeds anything itself. At startup it spawns whatever
+`WHATSRUST_EMBEDDER_CMD` points at (plus `WHATSRUST_EMBEDDER_ARGS`, if set) as
+a child process, and speaks newline-delimited JSON-RPC 2.0 over its
+stdin/stdout (ADR 0006/0024); the child's stderr is discarded. **The sidecar,
+not the daemon, decides which model it serves** — the Rust sidecar reads its
+own `--model` flag (or inherits `WHATSRUST_EMBEDDER_MODEL`, since env vars
+propagate to child processes). The daemon just reads back whatever
+`model_info` reports and stores vectors keyed by `(message_id, model_id)`, so
+it works with any model the sidecar advertises, past or future.
 
-**Legacy Python sidecar (reference/fallback):**
-The original Python sidecar (`scripts/embedder-sidecar.py`) remains available
-for parity checks. Steps:
-1. Create the venv: `make py-sidecar-setup` (installs `sentence-transformers`
-   into `.venv-embedder`; ~420 MB model downloads to `~/.cache/huggingface` on
-   first run).
-2. Test standalone: `make py-sidecar-smoke`.
-3. Run the daemon: `make run-semantic-py` (or set
-   `WHATSRUST_EMBEDDER_CMD=./scripts/run-embedder.sh` in `.env` and use `make run`).
-The Python sidecar is functionally equivalent (direction-identical cosine = 1.0
-on all test cases) but requires Python 3.8+ and ~GB of PyTorch deps. Use the
-Rust sidecar for deployment (ADR 0040).
+`model_info` answers instantly from built-in static metadata (`model_id`,
+`dim`, `max_batch`, `max_input_tokens`) — it never blocks on loading the
+model. The actual weights load on a background thread at startup; `health`
+reports `"loading"` and then `"ok"` (or `"error"`) once that thread finishes,
+and the embedding-drain worker waits on `health` before sending real work, up
+to `WHATSRUST_EMBEDDER_LOADING_TIMEOUT_SECS`. Each `embed` call does
+tokenize → transformer forward pass → pool (mean-pooling for MiniLM,
+first-token/CLS for bge-m3) → L2-normalize, and the daemon validates every
+response (dimension, vector count, model ID match) before trusting it
+(trust-but-verify, ADR 0024). Supporting a different/future model means
+changing the sidecar, not the daemon — see `embedder-rs/src/main.rs`.
 
-**Purging embeddings (model switch / disk reclaim):**
+### Choosing a model
+
+| | MiniLM (`paraphrase-multilingual-MiniLM-L12-v2`) | bge-m3 (`BAAI/bge-m3`) |
+|---|---|---|
+| Dimensions | 384 | 1024 |
+| Disk (first-run download) | ~0.46 GB | ~2.2 GB |
+| RAM while running | ~0.5–1.3 GB | ~1.3–2.3 GB |
+| Warm single query | 30–70 ms | 230–480 ms |
+| Max embed batch | 32 | 8 |
+| Cross-language/paraphrase recall | weaker | stronger |
+
+bge-m3 is the better default for mixed-language (e.g. Hebrew/Arabic/English)
+history: in calibration, 6 of 11 word-free cross-language queries ranked
+their intended target #1 of 24 candidates, vs. 3 of 11 for MiniLM (see
+docs/adr/0041-hybrid-recall-bounded-vector-scan.md). MiniLM stays worth
+choosing deliberately when you want the smaller download/RAM footprint and
+faster queries, and can tolerate weaker cross-language recall.
+
+- **bge-m3 (default):**
+  ```bash
+  make run-semantic
+  ```
+- **MiniLM:**
+  ```bash
+  make run-semantic EMBED_MODEL=minilm
+  ```
+- **Manual/`.env` form (either model):**
+  ```bash
+  WHATSRUST_EMBEDDER_CMD=/absolute/path/to/whatsrust/embedder-rs/target/release/whatsrust-embedder
+  WHATSRUST_EMBEDDER_ARGS="--model bge-m3"      # or: --model minilm
+  ```
+  `make run-semantic` builds the sidecar first (`make embedder-build`,
+  producing `embedder-rs/target/release/whatsrust-embedder` — a separate
+  crate so candle stays out of the daemon's own build) and wires both env
+  vars with an absolute path automatically; no manual `.env` edit needed.
+  Test the sidecar standalone (without starting the daemon) with
+  `make embedder-smoke` (bge-m3) or `make embedder-smoke EMBED_MODEL=minilm` —
+  it pipes a `model_info` + one `embed` request into the binary and prints the
+  raw JSON-RPC responses.
+
+### Switching models
+
+Changing the active model means **restarting the daemon** with a different
+`--model`/`WHATSRUST_EMBEDDER_ARGS` (there's no live hot-swap). On the next
+start:
+- The drain worker's set-difference query sees every embeddable row as
+  missing a vector for the *new* `model_id` and re-embeds all of them —
+  expect a burst of drain activity proportional to history size.
+- The *old* model's vectors are **not deleted**. They sit as inert cold
+  storage (`embeddings` table, keyed by `(message_id, model_id)`), so
+  switching back to the old model is instant (no re-embedding) — but they are
+  never read while a different model is active (ADR 0007/0017). Free the disk
+  space with:
+  ```bash
+  whatsrust purge-embeddings paraphrase-multilingual-MiniLM-L12-v2
+  # Returns: {"ok": true, "model_id": "...", "rows_deleted": N, "bytes_reclaimed": B}
+  ```
+- **Re-measure the similarity floor for the new model** — `WHATSRUST_SEMANTIC_MIN_SCORE`
+  is model-specific (ADR 0041); the shipped default (0.55) is calibrated for
+  bge-m3 and is deliberately conservative for MiniLM. Run
+  `make calibrate EMBED_MODEL=<minilm|bge-m3>` against your own data
+  (read-only against `whatsapp.db`) and set `WHATSRUST_SEMANTIC_MIN_SCORE` if
+  the result suggests a different floor.
+- Watch re-embedding progress in `/api/status` → `embeddings`. As of ADR 0041
+  this is keyed to the **active** model only:
+  `{"model_id": "...", "embedded": N, "pending": M, "failed": F, "skipped": S}`
+  (`embedded`/`pending` are omitted and `model_id` is `null` when no embedder
+  is configured). `pending` dropping to 0 means the new model has caught up.
+
+### How search uses it
+
+When the sidecar is active and the query embeds successfully, `search` is
+**hybrid**: FTS5 keyword candidates, plus a bounded brute-force cosine scan
+of every vector stored for the active model in the search scope (same chat
+filter, same time bound), merged and deduplicated by message ID. Keyword
+matches are **always** kept, no matter their semantic score. Vector-only
+matches (no shared keyword — the case this exists for) need
+`cosine ≥ WHATSRUST_SEMANTIC_MIN_SCORE` to be admitted.
+`WHATSRUST_SEMANTIC_SCAN_CAP` (default 50000 vectors) bounds the scan; a
+scope larger than that skips vector recall for that query and falls back to
+plain FTS5 + rerank. With no sidecar configured (or an unhealthy one, or a
+query-embed failure/timeout), search is byte-identical to plain FTS5 keyword
+search — no errors, no blocking. See
+`docs/adr/0041-hybrid-recall-bounded-vector-scan.md`.
+
+### Model files and cache
+
+Both models' weights/tokenizer/config are fetched from Hugging Face Hub into
+the standard local cache, `~/.cache/huggingface/hub` (override with `HF_HOME`
+or `HF_HUB_CACHE`, both honored). The sidecar starts loading its model in the
+background at startup, which also downloads it on a cold cache; once cached, `HF_HUB_OFFLINE=1` works with no network
+access. bge-m3's weights are loaded from a pinned community safetensors
+conversion revision rather than its `main` branch (which ships only a
+PyTorch checkpoint) — see ADR 0040 for why, and for the cold-cache download
+fix that makes first-run downloads work reliably for both models.
+
+### Legacy Python sidecar (reference/fallback)
+
+`scripts/embedder-sidecar.py` (sentence-transformers, MiniLM only) remains
+available for parity checks against the Rust sidecar:
 ```bash
-# Remove all embeddings for a specific model ID and reclaim disk space
-whatsrust purge-embeddings paraphrase-multilingual-MiniLM-L12-v2
-# Returns: {"ok": true, "model_id": "...", "rows_deleted": N, "bytes_reclaimed": B}
+make py-sidecar-setup   # creates .venv-embedder, installs sentence-transformers
+make py-sidecar-smoke   # standalone model_info check
+make run-semantic-py    # run the daemon with it (or WHATSRUST_EMBEDDER_CMD=./scripts/run-embedder.sh + make run)
 ```
-Per-model purge allows switching embedding models without losing lexical search
-or requiring a schema migration. The drain worker will re-embed pending rows
-for the new active model.
+Direction-identical to the Rust sidecar (cosine = 1.0 on parity tests,
+`scripts/test_embedder_parity.py`) but needs Python 3.8+ and ~GB of PyTorch
+deps, and doesn't support bge-m3. Use the Rust sidecar for real deployment.
 
-**Verification:** with the sidecar configured, trigger a search and check the
-daemon logs for `sidecar embed` calls. Without the sidecar (or with an invalid
-`WHATSRUST_EMBEDDER_CMD`), search still works (pure lexical) and the logs show
-`no embedder configured` or a sidecar-down warning.
+### Verification
 
-**Note:** End-to-end validation of the semantic search path against a live
-daemon is pending (M2.6). The code is complete but not yet live-tested in a
-real-world scenario. Use at your own risk; report issues to the repo.
+Start the daemon with a sidecar configured and check the log for, in order:
+`embedder configured model=… dim=…` (construction-time `model_info` round
+trip succeeded) and then `embedding-drain worker starting` (the drain
+worker spawned). Without a sidecar (or an invalid `WHATSRUST_EMBEDDER_CMD`),
+search still works (pure FTS5) and the daemon logs
+`no embedder configured or construction failed` at DEBUG — non-fatal by
+design.
+
+**Note:** end-to-end validation of the semantic search path against a live
+daemon with real data is pending; the code (including ADR 0041 hybrid
+recall) is complete and unit/integration-tested but not yet live-tested in
+a real-world scenario. Use at your own risk; report issues to the repo.
 
 ---
 
