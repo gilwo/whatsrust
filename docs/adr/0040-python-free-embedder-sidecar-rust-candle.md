@@ -71,5 +71,14 @@ model-weight distribution (fetch-on-first-run or vendored safetensors + tokenize
 env-configurable stays an optional defense-in-depth item (see the M2 review follow-ups in
 `docs/plans/IMPLEMENTATION-ROADMAP.md`).
 
+**Implementation note (2026-09-24, parity verified):** `paraphrase-multilingual-MiniLM-L12-v2`'s
+sentence-transformers pipeline is `Transformer` + `Pooling` only, with **no `Normalize` module**. The
+Python sidecar therefore emits *un*-normalized vectors (norm ≈ 4–5). The earlier "normalized by
+default" claim here and in the MVP spec §2 was wrong. The Rust sidecar mean-pools and then
+L2-normalizes. Its output is **direction-identical** to Python: cosine = 1.000000 on English, Hebrew,
+Arabic, mixed, emoji and truncated inputs, and the max element diff after normalizing the Python
+vector is about 1e-7. whatsrust ranks with scale-invariant `cosine_similarity`, so the two sidecars
+are interchangeable under the same `model_id`.
+
 **Supersedes:** the Python sidecar (ADR 0039 / spec §3) as the *deployment* target, once validated.
 ADR 0039's model-rollout decision (MiniLM → bge-m3, prefix-free) still stands — only the runtime changes.
