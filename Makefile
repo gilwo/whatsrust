@@ -5,7 +5,13 @@
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release run embedder-build run-semantic embedder-smoke test test-all lint lint-strict fmt fmt-check clean py-sidecar-setup py-sidecar-smoke run-semantic-py
+.PHONY: help build release run embedder-build run-semantic embedder-smoke calibrate test test-all lint lint-strict fmt fmt-check clean py-sidecar-setup py-sidecar-smoke run-semantic-py
+
+# Model for the Rust embedder sidecar: bge-m3 (default, stronger multilingual/cross-language
+# recall) or minilm (lighter, faster). Override on the command line, e.g.:
+#   make run-semantic EMBED_MODEL=minilm
+# See docs/HOWTO.md #5a "Choosing a model" and docs/adr/0041-hybrid-recall-bounded-vector-scan.md.
+EMBED_MODEL ?= bge-m3
 
 help: ## Show this help (default target)
 	@echo "whatsrust — available targets:"
@@ -33,12 +39,15 @@ embedder-build: ## Build the Rust embedder sidecar (embedder-rs/ — separate cr
 	cd embedder-rs && cargo build --release
 
 # Runs the daemon with semantic search enabled via the Rust embedder sidecar
-# (whatsrust spawns the sidecar as a child process via WHATSRUST_EMBEDDER_CMD).
-# Requires a linked account. On first run, the sidecar downloads ~420 MB of
-# weights to ~/.cache/huggingface (lazy, on first embed, ~2s). No Python/venv.
-# See docs/HOWTO.md #5a "Embedder sidecar" for the full setup walkthrough.
-run-semantic: embedder-build ## Run the daemon with Rust embedder sidecar enabled (requires linked account)
-	WHATSRUST_EMBEDDER_CMD=$(CURDIR)/embedder-rs/target/release/whatsrust-embedder cargo run
+# (whatsrust spawns the sidecar as a child process via WHATSRUST_EMBEDDER_CMD,
+# with WHATSRUST_EMBEDDER_ARGS="--model $(EMBED_MODEL)" selecting the model).
+# Requires a linked account. On first run, the sidecar downloads model weights
+# to ~/.cache/huggingface (lazy, on first embed): ~0.46 GB for minilm, ~2.2 GB
+# for bge-m3. No Python/venv. See docs/HOWTO.md #5a for the full walkthrough.
+run-semantic: embedder-build ## Run the daemon with Rust embedder sidecar enabled (EMBED_MODEL=bge-m3|minilm, default bge-m3; e.g. make run-semantic EMBED_MODEL=minilm)
+	WHATSRUST_EMBEDDER_CMD=$(CURDIR)/embedder-rs/target/release/whatsrust-embedder \
+	WHATSRUST_EMBEDDER_ARGS="--model $(EMBED_MODEL)" \
+	cargo run
 
 test: ## Run the default test suite (cargo test)
 	cargo test
@@ -68,12 +77,27 @@ fmt-check: ## Check formatting without writing changes (cargo fmt --check)
 
 # Quick protocol check: pipes model_info + a one-text embed request into the
 # Rust sidecar and prints the responses (confirms the sidecar answers correctly
-# before wiring it into the daemon). Safe and non-interactive.
-embedder-smoke: embedder-build ## Test the Rust embedder sidecar standalone (JSON-RPC protocol check)
-	@echo "Sending model_info + embed requests to Rust sidecar..."
+# before wiring it into the daemon). Safe and non-interactive. Honors EMBED_MODEL.
+embedder-smoke: embedder-build ## Test the Rust embedder sidecar standalone (JSON-RPC protocol check; EMBED_MODEL=bge-m3|minilm, default bge-m3)
+	@echo "Sending model_info + embed requests to Rust sidecar (model=$(EMBED_MODEL))..."
 	@(echo '{"jsonrpc":"2.0","id":1,"method":"model_info"}'; \
 	  echo '{"jsonrpc":"2.0","id":2,"method":"embed","params":{"texts":["Hello world"]}}') | \
-	  $(CURDIR)/embedder-rs/target/release/whatsrust-embedder
+	  $(CURDIR)/embedder-rs/target/release/whatsrust-embedder --model $(EMBED_MODEL)
+
+# Measures the cosine-similarity floor for EMBED_MODEL against the real, read-only
+# whatsapp.db (word-free queries vs. their targets vs. the unrelated-message
+# distribution — ADR 0041). scripts/calibrate_semantic.py needs numpy, which isn't
+# in stdlib, so this reuses .venv-embedder (the same venv `py-sidecar-setup`
+# creates for the legacy Python sidecar — sentence-transformers pulls numpy as a
+# dependency). Re-run after switching WHATSRUST_SEMANTIC_MIN_SCORE's target model.
+calibrate: embedder-build ## Measure the semantic-recall floor for EMBED_MODEL against whatsapp.db (needs .venv-embedder: make py-sidecar-setup)
+	@if [ ! -f .venv-embedder/bin/python3 ]; then \
+		echo "Error: .venv-embedder not found (calibrate_semantic.py needs numpy). Run 'make py-sidecar-setup' first." >&2; \
+		exit 1; \
+	fi
+	.venv-embedder/bin/python3 scripts/calibrate_semantic.py \
+	  --binary $(CURDIR)/embedder-rs/target/release/whatsrust-embedder \
+	  --models $(EMBED_MODEL)
 
 # ---------------------------------------------------------------------------
 # Legacy Python embedder sidecar (reference/fallback per ADR 0040)

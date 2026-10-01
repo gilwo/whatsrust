@@ -1,7 +1,7 @@
 # Implementation Roadmap — Historical Fetch + Semantic/Lexical Search
 
-**Date:** 2026-06-25 (updated 2026-09-01)
-**Status:** **Phase 0 GATE PASSED — GO** (2026-07-01, commit 615d185). **M1 COMPLETE (2026-07-20)** — M1.1/M1.2/M1.3/M1.4 all DONE and the live E2E smoke test passed on a real account (API/CLI/MCP trigger, SSE `backfill` + `storage_alert`, FTS search, cancel→404). **M2 (semantic search) M2.1–M2.6 CODE-COMPLETE (2026-09-02)** — embedder sidecar contract, drain worker, cosine rerank, multi-model purge, config-wiring/misbehave tests + observability. MVP Python sidecar built. **Only remaining M2 item: live end-to-end validation against a running daemon (hands-on, not automatable).**
+**Date:** 2026-06-25 (updated 2026-09-30)
+**Status:** **Phase 0 GATE PASSED — GO** (2026-07-01, commit 615d185). **M1 COMPLETE (2026-07-20)** — M1.1/M1.2/M1.3/M1.4 all DONE and the live E2E smoke test passed on a real account (API/CLI/MCP trigger, SSE `backfill` + `storage_alert`, FTS search, cancel→404). **M2 (semantic search) CODE-COMPLETE (2026-09-30)** — embedder sidecar contract, drain worker, multi-model purge, config-wiring/misbehave tests + observability (2026-09-02), **plus ADR 0041 hybrid recall** (FTS5 ∪ bounded vector scan, replacing rerank-only recall) **and the ADR 0039/0040 bge-m3 rollout** (native Rust/candle sidecar is now the default, serving bge-m3 by default or MiniLM selectably; default `WHATSRUST_SEMANTIC_MIN_SCORE=0.55`, calibrated for bge-m3). **Only remaining M2 item: live end-to-end validation against a running daemon with real data after a restart onto this code (hands-on, not automatable).**
 **Design:** `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (3 cold reviews, converged, implementation-ready)
 **Why this is a skeleton:** Phase 0 is a hard GO/NO-GO gate (the wa-rs v0.6.0 dependency adoption). We do not write detailed phase/task plans behind an unvalidated gate — a NO-GO or a fallback-triggering result reshapes everything. Only Phase 0 is planned in detail below; M1/M2 phase detail is deferred to their starts.
 
@@ -83,7 +83,7 @@ The entire feature is conditional on this. **No rebase, no fork, no clone** — 
 
 ---
 
-## Milestone 2 — Semantic search  (M2.1–M2.6 CODE-COMPLETE 2026-09-02; live E2E validation PENDING)
+## Milestone 2 — Semantic search  (CODE-COMPLETE 2026-09-30, incl. ADR 0041 hybrid recall + bge-m3 default; live E2E validation after restart PENDING)
 
 **Goal:** optional semantic search via the embedder sidecar, layered on M1's stored messages.
 
@@ -91,10 +91,13 @@ The entire feature is conditional on this. **No rebase, no fork, no clone** — 
 - ✅ **M2.1 Embedder sidecar contract & transport — DONE.** `Embedder` trait (`model_info`/`embed`/`health`), `StdioEmbedder` (JSON-RPC stdio client), `FakeEmbedder` test seam, trust-but-verify validation (dim, model_id, timeout). [ADR 0006/0024/0025]
 - ✅ **M2.2 Embeddable-text classification — DONE.** `InboundContent::embeddable_text()` (NL-only, distinct from `display_text()`), write-time classification (`pending`/`skipped`), set-difference drain query (`embed_status='pending'` minus already-embedded). Backlog tolerance: pre-M2 rows remain `pending` with `display_text()` stored; tolerated per ADR 0038 (small single-user backlog, raw captions unrecoverable). [ADR 0016/0017/0038]
 - ✅ **M2.3 Embedding-drain worker — DONE.** Independent task (spawned alongside backfill/prune, before reconnect loop), periodic wake (default 60s), batch sidecar calls (default 64), transport-failure retry (rows stay `pending`); the in-memory 3-attempt-cap → terminal `failed` path is scaffolded but **dormant** (batch protocol can't distinguish content rejection from transport failure — deferred to M2.6.7); pathological-pending circuit-breaker back-pressures **new backfill enqueues** (`EmbedderBacklogFull`) at a ceiling (default 100k), drain itself keeps running. [ADR 0015/0017/0038]
-- ✅ **M2.4 Semantic search path — DONE.** `WhatsAppBridge::search`: embed query → FTS recall (width = max of 200 and limit) → fetch vectors by `(message_id, active_model_id)` → cosine rerank (Rust-side `cosine_similarity()`) → additive lexical fallback (byte-identical to M1 when sidecar absent/down). [ADR 0007/0008/0017/0018]
+- ✅ **M2.4 Semantic search path — DONE.** `WhatsAppBridge::search`: embed query → FTS recall (width = max of 200 and limit) → fetch vectors by `(message_id, active_model_id)` → cosine rerank (Rust-side `cosine_similarity()`) → additive lexical fallback (byte-identical to M1 when sidecar absent/down). Superseded by ADR 0041's hybrid recall below as the active search path (kept as the scan-cap-exceeded fallback). [ADR 0007/0008/0017/0018]
 - ✅ **M2.5 Multi-model retention & explicit purge — DONE.** `embeddings` PK `(message_id, model_id)` supports model switch without purge; `Store::purge_embeddings(model_id)` deletes one model's rows + `incremental_vacuum`; surfaces: API `POST /api/embeddings/purge`, MCP `whatsrust_purge_embeddings` (35 tools total), CLI `purge-embeddings <model_id>`. Returns `{model_id, rows_deleted, bytes_reclaimed}`. [ADR 0017]
-- ✅ **MVP sidecar BUILT (2026-08-31).** `scripts/embedder-sidecar.py` (Python + sentence-transformers, `paraphrase-multilingual-MiniLM-L12-v2`, 384-dim, prefix-free, multilingual) + `scripts/run-embedder.sh` convenience wrapper. [ADR 0039]
-- ✅ **M2.6 Config, integration test, wiring — DONE (2026-09-02).** Embedder knobs plumbed through `.env`/`BridgeConfig` with config tests (override + absent-is-benign); `.env.example` completed (FAILURE_THRESHOLD); fake-embedder misbehave mode + real-subprocess trust-but-verify integration tests (wrong dim/count/model_id rejected over the process boundary, CI-safe); additive `/api/status` embed-status counts (watchdog already covers footprint); stale multi-worker-backfill comments reworded; inert per-row-rejection semantics reconciled in ADR 0015/0038 (path a — cap-3 dormant pending a protocol signal). **Remaining M2 item: live end-to-end validation against a running daemon with real data (hands-on, not automatable).** [ADR 0023/0024/0025]
+- ✅ **MVP sidecar BUILT (2026-08-31).** `scripts/embedder-sidecar.py` (Python + sentence-transformers, `paraphrase-multilingual-MiniLM-L12-v2`, 384-dim, prefix-free, multilingual) + `scripts/run-embedder.sh` convenience wrapper. Superseded as the deployment default by the native Rust sidecar below. [ADR 0039]
+- ✅ **M2.6 Config, integration test, wiring — DONE (2026-09-02).** Embedder knobs plumbed through `.env`/`BridgeConfig` with config tests (override + absent-is-benign); `.env.example` completed (FAILURE_THRESHOLD); fake-embedder misbehave mode + real-subprocess trust-but-verify integration tests (wrong dim/count/model_id rejected over the process boundary, CI-safe); additive `/api/status` embed-status counts (watchdog already covers footprint); stale multi-worker-backfill comments reworded; inert per-row-rejection semantics reconciled in ADR 0015/0038 (path a — cap-3 dormant pending a protocol signal). [ADR 0023/0024/0025]
+- ✅ **Native Rust sidecar + bge-m3 default — DONE (2026-09-30).** `embedder-rs/` (candle, ADR 0040) replaces the Python MVP as the deployment target, serving `--model minilm|bge-m3`; **bge-m3 is now the default for `make run-semantic`** (`EMBED_MODEL ?= bge-m3` in the Makefile), MiniLM stays selectable (`EMBED_MODEL=minilm`). Fixes the cold-cache download bug (hf-hub's redirect-following gap) for both models. [ADR 0039/0040]
+- ✅ **Hybrid recall — DONE (2026-09-30).** `WhatsAppBridge::search` unions FTS5 lexical candidates with a bounded brute-force vector scan of the search scope (skipped above `WHATSRUST_SEMANTIC_SCAN_CAP`, default 50000); lexical matches are always kept, vector-only matches need `cosine ≥ WHATSRUST_SEMANTIC_MIN_SCORE`. Fixes the M2.4 limitation where a word-free query (e.g. an English query matching a Hebrew-only message) returned nothing. Default floor raised to **0.55**, calibrated against the real (read-only) `whatsapp.db` for both models (`make calibrate`); right-sized for bge-m3, conservative (vector-only recall effectively off) for MiniLM. `/api/status` → `embeddings` now reports per-active-model `{model_id, embedded, pending, failed, skipped}`. [ADR 0041]
+  **Remaining M2 item: live end-to-end validation against a running daemon with real data, after a restart onto this code (hands-on, not automatable).**
 
 **M2 exit criteria (milestone-level):**
 - ✅ With a sidecar configured, semantic search returns relevant results; without one, search cleanly falls back to M1 lexical (no errors, no blocking). — **CODE-COMPLETE, E2E validation pending.**
@@ -129,7 +132,12 @@ against a *trusted* sidecar or rare inputs. Fix opportunistically or during a la
   for operator visibility (do NOT auto-`failed` — that's the deferred M2.6.7 cap-3 path). Reviewer "M3".
 - [ ] **(Nit) L1** fake-embedder: env-configurable `max_batch`/`max_input_tokens` (incl. omitting
   them) to exercise the no-advertised-limit path. **L2** cfg-gate the dormant `AttemptTracker`. **L3**
-  document the 100-iteration `incremental_vacuum` cap in `purge_embeddings`.
+  document the 100-iteration `incremental_vacuum` cap in `purge_embeddings`. **L4** (ADR 0040,
+  `embedder-rs/src/main.rs` `try_resolve_file`) a cold-cache download that fails partway through
+  (network drop mid-write, disk full) leaves its `<filename>.tmp-<pid>` sibling file behind — the
+  `File::create`/`io::copy` steps have no cleanup-on-error path before the `rename`. Harmless (a
+  stray file in the HF cache that a retry won't collide with, since the pid differs) but worth a
+  `defer`-style cleanup opportunistically.
 
 *Double-checked and DISMISSED (do not re-investigate):*
 - **H1 "missing partial-coverage additive test" — FALSE.** `test_search_partial_coverage_keeps_unvectored`
