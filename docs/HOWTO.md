@@ -270,38 +270,55 @@ FTS5 lexical search. Opt-in via environment variables; gracefully degrades to
 lexical when absent or down.
 
 **Background:** whatsrust ships with FTS5 lexical search (M1, DONE). Semantic
-search (M2.1–M2.5, code-complete; M2.6 + E2E validation pending) layers on top
+search (M2.1–M2.6 code-complete; live E2E validation pending) layers on top
 via a stateless embedder sidecar (a separate process that embeds text on
 demand). When configured, the bridge embeds the query, recalls FTS candidates,
 reranks by cosine similarity, and appends an additive lexical fallback. When
 the sidecar is absent or down, search is byte-identical to M1 lexical (no
 errors, no blocking).
 
-**Steps:**
-1. Set the embedder command in `.env` (or export directly). `WHATSRUST_EMBEDDER_CMD`
-   is a single executable path; the script path goes in `WHATSRUST_EMBEDDER_ARGS`
-   (whitespace-split into args). There is **no** model-ID env var — the model ID is
-   reported by the sidecar itself via its `model_info` response.
+**Steps (Rust sidecar, primary):**
+1. Build the native Rust embedder sidecar (ADR 0040 — Python-free):
    ```bash
-   WHATSRUST_EMBEDDER_CMD=".venv-embedder/bin/python3"
-   WHATSRUST_EMBEDDER_ARGS="scripts/embedder-sidecar.py"
+   make embedder-build
+   # Produces: embedder-rs/target/release/whatsrust-embedder
    ```
-   The MVP sidecar (`scripts/embedder-sidecar.py`) requires Python 3.8+ and
-   `sentence-transformers` (`pip install sentence-transformers`, ideally into the
-   `.venv-embedder` venv). The default model (`paraphrase-multilingual-MiniLM-L12-v2`,
-   384-dim, prefix-free) is downloaded on first run (~420 MB) to `~/.cache/huggingface`.
-2. (Recommended) A convenience wrapper `scripts/run-embedder.sh` exists; it `cd`s to
-   the repo root and execs the `.venv-embedder` Python on the sidecar script. To use
-   it, set `WHATSRUST_EMBEDDER_CMD="./scripts/run-embedder.sh"` (no `WHATSRUST_EMBEDDER_ARGS`
-   needed). **Quick start:** `make sidecar-setup` (creates the venv), `make sidecar-smoke`
-   (protocol check), `make run-semantic` (runs the daemon with the sidecar enabled).
-3. Start the daemon as usual (§3). The embedding-drain worker spawns
-   automatically and begins processing `embed_status='pending'` rows in the
-   background (default: 60s interval, 64 msgs/batch). No action required;
-   watch the logs for `embedding-drain` activity.
-4. Search as usual (`whatsrust search "query text"`, or via API/MCP). When
+   This is a separate crate (`embedder-rs/`) so candle stays out of the daemon
+   build. No Python, no venv.
+2. Set the embedder command in `.env` (or export directly):
+   ```bash
+   WHATSRUST_EMBEDDER_CMD="/absolute/path/to/whatsrust/embedder-rs/target/release/whatsrust-embedder"
+   ```
+   Use an absolute path. There is **no** `WHATSRUST_EMBEDDER_ARGS` needed. The
+   model ID is reported by the sidecar itself via its `model_info` response
+   (default: `paraphrase-multilingual-MiniLM-L12-v2`, 384-dim, prefix-free).
+3. (Recommended shortcut) Use `make run-semantic` — it builds the sidecar and
+   wires it via `WHATSRUST_EMBEDDER_CMD` automatically (absolute path, no
+   manual `.env` edit needed). Test the sidecar standalone with `make embedder-smoke`
+   (pipes `model_info` + one `embed` request and prints the responses).
+4. On first run, the sidecar downloads ~420 MB of weights to `~/.cache/huggingface`
+   (lazy, on first `embed`, ~2s). `model_info` answers instantly; no blocking.
+5. Start the daemon (§3, or just `make run-semantic` if using the shortcut).
+   The embedding-drain worker spawns automatically and begins processing
+   `embed_status='pending'` rows in the background (default: 60s interval,
+   64 msgs/batch). No action required. Confirm in the log: `embedder configured model=… dim=…`
+   then `embedding-drain worker starting`.
+6. Search as usual (`whatsrust search "query text"`, or via API/MCP). When
    embeddings exist for the query and recalled messages, results are reranked
    by semantic similarity; otherwise falls back to FTS5 lexical.
+
+**Legacy Python sidecar (reference/fallback):**
+The original Python sidecar (`scripts/embedder-sidecar.py`) remains available
+for parity checks. Steps:
+1. Create the venv: `make py-sidecar-setup` (installs `sentence-transformers`
+   into `.venv-embedder`; ~420 MB model downloads to `~/.cache/huggingface` on
+   first run).
+2. Test standalone: `make py-sidecar-smoke`.
+3. Run the daemon: `make run-semantic-py` (or set
+   `WHATSRUST_EMBEDDER_CMD=./scripts/run-embedder.sh` in `.env` and use `make run`).
+The Python sidecar is functionally equivalent (direction-identical cosine = 1.0
+on all test cases) but requires Python 3.8+ and ~GB of PyTorch deps. Use the
+Rust sidecar for deployment (ADR 0040).
 
 **Purging embeddings (model switch / disk reclaim):**
 ```bash
