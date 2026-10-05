@@ -65,10 +65,17 @@ pub fn urlencode(s: &str) -> String {
     out
 }
 
-/// Percent-decode a URL query component. Invalid/incomplete `%` escapes are
+/// Decode a URL query-string component using `application/x-www-form-urlencoded`
+/// rules (the WHATWG URL spec's query encoding): `%XX`-decode as usual, and
+/// also treat a literal `+` as a space. Invalid/incomplete `%` escapes are
 /// left literal (so a raw string with no valid escapes is returned unchanged).
-/// Does NOT treat '+' as space (RFC 3986 query components use %20).
-fn percent_decode(s: &str) -> String {
+///
+/// `%2B` always decodes to a literal `+` and is never turned into a space —
+/// only *raw* `+` bytes in the input are treated as space. This matches what
+/// browsers, `curl --data-urlencode`, and Python's `urllib.parse.urlencode`
+/// send for query strings; `api::urlencode` emits `%20` for space and `%2B`
+/// for a literal `+`, so whatsrust's own CLI/MCP clients round-trip exactly.
+fn decode_query_component(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let hex = |c: u8| -> Option<u8> {
@@ -83,7 +90,11 @@ fn percent_decode(s: &str) -> String {
                 continue;
             }
         }
-        out.push(b[i]);
+        if b[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(b[i]);
+        }
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -274,7 +285,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest>
             .split('&')
             .filter_map(|pair| {
                 let mut kv = pair.splitn(2, '=');
-                Some((percent_decode(kv.next()?), percent_decode(kv.next().unwrap_or(""))))
+                Some((decode_query_component(kv.next()?), decode_query_component(kv.next().unwrap_or(""))))
             })
             .collect();
         (raw_path[..idx].to_string(), q)
@@ -2027,11 +2038,11 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Query param hardening: urlencode / percent_decode
+    // Query param hardening: urlencode / decode_query_component
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_urlencode_percent_decode_round_trip() {
+    fn test_urlencode_decode_query_component_round_trip() {
         let cases = [
             "972542271337@s.whatsapp.net",
             "120363000@g.us",
@@ -2043,7 +2054,7 @@ mod tests {
         ];
         for s in cases {
             let encoded = urlencode(s);
-            assert_eq!(percent_decode(&encoded), s, "round-trip failed for {s:?}");
+            assert_eq!(decode_query_component(&encoded), s, "round-trip failed for {s:?}");
         }
     }
 
@@ -2056,24 +2067,42 @@ mod tests {
     }
 
     #[test]
-    fn test_percent_decode_raw_string_is_unchanged() {
-        // Backward compat: no '%' escapes means the decode is a no-op.
+    fn test_decode_query_component_raw_string_is_unchanged() {
+        // Backward compat: no '%' escapes and no '+' means the decode is a no-op.
         let raw = "972542271337@s.whatsapp.net";
-        assert_eq!(percent_decode(raw), raw);
+        assert_eq!(decode_query_component(raw), raw);
     }
 
     #[test]
-    fn test_percent_decode_trailing_percent_left_literal() {
+    fn test_decode_query_component_trailing_percent_left_literal() {
         // Incomplete escape at end of string must not panic or truncate.
-        assert_eq!(percent_decode("50%"), "50%");
-        assert_eq!(percent_decode("50%4"), "50%4");
-        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(decode_query_component("50%"), "50%");
+        assert_eq!(decode_query_component("50%4"), "50%4");
+        assert_eq!(decode_query_component("%"), "%");
     }
 
     #[test]
-    fn test_percent_decode_decodes_valid_escapes() {
-        assert_eq!(percent_decode("972%40s.whatsapp.net"), "972@s.whatsapp.net");
-        assert_eq!(percent_decode("foo%26bar%3Dbaz"), "foo&bar=baz");
+    fn test_decode_query_component_decodes_valid_escapes() {
+        assert_eq!(decode_query_component("972%40s.whatsapp.net"), "972@s.whatsapp.net");
+        assert_eq!(decode_query_component("foo%26bar%3Dbaz"), "foo&bar=baz");
+    }
+
+    #[test]
+    fn test_decode_query_component_plus_is_space() {
+        // application/x-www-form-urlencoded: literal '+' in a query component means space.
+        assert_eq!(decode_query_component("you+are+crazy"), "you are crazy");
+    }
+
+    #[test]
+    fn test_decode_query_component_percent_2b_is_literal_plus() {
+        // %2B must decode to a literal '+' and must NOT then be turned into a space.
+        assert_eq!(decode_query_component("C%2B%2B"), "C++");
+        assert_eq!(decode_query_component("a%2Bb+c"), "a+b c");
+    }
+
+    #[test]
+    fn test_decode_query_component_mixed_percent20_and_plus() {
+        assert_eq!(decode_query_component("a%20b+c"), "a b c");
     }
 
     #[tokio::test]
@@ -2092,6 +2121,26 @@ mod tests {
         let req = read_request(&mut server_stream).await.expect("request should parse");
         assert_eq!(req.query_get("q"), Some("foo&bar"));
         assert_eq!(req.query_get("jid"), Some("972@s.whatsapp.net"));
+    }
+
+    #[tokio::test]
+    async fn test_read_request_decodes_plus_as_space_in_query_params() {
+        // Form-encoded clients (curl --data-urlencode, HTML forms, Python's
+        // urllib.parse.urlencode) send spaces as '+' in query strings.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+
+        client
+            .write_all(b"GET /api/search?q=you+are+crazy&limit=5 HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+
+        let req = read_request(&mut server_stream).await.expect("request should parse");
+        assert_eq!(req.query_get("q"), Some("you are crazy"));
+        assert_eq!(req.query_get("limit"), Some("5"));
     }
 
     #[tokio::test]
