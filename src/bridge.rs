@@ -810,6 +810,12 @@ pub struct BridgeConfig {
     pub semantic_min_score: f32,
     /// Maximum vectors to scan per query before falling back to lexical-only (ADR 0041, default: 50000).
     pub semantic_scan_cap: usize,
+    /// Overall budget in seconds for `search`'s query-embed path — covers both waiting for
+    /// the sidecar to finish loading AND waiting for the embed reply (ADR 0042, default: 20).
+    /// Kept below the CLI/MCP client timeouts (30s, `api.rs::cli_get`, `mcp.rs::http_get`/
+    /// `http_post`) so an interactive caller never gives up before `search` itself does; a
+    /// configured value >= 30 logs a startup warning.
+    pub semantic_query_timeout_secs: u64,
 }
 
 impl Default for BridgeConfig {
@@ -848,6 +854,7 @@ impl Default for BridgeConfig {
             embedder_failure_threshold: 10,
             semantic_min_score: 0.55,
             semantic_scan_cap: 50_000,
+            semantic_query_timeout_secs: 20,
         }
     }
 }
@@ -934,6 +941,83 @@ pub struct WhatsAppBridge {
     semantic_min_score: f32,
     /// Maximum vectors to scan per query before falling back to lexical-only (ADR 0041).
     semantic_scan_cap: usize,
+    /// Overall budget for `search`'s query-embed path: health-poll + embed wait (ADR 0042).
+    semantic_query_timeout: Duration,
+    /// Shared cap-hit circuit breaker between `search` and the embedding-drain worker
+    /// (ADR 0042). Also handed to the drain worker's spawn site in `run_bridge`.
+    semantic_cooldown: Arc<crate::embed_drain::SemanticCooldown>,
+}
+
+// ---------------------------------------------------------------------------
+// search()'s query-embed wait — ADR 0042
+// ---------------------------------------------------------------------------
+
+/// Poll interval while waiting for the sidecar to leave `HealthStatus::Loading` (ADR 0042
+/// decision 2).
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Checkpoints (elapsed seconds since the embed wait started) at which a still-pending query
+/// embed logs a warning, so operators can see the sidecar is slow (e.g. swapping) instead of
+/// silently waiting out the whole budget (ADR 0042 decision 2). Only checkpoints that fall
+/// strictly inside the remaining budget actually fire.
+const QUERY_EMBED_CHECKPOINTS_SECS: [u64; 3] = [5, 10, 20];
+
+/// Outcome of [`wait_for_query_embed`].
+enum QueryEmbedOutcome {
+    Ok(Vec<Vec<f32>>),
+    Err(anyhow::Error),
+    /// The whole remaining budget elapsed before the reply arrived.
+    TimedOut,
+}
+
+/// The boxed future returned by `Embedder::embed` (an `#[async_trait]` method) — named here
+/// purely to keep `wait_for_query_embed`'s signature readable.
+type EmbedFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<Vec<f32>>>> + Send + 'a>>;
+
+/// Wait for the query-embed reply, never re-sending it (ADR 0042 decision 2): a re-send would
+/// only queue behind the original request in the sidecar's one-at-a-time stdin loop, so it
+/// cannot come back sooner, and would make the sidecar recompute the same embedding on a
+/// machine that may already be swapping. Logs at escalating checkpoints
+/// (`QUERY_EMBED_CHECKPOINTS_SECS`, clipped to `budget`) while still pending.
+///
+/// Returns [`QueryEmbedOutcome::TimedOut`] if `budget` elapses first. Dropping `embed_future`
+/// at that point is safe: the cancellation-safe `StdioEmbedder` (ADR 0042 item 1) just stops
+/// waiting for that request; any late reply is discarded, and the sidecar itself keeps
+/// answering requests in order.
+async fn wait_for_query_embed(mut embed_future: EmbedFuture<'_>, budget: Duration) -> QueryEmbedOutcome {
+    let start = tokio::time::Instant::now();
+    let deadline = start + budget;
+    let mut next_checkpoint = 0usize;
+
+    loop {
+        let checkpoint_at = QUERY_EMBED_CHECKPOINTS_SECS
+            .get(next_checkpoint)
+            .map(|&secs| start + Duration::from_secs(secs))
+            .filter(|&t| t < deadline);
+        let wake_at = checkpoint_at.unwrap_or(deadline);
+
+        tokio::select! {
+            result = &mut embed_future => {
+                return match result {
+                    Ok(v) => QueryEmbedOutcome::Ok(v),
+                    Err(e) => QueryEmbedOutcome::Err(e),
+                };
+            }
+            _ = tokio::time::sleep_until(wake_at) => {
+                match checkpoint_at {
+                    Some(_) => {
+                        let elapsed = tokio::time::Instant::now().saturating_duration_since(start).as_secs();
+                        tracing::warn!(
+                            "search: query embed still pending after {}s (sidecar slow — likely swapping)",
+                            elapsed
+                        );
+                        next_checkpoint += 1;
+                    }
+                    None => return QueryEmbedOutcome::TimedOut,
+                }
+            }
+        }
+    }
 }
 
 impl WhatsAppBridge {
@@ -959,6 +1043,12 @@ impl WhatsAppBridge {
         let (event_tx, _event_rx) = crate::bridge_events::new_event_bus();
         let embedder_handle: Arc<ParkingMutex<Option<Arc<dyn crate::embedder::Embedder>>>> =
             Arc::new(ParkingMutex::new(None));
+        // ADR 0042: shared cap-hit circuit breaker between search and the drain worker.
+        // Constructed synchronously (unlike the embedder, it needs no async setup), so one
+        // clone can be handed to run_bridge's drain-worker spawn site while another stays
+        // here for search.
+        let semantic_cooldown: Arc<crate::embed_drain::SemanticCooldown> =
+            Arc::new(crate::embed_drain::SemanticCooldown::new());
 
         // Open store early so bridge methods can access it (e.g. poll key storage)
         let store = Store::new(&config.db_path).expect("failed to open database for bridge");
@@ -971,6 +1061,7 @@ impl WhatsAppBridge {
         let db_path = config.db_path.clone();
         let semantic_min_score = config.semantic_min_score;
         let semantic_scan_cap = config.semantic_scan_cap;
+        let semantic_query_timeout = Duration::from_secs(config.semantic_query_timeout_secs);
 
         let cancel_clone = cancel.clone();
         let ch = client_handle.clone();
@@ -986,9 +1077,10 @@ impl WhatsAppBridge {
         let st = store.clone();
         let gc = group_cache.clone();
         let emb_handle = embedder_handle.clone();
+        let sem_cooldown = semantic_cooldown.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, bn, en, et, st, gc, emb_handle).await
+                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, bn, en, et, st, gc, emb_handle, sem_cooldown).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -1017,6 +1109,8 @@ impl WhatsAppBridge {
             db_path,
             semantic_min_score,
             semantic_scan_cap,
+            semantic_query_timeout,
+            semantic_cooldown,
         }
     }
 
@@ -1445,14 +1539,20 @@ impl WhatsAppBridge {
         self.state() == BridgeState::Connected && get_client_handle(&self.client_handle).is_some()
     }
 
-    /// Semantic search with FTS5 fallback (M2.4.3-4). When an embedder is configured+healthy
-    /// AND vectors exist for the active model: (1) embed query, (2) FTS5 recall widened to
-    /// ~200 candidates, (3) fetch vectors, (4) cosine-rerank, (5) truncate to limit.
-    /// Otherwise: byte-identical fallback to the M1.3 lexical FTS5/BM25 path.
+    /// Semantic search with FTS5 fallback (M2.4.3-4, ADR 0042). When an embedder is
+    /// configured+healthy AND vectors exist for the active model: (1) embed query, (2) FTS5
+    /// recall widened to ~200 candidates, (3) fetch vectors, (4) cosine-rerank, (5) truncate
+    /// to limit. Otherwise: byte-identical fallback to the M1.3 lexical FTS5/BM25 path.
     ///
     /// Returns `InboundRow`-shaped results (shape unchanged from M1.3 — only order differs).
     /// Additive-only: candidates without active-model vectors are NOT dropped — they keep their
     /// FTS rank, appended after the cosine-reranked vectorized subset.
+    ///
+    /// ADR 0042: the query-embed path is bounded by one overall budget
+    /// (`semantic_query_timeout`, covering both waiting for the sidecar to finish loading and
+    /// waiting for the embed reply), waits for that SAME in-flight embed request rather than
+    /// re-sending it, and — if the budget runs out — enters a shared cool-down so later
+    /// searches skip the embed entirely until it elapses.
     pub async fn search(
         &self,
         chat_jid: Option<&str>,
@@ -1472,30 +1572,69 @@ impl WhatsAppBridge {
             }
         };
 
-        // Check health (M2.4.4 — unhealthy → fallback).
-        let health = embedder.health().await;
-        if !matches!(health, crate::embedder::HealthStatus::Ok) {
+        // ADR 0042 decision 3: while cooling down from a prior cap-hit, skip health()/embed()
+        // entirely — instant lexical results, no sidecar round trip at all.
+        if self.semantic_cooldown.is_active() {
+            tracing::debug!("search: semantic cool-down active, skipping embed");
             return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
         }
 
-        // Embed the query with a timeout (M2.4.3 step 1, M2.4.4 — query-embed fails → fallback).
-        let query_vec = match tokio::time::timeout(
-            Duration::from_secs(5),
-            embedder.embed(&[query.to_string()])
-        ).await {
-            Ok(Ok(mut vecs)) if !vecs.is_empty() => vecs.remove(0),
-            Ok(Ok(_)) => {
-                // Empty response → fallback.
+        // ADR 0042 decision 2: one overall budget covers BOTH waiting for the sidecar to
+        // finish loading AND waiting for the embed reply.
+        let deadline = tokio::time::Instant::now() + self.semantic_query_timeout;
+
+        // Poll health until Ok or the budget runs out (ADR 0024 "wait, don't fall back yet").
+        // `Error(..)` → fallback immediately, same as before ADR 0042.
+        loop {
+            match embedder.health().await {
+                crate::embedder::HealthStatus::Ok => break,
+                crate::embedder::HealthStatus::Error(detail) => {
+                    tracing::debug!("search: embedder health error ({}), falling back to lexical", detail);
+                    return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
+                }
+                crate::embedder::HealthStatus::Loading => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        // Budget exhausted while still loading — cap-hit (ADR 0042 decision 3).
+                        tracing::debug!("search: embedder still loading after the whole budget, falling back to lexical");
+                        self.semantic_cooldown.on_cap_hit();
+                        return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
+                    }
+                    let remaining = deadline.saturating_duration_since(now);
+                    tokio::time::sleep(std::cmp::min(remaining, HEALTH_POLL_INTERVAL)).await;
+                }
+            }
+        }
+
+        // Embed the query, waiting for the SAME in-flight request with whatever budget is
+        // left — NEVER re-sent (ADR 0042 decision 2): a re-send would just queue behind the
+        // original in the sidecar's one-at-a-time stdin loop and can't come back sooner.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let query_texts = [query.to_string()];
+        let embed_future = embedder.embed(&query_texts);
+        let query_vec = match wait_for_query_embed(embed_future, remaining).await {
+            QueryEmbedOutcome::Ok(mut vecs) if !vecs.is_empty() => {
+                // Budget not exhausted — the sidecar answered. Reset the shared cool-down
+                // (ADR 0042 decision 3): a no-op if it wasn't active.
+                self.semantic_cooldown.reset("search");
+                vecs.remove(0)
+            }
+            QueryEmbedOutcome::Ok(_) => {
+                // Empty response → fallback (not a cap-hit — the sidecar answered in time).
+                self.semantic_cooldown.reset("search");
                 return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
             }
-            Ok(Err(e)) => {
-                // Embed error → fallback.
+            QueryEmbedOutcome::Err(e) => {
+                // Embed error → fallback (not a cap-hit — the sidecar answered in time).
                 tracing::debug!("search: query embed failed ({}), falling back to lexical", e);
                 return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
             }
-            Err(_) => {
-                // Timeout → fallback.
-                tracing::debug!("search: query embed timed out, falling back to lexical");
+            QueryEmbedOutcome::TimedOut => {
+                // Whole budget exhausted waiting for the reply — cap-hit (ADR 0042 decision 3).
+                // Dropping embed_future here is safe: the cancellation-safe StdioEmbedder (ADR
+                // 0042 item 1) just stops waiting; any late reply is discarded.
+                tracing::debug!("search: query embed exhausted the budget, falling back to lexical");
+                self.semantic_cooldown.on_cap_hit();
                 return self.store.search_inbound(chat_jid, Some(query), limit, before_ts).await.map_err(Into::into);
             }
         };
@@ -2342,6 +2481,7 @@ async fn run_bridge(
     store: Store,
     group_cache: GroupCacheHandle,
     embedder_handle: Arc<ParkingMutex<Option<Arc<dyn crate::embedder::Embedder>>>>,
+    semantic_cooldown: Arc<crate::embed_drain::SemanticCooldown>,
 ) -> Result<()> {
     info!("WhatsApp bridge starting");
 
@@ -2564,6 +2704,7 @@ async fn run_bridge(
         let drain_backoff_cap = Duration::from_secs(config.embedder_backoff_cap_secs);
         let drain_loading_timeout = Duration::from_secs(config.embedder_loading_timeout_secs);
         let drain_failure_threshold = config.embedder_failure_threshold;
+        let drain_cooldown = semantic_cooldown.clone();
         tokio::spawn(async move {
             crate::embed_drain::run_embedding_drain_worker(
                 emb,
@@ -2575,6 +2716,7 @@ async fn run_bridge(
                 drain_backoff_cap,
                 drain_loading_timeout,
                 drain_failure_threshold,
+                drain_cooldown,
             )
             .await;
         });
@@ -4818,6 +4960,8 @@ pub(crate) async fn build_test_bridge_with_embedder(
         db_path: db_path.to_path_buf(),
         semantic_min_score: 0.3,
         semantic_scan_cap: 50_000,
+        semantic_query_timeout: Duration::from_secs(20),
+        semantic_cooldown: Arc::new(crate::embed_drain::SemanticCooldown::new()),
     }
 }
 
@@ -5572,6 +5716,8 @@ mod tests {
             db_path: db_path.to_path_buf(),
             semantic_min_score: 0.25,
             semantic_scan_cap: 50_000,
+            semantic_query_timeout: Duration::from_secs(20),
+            semantic_cooldown: Arc::new(crate::embed_drain::SemanticCooldown::new()),
         };
 
         // The critical assertion: active_model_id() returns the configured model ID.
@@ -6243,6 +6389,335 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- ADR 0042: bounded query-embed wait + cool-down tests ---
+    //
+    // All of these use `#[tokio::test(start_paused = true)]` so waits up to the 20s default
+    // budget (and the 30s/60s/120s cool-down windows) cost no real wall-clock time.
+
+    #[tokio::test(start_paused = true)]
+    async fn test_search_semantic_slow_but_within_budget_returns_semantic() {
+        // A query embed slower than usual (12s) but within the 20s default budget still
+        // returns semantic results, and the embed is only ever called once (never re-sent).
+        let dir = std::env::temp_dir().join(format!("test_adr0042_slow_within_budget_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("completely different words"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 3)
+            .with_embed_delay(Duration::from_secs(12));
+        let call_counter = fake.embed_call_counter();
+        let model_id = fake.model_info().model_id.clone();
+
+        // Vector-only hit (no shared keyword with "fruit") so a non-empty result proves the
+        // vector recall path actually ran.
+        store
+            .write_embedding_batch(&["msg1".to_string()], &model_id, 3, &[vec![0.1, 0.1, 0.1]])
+            .await
+            .unwrap();
+
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        let results = bridge.search(None, "fruit", 10, None).await.unwrap();
+
+        assert_eq!(results.len(), 1, "vector-only match should be returned despite the slow embed");
+        assert_eq!(results[0].message_id, "msg1");
+        assert_eq!(call_counter.load(Ordering::SeqCst), 1, "embed must be called exactly once, never re-sent");
+        assert!(!bridge.semantic_cooldown.is_active(), "no cap-hit occurred, no cool-down");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_search_semantic_over_budget_falls_back_and_enters_cooldown() {
+        // A query embed slower than the whole 20s default budget (25s) exhausts it: `search`
+        // falls back to lexical-only AND enters the shared cool-down.
+        let dir = std::env::temp_dir().join(format!("test_adr0042_over_budget_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("hello world"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 3)
+            .with_embed_delay(Duration::from_secs(25));
+        let call_counter = fake.embed_call_counter();
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        let results = bridge.search(None, "world", 10, None).await.unwrap();
+
+        assert_eq!(results.len(), 1, "lexical fallback should still find the keyword match");
+        assert_eq!(results[0].message_id, "msg1");
+        assert_eq!(call_counter.load(Ordering::SeqCst), 1, "embed is attempted exactly once before the cap-hit");
+        assert!(bridge.semantic_cooldown.is_active(), "exhausting the budget must enter the cool-down");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_search_during_cooldown_skips_embed_instantly() {
+        // Once cooling down, a search must skip health()/embed() entirely: instant lexical
+        // results, and the embed call count must NOT increase.
+        let dir = std::env::temp_dir().join(format!("test_adr0042_cooldown_skips_embed_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("hello world"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 3)
+            .with_embed_delay(Duration::from_secs(25));
+        let call_counter = fake.embed_call_counter();
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        // First search exhausts the budget and enters the cool-down.
+        let _ = bridge.search(None, "world", 10, None).await.unwrap();
+        assert!(bridge.semantic_cooldown.is_active());
+        assert_eq!(call_counter.load(Ordering::SeqCst), 1);
+
+        // Second search, while still cooling down, must skip health()/embed() entirely —
+        // proven both by the call count staying flat AND by not paying the budget wait.
+        let before = tokio::time::Instant::now();
+        let results = bridge.search(None, "world", 10, None).await.unwrap();
+        let elapsed = tokio::time::Instant::now().saturating_duration_since(before);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message_id, "msg1");
+        assert_eq!(call_counter.load(Ordering::SeqCst), 1, "embed must not be called again while cooling down");
+        assert!(elapsed < Duration::from_secs(1), "cool-down search should not pay the budget wait, took {:?}", elapsed);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_search_cooldown_window_elapses_then_retries_and_doubles() {
+        // After the window elapses, semantic is attempted again. Consecutive cap-hits double
+        // the window (30s → 60s → 120s → ...).
+        let dir = std::env::temp_dir().join(format!("test_adr0042_cooldown_doubles_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("hello world"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        // Every embed is far slower than the 20s budget, so every attempt is a cap-hit.
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 3)
+            .with_embed_delay(Duration::from_secs(100));
+        let call_counter = fake.embed_call_counter();
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        // 1st cap-hit: window=30s (SEMANTIC_COOLDOWN_INITIAL) applied; next_window becomes 60s.
+        bridge.search(None, "world", 10, None).await.unwrap();
+        assert_eq!(call_counter.load(Ordering::SeqCst), 1);
+        assert_eq!(bridge.semantic_cooldown.peek_next_window(), Duration::from_secs(60));
+
+        // Let the 30s window elapse — semantic is attempted again.
+        tokio::time::advance(crate::embed_drain::SEMANTIC_COOLDOWN_INITIAL + Duration::from_secs(1)).await;
+        assert!(!bridge.semantic_cooldown.is_active());
+
+        // 2nd cap-hit: window=60s applied; next_window becomes 120s.
+        bridge.search(None, "world", 10, None).await.unwrap();
+        assert_eq!(call_counter.load(Ordering::SeqCst), 2, "embed is re-attempted once the window elapsed");
+        assert_eq!(bridge.semantic_cooldown.peek_next_window(), Duration::from_secs(120));
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(!bridge.semantic_cooldown.is_active());
+
+        // 3rd cap-hit: window=120s applied; next_window becomes 240s.
+        bridge.search(None, "world", 10, None).await.unwrap();
+        assert_eq!(bridge.semantic_cooldown.peek_next_window(), Duration::from_secs(240));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_search_health_loading_then_ok_within_budget_returns_semantic() {
+        // `health() == Loading` for 8s (within the 20s budget), then `Ok` → search waits it
+        // out and still returns semantic results.
+        let dir = std::env::temp_dir().join(format!("test_adr0042_loading_then_ok_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("completely different words"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 3)
+            .with_health_loading_for(Duration::from_secs(8));
+        let call_counter = fake.embed_call_counter();
+        let model_id = fake.model_info().model_id.clone();
+
+        store
+            .write_embedding_batch(&["msg1".to_string()], &model_id, 3, &[vec![0.1, 0.1, 0.1]])
+            .await
+            .unwrap();
+
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        let results = bridge.search(None, "fruit", 10, None).await.unwrap();
+
+        assert_eq!(results.len(), 1, "semantic should kick in once loading finishes within budget");
+        assert_eq!(results[0].message_id, "msg1");
+        assert_eq!(call_counter.load(Ordering::SeqCst), 1);
+        assert!(!bridge.semantic_cooldown.is_active(), "no cap-hit occurred, no cool-down");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_search_health_loading_beyond_budget_falls_back_and_enters_cooldown() {
+        // `health() == Loading` for 30s — longer than the 20s budget — never reaches the
+        // embed call at all: lexical fallback + cool-down, embed count stays at 0.
+        let dir = std::env::temp_dir().join(format!("test_adr0042_loading_beyond_budget_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("hello world"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 3)
+            .with_health_loading_for(Duration::from_secs(30));
+        let call_counter = fake.embed_call_counter();
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        let results = bridge.search(None, "world", 10, None).await.unwrap();
+
+        assert_eq!(results.len(), 1, "lexical fallback should still find the keyword match");
+        assert_eq!(results[0].message_id, "msg1");
+        assert_eq!(call_counter.load(Ordering::SeqCst), 0, "embed is never called while still loading");
+        assert!(bridge.semantic_cooldown.is_active(), "a cap-hit while loading must still enter the cool-down");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_search_successful_embed_resets_cooldown() {
+        // A successful embed from `search` itself resets the shared cool-down — even one left
+        // active (with a doubled window) by an earlier cap-hit, once that window has elapsed
+        // and `search` tries again.
+        let dir = std::env::temp_dir().join(format!("test_adr0042_reset_via_search_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let store = Store::new(&db_path).expect("test DB");
+
+        store
+            .insert_message(
+                "chat@s.whatsapp.net",
+                "sender@s.whatsapp.net",
+                "msg1",
+                "text",
+                Some("hello world"),
+                1000,
+                false,
+                "test",
+                "pending",
+            )
+            .await
+            .unwrap();
+
+        // Fast embedder (no delay) — only the shared cool-down's PRIOR state (manufactured
+        // below, as if an earlier slow search had already tripped it) is under test here.
+        let fake = crate::embedder::FakeEmbedder::new("test-model", 3);
+        let bridge = build_test_bridge_with_embedder(&db_path, fake).await;
+
+        bridge.semantic_cooldown.on_cap_hit(); // window=30s applied; next_window becomes 60s
+        assert_ne!(bridge.semantic_cooldown.peek_next_window(), crate::embed_drain::SEMANTIC_COOLDOWN_INITIAL);
+
+        // Let the 30s window elapse so `search` will try the embed again.
+        tokio::time::advance(crate::embed_drain::SEMANTIC_COOLDOWN_INITIAL + Duration::from_secs(1)).await;
+        assert!(!bridge.semantic_cooldown.is_active());
+
+        let results = bridge.search(None, "world", 10, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+
+        assert!(!bridge.semantic_cooldown.is_active());
+        assert_eq!(
+            bridge.semantic_cooldown.peek_next_window(),
+            crate::embed_drain::SEMANTIC_COOLDOWN_INITIAL,
+            "a successful embed from search must reset the doubling window back to baseline"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // Helper to build a bridge with no embedder.
     async fn build_test_bridge_without_embedder(db_path: &std::path::Path) -> WhatsAppBridge {
         use crate::storage::Store;
@@ -6292,6 +6767,8 @@ mod tests {
             db_path: db_path.to_path_buf(),
             semantic_min_score: 0.25,
             semantic_scan_cap: 50_000,
+            semantic_query_timeout: Duration::from_secs(20),
+            semantic_cooldown: Arc::new(crate::embed_drain::SemanticCooldown::new()),
         }
     }
 }

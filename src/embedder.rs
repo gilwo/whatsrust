@@ -655,6 +655,10 @@ impl Embedder for StdioEmbedder {
 ///   - `always_fail` — all `embed()` calls return `Err` (transport failure)
 ///   - `reject_text` — reject a specific text content (per-row rejection)
 ///   - `health_override` — override the health status (e.g. `Loading`)
+///   - `with_health_loading_for` — report `Loading` for a fixed duration from construction,
+///     then `Ok` (ADR 0042: simulates the sidecar finishing warm-up within/beyond a budget)
+///   - `with_embed_delay` — sleep before returning from `embed()` (ADR 0042: simulates a slow
+///     sidecar, e.g. paging weights back in after being swapped out)
 ///   - `max_batch` / `max_input_tokens` — advertise limits to test clamping
 pub struct FakeEmbedder {
     model_id: String,
@@ -664,6 +668,16 @@ pub struct FakeEmbedder {
     always_fail: bool,
     reject_text: Option<String>,
     health_override: Option<HealthStatus>,
+    /// `Loading` until this much time has passed since construction, then `Ok` (ADR 0042).
+    /// Measured via `tokio::time::Instant`, so `#[tokio::test(start_paused = true)]` can
+    /// simulate long waits without real delay. Takes precedence over `health_override`.
+    health_loading_for: Option<Duration>,
+    constructed_at: tokio::time::Instant,
+    /// Sleep this long before returning from `embed()` (ADR 0042: simulate a slow sidecar).
+    embed_delay: Option<Duration>,
+    /// Number of `embed()` calls made so far, exposed via `embed_call_counter()` so a test
+    /// can hold a handle to it after the `FakeEmbedder` itself has been moved into a bridge.
+    embed_calls: Arc<AtomicU64>,
 }
 
 impl FakeEmbedder {
@@ -676,6 +690,10 @@ impl FakeEmbedder {
             always_fail: false,
             reject_text: None,
             health_override: None,
+            health_loading_for: None,
+            constructed_at: tokio::time::Instant::now(),
+            embed_delay: None,
+            embed_calls: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -708,6 +726,28 @@ impl FakeEmbedder {
         self.health_override = Some(status);
         self
     }
+
+    /// Report `Loading` for `duration` since construction, then `Ok` (ADR 0042). Lets a test
+    /// simulate the sidecar finishing warm-up either within or beyond the search budget,
+    /// without any real delay under `#[tokio::test(start_paused = true)]`.
+    pub fn with_health_loading_for(mut self, duration: Duration) -> Self {
+        self.health_loading_for = Some(duration);
+        self
+    }
+
+    /// Sleep `delay` before returning from `embed()` (ADR 0042: simulate a slow sidecar, e.g.
+    /// one that has to page bge-m3's weights back in).
+    pub fn with_embed_delay(mut self, delay: Duration) -> Self {
+        self.embed_delay = Some(delay);
+        self
+    }
+
+    /// A shared handle to the `embed()` call counter. Grab this BEFORE the `FakeEmbedder` is
+    /// moved into a bridge/`Arc<dyn Embedder>`, so the test can still inspect it afterwards —
+    /// e.g. to assert a slow/pending embed was never re-sent (ADR 0042 decision 2).
+    pub fn embed_call_counter(&self) -> Arc<AtomicU64> {
+        self.embed_calls.clone()
+    }
 }
 
 #[async_trait]
@@ -722,6 +762,10 @@ impl Embedder for FakeEmbedder {
     }
 
     async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.embed_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(delay) = self.embed_delay {
+            tokio::time::sleep(delay).await;
+        }
         if self.always_fail {
             anyhow::bail!("fake embedder: always_fail mode");
         }
@@ -738,6 +782,12 @@ impl Embedder for FakeEmbedder {
     }
 
     async fn health(&self) -> HealthStatus {
+        if let Some(loading_for) = self.health_loading_for {
+            if tokio::time::Instant::now().saturating_duration_since(self.constructed_at) < loading_for {
+                return HealthStatus::Loading;
+            }
+            return HealthStatus::Ok;
+        }
         self.health_override.clone().unwrap_or(HealthStatus::Ok)
     }
 }

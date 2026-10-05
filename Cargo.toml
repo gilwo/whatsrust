@@ -65,6 +65,13 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9e8c70e2fc
 whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9e8c70e2fcadc8f52246c8336243504fea89edf6" }
 whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9e8c70e2fcadc8f52246c8336243504fea89edf6" }
 
+# Cargo unifies features across [dependencies]/[dev-dependencies] when building test
+# targets, so this adds "test-util" (needed for `#[tokio::test(start_paused = true)]`,
+# ADR 0042) to the SAME tokio crate used above, without affecting release builds (dev-
+# dependency features are compiled in for tests/benches/examples only).
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 opt-level = "z"
 lto = true

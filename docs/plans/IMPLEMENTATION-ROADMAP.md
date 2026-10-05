@@ -115,7 +115,7 @@ against a *trusted* sidecar or rare inputs. Fix opportunistically or during a la
   ~read_line_bounded). A runaway/buggy sidecar could OOM before the cap fires. Read in chunks and
   check accumulated size before each chunk (true hard bound). Reviewer "M6".
 - [ ] **(Med, defense-in-depth) Timeout on `fetch_embeddings_for_candidates`** in
-  `WhatsAppBridge::search` (`src/bridge.rs:1487`): query-embed has a 5s timeout, the candidate
+  `WhatsAppBridge::search` (`src/bridge.rs:1487`): query-embed has a bounded wait (20s budget + cool-down, ADR 0042), the candidate
   vector fetch does not. NOTE: this is a property of the whole single-`Mutex<Connection>` storage
   layer (the M1 lexical fallback `search_inbound` has no timeout either), **not an M2 regression** —
   if fixed, apply consistently, not just to the semantic path. Reviewer "H2".
@@ -138,6 +138,8 @@ against a *trusted* sidecar or rare inputs. Fix opportunistically or during a la
   `File::create`/`io::copy` steps have no cleanup-on-error path before the `rename`. Harmless (a
   stray file in the HF cache that a retry won't collide with, since the pid differs) but worth a
   `defer`-style cleanup opportunistically.
+- [ ] **(Med) Sidecar auto-respawn** — if the sidecar process dies, whatsrust doesn't restart it;
+  semantic stays off until daemon restart (follow-up).
 
 *Double-checked and DISMISSED (do not re-investigate):*
 - **H1 "missing partial-coverage additive test" — FALSE.** `test_search_partial_coverage_keeps_unvectored`
