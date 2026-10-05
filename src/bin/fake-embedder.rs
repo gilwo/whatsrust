@@ -13,6 +13,14 @@
 //! - "wrong_dim": vectors with incorrect dimension (7 instead of 8)
 //! - "wrong_count": vector count mismatched with input count (always 1 vector)
 //! - "wrong_model_id": model_id in embed response differs from model_info
+//!
+//! Delay mode (cancellation-safety regression tests): set
+//! `FAKE_EMBEDDER_DELAY_FIRST_MS=<ms>` to sleep for that long before writing the
+//! reply to the FIRST `embed` request only (every later `embed` — and every other
+//! method — replies immediately). This reproduces the real-world "query embed
+//! takes >timeout, caller cancels, reply arrives late" scenario against a real
+//! child process so `StdioEmbedder` can be tested for cancellation-safety without
+//! a flaky/slow ML model.
 
 use std::io::{BufRead, Write};
 
@@ -37,11 +45,23 @@ fn parse_misbehavior() -> MisbehaviorMode {
     }
 }
 
+/// Delay (in ms) to apply to the first `embed` reply only, from
+/// `FAKE_EMBEDDER_DELAY_FIRST_MS`. `None` (the default) means no delay — off by
+/// default so every other test is unaffected.
+fn parse_delay_first_ms() -> Option<u64> {
+    std::env::var("FAKE_EMBEDDER_DELAY_FIRST_MS")
+        .ok()?
+        .parse()
+        .ok()
+}
+
 fn main() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let misbehavior = parse_misbehavior();
+    let delay_first_ms = parse_delay_first_ms();
+    let mut embed_calls = 0u64;
 
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -61,6 +81,13 @@ fn main() {
         let result = match method {
             "model_info" => json!({"model_id": MODEL_ID, "dim": DIM, "max_batch": 32, "max_input_tokens": 256}),
             "embed" => {
+                embed_calls += 1;
+                if embed_calls == 1 {
+                    if let Some(ms) = delay_first_ms {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
+                }
+
                 let texts = req
                     .get("params")
                     .and_then(|p| p.get("texts"))

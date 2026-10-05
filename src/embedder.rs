@@ -16,7 +16,10 @@
 //!
 //! No drain worker, no DB/schema changes, no bridge wiring here — that is M2.2+.
 
+use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -25,7 +28,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
 // ModelInfo / HealthStatus — transport-neutral domain types (ADR 0024)
@@ -189,60 +193,220 @@ const DEFAULT_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// hanging/misbehaving sidecar can never block bridge startup (2.1.4).
 const MODEL_INFO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Mutable transport state, serialized behind `StdioEmbedder::inner`'s async
-/// mutex so `embed`/`model_info`/`health` calls from concurrent callers (the
-/// future drain worker + live search, M2.3/M2.4) can never interleave/corrupt
-/// the single stdin/stdout framing (2.1.9). A concurrent call simply queues
-/// behind an in-flight one — the chosen v1 policy (no preemption).
-struct StdioEmbedderInner {
-    /// Kept alive so `kill_on_drop(true)` (set at spawn) reaps the child when
-    /// `StdioEmbedder` (and thus this struct) is dropped. Only read directly by
-    /// the `fake-embedder`-gated drop-safety test (`.id()`); otherwise it's held
-    /// purely for its Drop side effect, hence the lint allow.
-    #[allow(dead_code)]
-    child: Child,
-    stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
-    next_id: u64,
+/// Capacity of the writer task's request channel. Generous enough that bursts
+/// of concurrent callers (drain worker + live search, M2.3/M2.4) never block on
+/// enqueueing a request; the real backpressure is the oneshot each caller awaits.
+const WRITER_CHANNEL_CAPACITY: usize = 64;
+
+/// One in-flight request's completion channel, keyed by JSON-RPC id in
+/// `PendingState::pending`. `method` is kept alongside the sender purely so a
+/// stale/unroutable or error response can still log/report which RPC it was for.
+struct PendingEntry {
+    method: &'static str,
+    tx: oneshot::Sender<anyhow::Result<Value>>,
 }
 
-impl StdioEmbedderInner {
-    /// Write one JSON-RPC request and read back its response, end to end. Callers
-    /// hold the `StdioEmbedder::inner` mutex for the duration, which is what
-    /// serializes concurrent `Embedder` calls onto the one stdin/stdout pair.
-    async fn call_rpc(
-        &mut self,
-        method: &'static str,
-        params: Option<Value>,
-        max_line_bytes: usize,
-    ) -> anyhow::Result<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
+/// Requests awaiting a reply, plus a sticky "transport is dead" reason once the
+/// writer or reader task has observed a fatal I/O failure (EOF, read error,
+/// write error). `dead` and `pending` share one lock so registering a new
+/// request and declaring the transport dead can never race: either the
+/// registration happens first (and is then drained/failed by `mark_dead`), or
+/// `mark_dead` happens first (and the registration sees `dead` and fails fast)
+/// — there is no window where a request is registered after the drain and is
+/// never resolved.
+struct PendingState {
+    pending: HashMap<u64, PendingEntry>,
+    dead: Option<String>,
+}
 
-        let req = SidecarRequest { jsonrpc: "2.0", id, method, params };
-        let mut line = serde_json::to_string(&req).context("serializing sidecar request")?;
-        line.push('\n');
-        self.stdin
-            .write_all(line.as_bytes())
-            .await
-            .with_context(|| format!("writing {method} request to sidecar stdin"))?;
-        self.stdin.flush().await.context("flushing sidecar stdin")?;
+/// Shared between `call_rpc` (registers/unregisters pending requests) and the
+/// reader/writer background tasks (dispatch replies, declare the transport
+/// dead). Cheap, synchronous, non-blocking critical sections only — a
+/// `std::sync::Mutex` is intentionally used instead of an async one (ADR 0024
+/// cancellation-safety rework): no `.await` is ever held across this lock.
+struct SharedState {
+    state: StdMutex<PendingState>,
+}
 
-        let raw_line = read_line_bounded(&mut self.reader, max_line_bytes).await?;
-        let resp: SidecarResponse = serde_json::from_str(&raw_line)
-            .with_context(|| format!("parsing sidecar response to {method}: {raw_line:?}"))?;
+impl SharedState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { state: StdMutex::new(PendingState { pending: HashMap::new(), dead: None }) })
+    }
 
-        if !resp.id.is_null() && resp.id != id {
-            anyhow::bail!(
-                "sidecar response id mismatch for {method}: expected {id}, got {:?}",
-                resp.id
-            );
+    /// Register a pending request BEFORE it is sent, so a reply that wins the
+    /// race against the caller's own registration can never be dispatched to a
+    /// missing waiter. Fails fast if the transport is already known dead.
+    fn register(&self, id: u64, method: &'static str, tx: oneshot::Sender<anyhow::Result<Value>>) -> anyhow::Result<()> {
+        let mut guard = self.state.lock().expect("StdioEmbedder pending-state mutex poisoned");
+        if let Some(reason) = &guard.dead {
+            anyhow::bail!("sidecar exited: {reason}");
         }
-        if let Some(err) = resp.error {
-            anyhow::bail!("sidecar returned an error for {method}: {err}");
+        guard.pending.insert(id, PendingEntry { method, tx });
+        Ok(())
+    }
+
+    /// Remove and return the pending entry for `id`, if any. Called by the
+    /// reader task when a reply arrives (dispatch), and by `PendingGuard`'s
+    /// `Drop` when a caller is cancelled before its reply arrives (cleanup —
+    /// no leak, and the eventual late reply is then unroutable and discarded).
+    fn remove(&self, id: u64) -> Option<PendingEntry> {
+        self.state.lock().expect("StdioEmbedder pending-state mutex poisoned").pending.remove(&id)
+    }
+
+    /// Declare the transport dead (idempotent — only the first call has any
+    /// effect) and fail every currently-pending request with a transport error
+    /// so no caller can ever hang waiting on a reply that will never come.
+    /// Called by the reader task on EOF/read error and by the writer task on a
+    /// write error or channel closure.
+    fn mark_dead(&self, reason: String) {
+        let pending = {
+            let mut guard = self.state.lock().expect("StdioEmbedder pending-state mutex poisoned");
+            if guard.dead.is_some() {
+                return;
+            }
+            guard.dead = Some(reason.clone());
+            std::mem::take(&mut guard.pending)
+        };
+        for (_, entry) in pending {
+            let _ = entry.tx.send(Err(anyhow::anyhow!("sidecar exited: {reason}")));
         }
-        resp.result
-            .ok_or_else(|| anyhow::anyhow!("sidecar response for {method} had neither result nor error"))
+    }
+}
+
+/// Drop guard that removes a call's pending entry if the call is cancelled
+/// (e.g. the caller's `tokio::time::timeout` fires) before a reply arrives —
+/// this is the fix for the cancellation-safety bug (ADR 0024 rework): without
+/// it, a cancelled call's id stays registered forever, and when its late reply
+/// finally arrives there is nothing to notice it's stale. With it, cancellation
+/// deregisters immediately, so the late reply is simply an unknown id to the
+/// reader task and is discarded (`debug!`) instead of corrupting a later call.
+struct PendingGuard<'a> {
+    shared: &'a SharedState,
+    id: u64,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        // No-op if the reader task already removed it (normal completion) —
+        // only matters for the cancelled-before-reply case.
+        self.shared.remove(self.id);
+    }
+}
+
+/// Write one JSON-RPC request and await its reply via the writer task + reader
+/// task described above. Cancellation-safe at every await point (ADR 0024
+/// rework): the pending entry is registered before anything is sent, so a
+/// cancelled caller (its future dropped mid-await) is cleaned up by
+/// `PendingGuard` rather than leaving stale state for the next call to trip
+/// over. Multiple callers may have requests in flight at once — the sidecar is
+/// expected to process/reply to them in order, but routing here is by id, not
+/// position, so out-of-order replies would still be routed correctly.
+async fn call_rpc(
+    next_id: &AtomicU64,
+    shared: &Arc<SharedState>,
+    writer_tx: &mpsc::Sender<String>,
+    method: &'static str,
+    params: Option<Value>,
+) -> anyhow::Result<Value> {
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+
+    let (tx, rx) = oneshot::channel();
+    shared.register(id, method, tx)?;
+    let _guard = PendingGuard { shared, id };
+
+    let req = SidecarRequest { jsonrpc: "2.0", id, method, params };
+    let mut line = serde_json::to_string(&req).context("serializing sidecar request")?;
+    line.push('\n');
+    writer_tx
+        .send(line)
+        .await
+        .map_err(|_| anyhow::anyhow!("sidecar exited: writer task is no longer running"))?;
+
+    match rx.await {
+        Ok(result) => result,
+        // The reader task dropped our sender without replying — only happens via
+        // `mark_dead` draining it on transport failure, which already encodes a
+        // "sidecar exited" message, but a bare oneshot cancellation (shouldn't
+        // normally happen) still needs a message of its own.
+        Err(_) => Err(anyhow::anyhow!("sidecar exited: reply channel closed without a response")),
+    }
+}
+
+/// Background task owning the child's stdin: serializes writes from concurrent
+/// callers (via the mpsc channel) onto the one pipe. A write/flush failure (or
+/// the channel closing because every `StdioEmbedder` clone was dropped) marks
+/// the transport dead so any requests already in flight fail fast instead of
+/// hanging.
+async fn run_writer_task(mut stdin: ChildStdin, mut rx: mpsc::Receiver<String>, shared: Arc<SharedState>) {
+    while let Some(line) = rx.recv().await {
+        if let Err(e) = async {
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.flush().await
+        }
+        .await
+        {
+            shared.mark_dead(format!("writing to sidecar stdin failed: {e}"));
+            return;
+        }
+    }
+    // Channel closed with no write error: either `StdioEmbedder` was dropped
+    // (expected, harmless — nothing is waiting) or something else stopped
+    // sending. Either way, mark dead so no caller added after this point hangs.
+    shared.mark_dead("sidecar writer task exited (request channel closed)".to_string());
+}
+
+/// Background task owning the child's stdout: reads replies continuously and
+/// dispatches each to its waiting caller by JSON-RPC id. Runs independently of
+/// callers so a reply can be read (and, for the right id, delivered) regardless
+/// of whether some OTHER caller has already timed out and moved on.
+async fn run_reader_task(mut reader: BufReader<ChildStdout>, max_line_bytes: usize, shared: Arc<SharedState>) {
+    loop {
+        let raw_line = match read_line_bounded(&mut reader, max_line_bytes).await {
+            Ok(line) => line,
+            Err(e) => {
+                shared.mark_dead(format!("reading sidecar stdout failed: {e}"));
+                return;
+            }
+        };
+
+        let resp: SidecarResponse = match serde_json::from_str(&raw_line) {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!(error = %e, line = %raw_line, "sidecar: malformed response line, dropping");
+                continue;
+            }
+        };
+
+        let id = match resp.id.as_u64() {
+            Some(id) => id,
+            None => {
+                // Null id (e.g. the sidecar's own parse-error response) or a
+                // non-numeric id can't be routed to any waiter at all.
+                warn!(id = ?resp.id, "sidecar: response id is null/non-numeric, cannot route, dropping");
+                continue;
+            }
+        };
+
+        let entry = match shared.remove(id) {
+            Some(entry) => entry,
+            None => {
+                // Unknown/stale id: the caller that owned it already cancelled
+                // (timed out) and `PendingGuard` deregistered it. This is the
+                // cancellation-safety fix in action — the late reply is simply
+                // discarded instead of being misread by whatever call comes next.
+                debug!(id, "sidecar: discarding response for unknown/stale id (caller likely timed out)");
+                continue;
+            }
+        };
+
+        let method = entry.method;
+        let result = if let Some(err) = resp.error {
+            Err(anyhow::anyhow!("sidecar returned an error for {method}: {err}"))
+        } else {
+            resp.result
+                .ok_or_else(|| anyhow::anyhow!("sidecar response for {method} had neither result nor error"))
+        };
+        let _ = entry.tx.send(result);
     }
 }
 
@@ -281,13 +445,31 @@ fn parse_args(raw: &str) -> Vec<String> {
 }
 
 /// Real `Embedder` transport: spawns a child process and speaks newline-
-/// delimited JSON-RPC 2.0 over its stdin/stdout (ADR 0006/0024).
+/// delimited JSON-RPC 2.0 over its stdin/stdout (ADR 0006/0024). Internally,
+/// a writer task and a reader task (both spawned at construction, see
+/// `spawn_with`) own the child's stdin/stdout respectively; `call_rpc` talks to
+/// them via a channel + a per-request oneshot rather than holding the pipes
+/// directly, which is what makes a cancelled caller (e.g. a `tokio::time::
+/// timeout`) safe: dropping its future can never leave a half-written request
+/// or an unread reply on the wire (ADR 0024 cancellation-safety rework).
 pub struct StdioEmbedder {
-    inner: AsyncMutex<StdioEmbedderInner>,
+    /// Kept alive so `kill_on_drop(true)` (set at spawn) reaps the child when
+    /// `StdioEmbedder` is dropped. Only read directly by the
+    /// `fake-embedder`-gated tests (`.id()`); otherwise it's held purely for
+    /// its Drop side effect, hence the lint allow.
+    #[allow(dead_code)]
+    child: Child,
+    /// Hands a serialized request line to the writer task. Dropping every
+    /// clone of this (i.e. dropping `StdioEmbedder`) closes the channel, which
+    /// is the writer task's signal to exit.
+    writer_tx: mpsc::Sender<String>,
+    /// Pending-request map shared with the reader/writer tasks (registration,
+    /// dispatch, dead-transport bookkeeping).
+    shared: Arc<SharedState>,
+    next_id: AtomicU64,
     /// Cached at construction (2.1.4) — `model_info()` is a plain, infallible
     /// accessor with no I/O.
     cached_model_info: ModelInfo,
-    max_line_bytes: usize,
 }
 
 impl StdioEmbedder {
@@ -346,11 +528,15 @@ impl StdioEmbedder {
         let stdout = child.stdout.take().context("sidecar child has no stdout pipe")?;
         let reader = BufReader::new(stdout);
 
-        let mut inner = StdioEmbedderInner { child, stdin, reader, next_id: 1 };
+        let shared = SharedState::new();
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(WRITER_CHANNEL_CAPACITY);
+        tokio::spawn(run_writer_task(stdin, writer_rx, shared.clone()));
+        tokio::spawn(run_reader_task(reader, max_line_bytes, shared.clone()));
 
+        let next_id = AtomicU64::new(1);
         let model_info_value = tokio::time::timeout(
             model_info_timeout,
-            inner.call_rpc("model_info", None, max_line_bytes),
+            call_rpc(&next_id, &shared, &writer_tx, "model_info", None),
         )
         .await
         .context("timed out waiting for sidecar model_info at construction")??;
@@ -359,20 +545,21 @@ impl StdioEmbedder {
             .context("parsing model_info response at construction")?;
 
         Ok(Self {
-            inner: AsyncMutex::new(inner),
+            child,
+            writer_tx,
+            shared,
+            next_id,
             cached_model_info: ModelInfo {
                 model_id: wire.model_id,
                 dim: wire.dim,
                 max_batch: wire.max_batch,
                 max_input_tokens: wire.max_input_tokens,
             },
-            max_line_bytes,
         })
     }
 
     async fn call_rpc(&self, method: &'static str, params: Option<Value>) -> anyhow::Result<Value> {
-        let mut inner = self.inner.lock().await;
-        inner.call_rpc(method, params, self.max_line_bytes).await
+        call_rpc(&self.next_id, &self.shared, &self.writer_tx, method, params).await
     }
 
     /// Trust-but-verify (ADR 0024): `model_id`/`dim` must match the cached
@@ -836,9 +1023,11 @@ mod tests {
         let texts2 = vec!["bb".to_string(), "cc".to_string()];
 
         // Fire three concurrent calls (two embeds + a health check) at the SAME
-        // child over the SAME stdin/stdout pipe. If serialization (2.1.9) were
-        // broken, responses would interleave and either fail to parse or return
-        // vectors from the wrong request.
+        // child over the SAME stdin/stdout pipe. Requests may now genuinely be
+        // in flight at once (ADR 0024 cancellation-safety rework — no more
+        // single-mutex serialization); correctness instead relies on id-based
+        // routing in the reader task. If that routing were broken, responses
+        // would be delivered to the wrong caller or fail to parse.
         let (r1, r2, r3) = tokio::join!(
             e1.embed(&texts1),
             e2.embed(&texts2),
@@ -855,13 +1044,159 @@ mod tests {
         assert_eq!(r3, HealthStatus::Ok);
     }
 
+    // --- FLIP-CHECK: cancellation-safety regression test ---
+    //
+    // Reproduces the live-daemon bug: a caller's `tokio::time::timeout` fires
+    // after the request was written but before the reply was read, so the
+    // in-flight reply is left stale in the pipe. On the buggy client this
+    // poisons every subsequent call (one-reply-behind, permanent id mismatch /
+    // wrong-sized response). On the fixed client, cancellation deregisters the
+    // call so the late reply is just discarded, and later calls get their own
+    // reply.
+    //
+    // Confirmed to fail on the pre-fix client with exactly the predicted
+    // symptom (`sidecar response id mismatch for embed: expected 3, got 2`)
+    // before this fix was implemented.
+    #[cfg(feature = "fake-embedder")]
+    #[tokio::test]
+    async fn test_stdio_embedder_cancelled_call_does_not_poison_later_calls() {
+        let bin = fake_embedder_bin_path();
+        let embedder = StdioEmbedder::spawn_with_env(
+            bin.to_str().unwrap(),
+            &[],
+            &[("FAKE_EMBEDDER_DELAY_FIRST_MS", "1500")],
+        )
+        .await
+        .expect("spawn fake-embedder with delay-first");
+
+        // First embed call: 3 texts, the sidecar will sit on this reply for
+        // ~1.5s (delay-first). A 300ms timeout fires well before that, so the
+        // caller's future (and its pending registration) is dropped while the
+        // reply is still in flight.
+        let three_texts = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        let timed_out =
+            tokio::time::timeout(Duration::from_millis(300), embedder.embed(&three_texts)).await;
+        assert!(
+            timed_out.is_err(),
+            "the 3-text embed call must time out while the sidecar is still delaying its reply"
+        );
+
+        // Second call: a single text, no timeout. The stale 3-vector reply for
+        // the first call is still unread in the pipe at this point. A correct,
+        // cancellation-safe client must not confuse that stale reply for this
+        // call's own reply — it must wait for (and correctly route) ITS OWN
+        // reply, giving back exactly 1 vector.
+        let one_text = vec!["solo".to_string()];
+        let result = embedder.embed(&one_text).await;
+        let vectors = result.expect(
+            "embed with 1 text must succeed with its own reply, not the stale 3-vector reply \
+             left behind by the cancelled call",
+        );
+        assert_eq!(
+            vectors.len(),
+            1,
+            "must get exactly 1 vector (its own reply), not 3 (the stale reply)"
+        );
+        assert_eq!(vectors[0].len(), embedder.model_info().dim);
+
+        // health() must also still work — a buggy client leaves EVERY call one
+        // reply behind forever, so this would fail too if the bug were present.
+        let health = embedder.health().await;
+        assert_eq!(health, HealthStatus::Ok, "health() must succeed after the cancelled call");
+    }
+
+    /// Two genuinely concurrent `embed` calls (fired together via
+    /// `tokio::join!`, no artificial delay), distinguished by batch size, each
+    /// get their OWN reply — never swapped. Both requests can be in flight on
+    /// the wire at once now (ADR 0024 rework); correctness relies on the
+    /// reader task routing each reply by JSON-RPC id rather than by position.
+    #[cfg(feature = "fake-embedder")]
+    #[tokio::test]
+    async fn test_stdio_embedder_concurrent_calls_each_get_own_reply() {
+        let bin = fake_embedder_bin_path();
+        let embedder = std::sync::Arc::new(
+            StdioEmbedder::spawn(bin.to_str().unwrap(), &[]).await.expect("spawn fake-embedder"),
+        );
+
+        let e_a = embedder.clone();
+        let e_b = embedder.clone();
+        // Distinguish the two batches by size (4 vs 1) so a swapped/misrouted
+        // reply would be caught by a length mismatch, not just a value check.
+        let texts_a = vec!["a1".to_string(), "a2".to_string(), "a3".to_string(), "a4".to_string()];
+        let texts_b = vec!["b1".to_string()];
+
+        let (result_a, result_b) = tokio::join!(e_a.embed(&texts_a), e_b.embed(&texts_b));
+
+        let vec_a = result_a.expect("embed A should succeed");
+        let vec_b = result_b.expect("embed B should succeed");
+        assert_eq!(vec_a.len(), 4, "batch A (4 texts) must get its own 4-vector reply, not B's");
+        assert_eq!(vec_b.len(), 1, "batch B (1 text) must get its own 1-vector reply, not A's");
+    }
+
+    /// When the child exits (EOF on stdout), both an already-in-flight request
+    /// and any subsequent request must fail fast with a transport error —
+    /// never hang waiting for a reply that will never arrive.
+    #[cfg(feature = "fake-embedder")]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stdio_embedder_eof_fails_pending_and_subsequent_calls_fast() {
+        let bin = fake_embedder_bin_path();
+        let embedder = std::sync::Arc::new(
+            StdioEmbedder::spawn_with_env(
+                bin.to_str().unwrap(),
+                &[],
+                &[("FAKE_EMBEDDER_DELAY_FIRST_MS", "2000")],
+            )
+            .await
+            .expect("spawn fake-embedder with delay-first"),
+        );
+
+        // Kick off an embed call the sidecar will sit on for 2s (first embed
+        // call is delayed) — it is still genuinely pending when we kill the
+        // child below, before any reply is ever written.
+        let e_pending = embedder.clone();
+        let pending_texts = vec!["x".to_string()];
+        let pending_call = tokio::spawn(async move { e_pending.embed(&pending_texts).await });
+
+        // Give the write a moment to land so the request is genuinely in
+        // flight (registered + sent), not racing construction. Generous
+        // margin: under a loaded test runner (whole suite in parallel,
+        // several fake-embedder subprocesses at once) scheduling can lag well
+        // past 100ms, and the 2s delay-first above leaves plenty of room.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let pid = embedder.child.id().expect("child should have a pid");
+        let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
+
+        // The in-flight call must fail fast once the child dies, not hang
+        // forever waiting for a reply that will never come. The timeout here
+        // is just an upper bound on a broken ("hangs forever") outcome, not
+        // expected latency — it only costs wall-clock time if the test fails.
+        let pending_result = tokio::time::timeout(Duration::from_secs(5), pending_call)
+            .await
+            .expect("pending embed call must not hang after the child dies")
+            .expect("task must not panic");
+        assert!(pending_result.is_err(), "pending embed call must fail once the sidecar dies");
+
+        // Give the reader task a moment to observe EOF and mark the transport
+        // dead (generous margin for the same reason as above).
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // A brand-new call issued AFTER the child is known-dead must also fail
+        // fast rather than hang.
+        let subsequent = tokio::time::timeout(Duration::from_secs(2), embedder.embed(&["y".to_string()]))
+            .await
+            .expect("post-EOF embed call must not hang");
+        assert!(subsequent.is_err(), "post-EOF embed call must fail fast, not succeed");
+    }
+
     #[cfg(feature = "fake-embedder")]
     #[cfg(unix)]
     #[tokio::test]
     async fn test_stdio_embedder_drop_kills_child() {
         let bin = fake_embedder_bin_path();
         let embedder = StdioEmbedder::spawn(bin.to_str().unwrap(), &[]).await.expect("spawn fake-embedder");
-        let pid = embedder.inner.lock().await.child.id().expect("child should have a pid");
+        let pid = embedder.child.id().expect("child should have a pid");
 
         drop(embedder);
         // Give the OS a moment to process the kill triggered by kill_on_drop.
