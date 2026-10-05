@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::Notify;
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -264,6 +265,102 @@ impl BisectionTracker {
 }
 
 // ---------------------------------------------------------------------------
+// SemanticCooldown — shared query-embed circuit breaker (ADR 0042)
+// ---------------------------------------------------------------------------
+
+/// Initial cool-down window after `search` exhausts its whole query-embed budget
+/// (ADR 0042 decision 3). Doubles on each further consecutive cap-hit, capped at
+/// `SEMANTIC_COOLDOWN_MAX`.
+pub const SEMANTIC_COOLDOWN_INITIAL: Duration = Duration::from_secs(30);
+
+/// Upper bound for the doubling cool-down window (ADR 0042 decision 3).
+pub const SEMANTIC_COOLDOWN_MAX: Duration = Duration::from_secs(600);
+
+struct CooldownState {
+    /// Instant until which `search` skips `health()`/`embed()` entirely. `None` outside a
+    /// cool-down (either never entered, or the window has elapsed).
+    until: Option<Instant>,
+    /// Window that will be applied on the NEXT cap-hit. Doubles (capped at
+    /// `SEMANTIC_COOLDOWN_MAX`) on each consecutive cap-hit; reset to `SEMANTIC_COOLDOWN_INITIAL`
+    /// by `reset()`.
+    next_window: Duration,
+}
+
+/// Shared circuit breaker (ADR 0042 decision 3) between `WhatsAppBridge::search` and
+/// [`run_embedding_drain_worker`]. When a search exhausts its whole query-embed budget, it
+/// calls [`SemanticCooldown::on_cap_hit`]: later searches skip `health()`/`embed()` entirely
+/// (instant lexical-only results) until the window elapses. Consecutive cap-hits double the
+/// window, capped at `SEMANTIC_COOLDOWN_MAX`. The FIRST successful embed from EITHER side — a
+/// search or the drain worker — calls [`SemanticCooldown::reset`], which clears the cool-down
+/// and the doubling, back to the `SEMANTIC_COOLDOWN_INITIAL` baseline.
+///
+/// One `Arc<SemanticCooldown>` is constructed in `WhatsAppBridge::start()` and shared with
+/// this worker's spawn site in `run_bridge` (`src/bridge.rs`).
+pub struct SemanticCooldown {
+    state: ParkingMutex<CooldownState>,
+}
+
+impl SemanticCooldown {
+    pub fn new() -> Self {
+        Self {
+            state: ParkingMutex::new(CooldownState {
+                until: None,
+                next_window: SEMANTIC_COOLDOWN_INITIAL,
+            }),
+        }
+    }
+
+    /// `true` if `search` should skip `health()`/`embed()` entirely and go straight to the
+    /// lexical-only path.
+    pub fn is_active(&self) -> bool {
+        let guard = self.state.lock();
+        matches!(guard.until, Some(until) if Instant::now() < until)
+    }
+
+    /// Record that a search exhausted its whole query-embed budget: enters (or extends) the
+    /// cool-down at the current window, then doubles it (capped) for the NEXT cap-hit. Logged
+    /// once per call — in practice once per cool-down episode, since a search skips the embed
+    /// entirely (never reaching `on_cap_hit` again) while already cooling down.
+    pub fn on_cap_hit(&self) {
+        let mut guard = self.state.lock();
+        let window = guard.next_window;
+        guard.until = Some(Instant::now() + window);
+        guard.next_window = (window * 2).min(SEMANTIC_COOLDOWN_MAX);
+        warn!(
+            window_secs = window.as_secs(),
+            "search: semantic cool-down entered (query-embed budget exhausted) — \
+             later searches use lexical-only until the window elapses"
+        );
+    }
+
+    /// Record a successful embed from EITHER `search` or the drain worker: clears the
+    /// cool-down and resets the doubling window back to the `SEMANTIC_COOLDOWN_INITIAL`
+    /// baseline. A silent no-op if there was nothing to reset — the drain worker calls this
+    /// on every successful batch, which must not spam the log.
+    pub fn reset(&self, source: &str) {
+        let mut guard = self.state.lock();
+        let had_cooldown = guard.until.is_some() || guard.next_window != SEMANTIC_COOLDOWN_INITIAL;
+        guard.until = None;
+        guard.next_window = SEMANTIC_COOLDOWN_INITIAL;
+        if had_cooldown {
+            info!(source = source, "search: semantic cool-down reset by a successful embed");
+        }
+    }
+
+    /// Window that will be applied on the NEXT cap-hit (test-only introspection).
+    #[cfg(test)]
+    pub(crate) fn peek_next_window(&self) -> Duration {
+        self.state.lock().next_window
+    }
+}
+
+impl Default for SemanticCooldown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main drain worker loop (M2.3)
 // ---------------------------------------------------------------------------
 
@@ -282,6 +379,7 @@ pub async fn run_embedding_drain_worker(
     backoff_cap: Duration,
     loading_timeout: Duration,
     failure_threshold: u32,
+    semantic_cooldown: Arc<SemanticCooldown>,
 ) {
     info!("embedding-drain worker starting");
     let model_info = embedder.model_info();
@@ -461,7 +559,13 @@ pub async fn run_embedding_drain_worker(
 
         // Embed the batch.
         let vectors = match embedder.embed(&texts).await {
-            Ok(v) => v,
+            Ok(v) => {
+                // ADR 0042 decision 3: the FIRST successful embed from either side (search or
+                // drain) resets the shared cool-down. Reset here, right on success, regardless
+                // of whether the subsequent DB write below succeeds.
+                semantic_cooldown.reset("drain");
+                v
+            }
             Err(e) => {
                 // Solo-batch errors are AMBIGUOUS with the current batch-only protocol (ADR 0024):
                 // the sidecar just failed the call, and we can't tell "content rejection" from
@@ -644,6 +748,123 @@ mod tests {
         assert!(!timer.observe(&HealthStatus::Ok, t31)); // reset
         assert!(!timer.is_loading());
         assert!(!timer.observe(&HealthStatus::Loading, t91)); // starts fresh
+    }
+
+    // --- ADR 0042: SemanticCooldown ---
+
+    #[tokio::test(start_paused = true)]
+    async fn test_semantic_cooldown_starts_inactive() {
+        let cooldown = SemanticCooldown::new();
+        assert!(!cooldown.is_active());
+        assert_eq!(cooldown.peek_next_window(), SEMANTIC_COOLDOWN_INITIAL);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_semantic_cooldown_cap_hit_enters_window() {
+        let cooldown = SemanticCooldown::new();
+        cooldown.on_cap_hit();
+        assert!(cooldown.is_active());
+
+        // Still active just before the 30s window elapses.
+        tokio::time::advance(SEMANTIC_COOLDOWN_INITIAL - Duration::from_secs(1)).await;
+        assert!(cooldown.is_active());
+
+        // Inactive once the window has elapsed.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(!cooldown.is_active());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_semantic_cooldown_consecutive_hits_double_capped_at_max() {
+        let cooldown = SemanticCooldown::new();
+
+        cooldown.on_cap_hit(); // window=30s applied, next_window becomes 60s
+        assert_eq!(cooldown.peek_next_window(), Duration::from_secs(60));
+        tokio::time::advance(Duration::from_secs(31)).await; // let the 30s window lapse
+
+        cooldown.on_cap_hit(); // window=60s applied, next_window becomes 120s
+        assert_eq!(cooldown.peek_next_window(), Duration::from_secs(120));
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        // Keep hitting until the window saturates at the 600s cap.
+        for _ in 0..6 {
+            cooldown.on_cap_hit();
+            let window = cooldown.peek_next_window();
+            tokio::time::advance(window + Duration::from_secs(1)).await;
+        }
+        assert_eq!(cooldown.peek_next_window(), SEMANTIC_COOLDOWN_MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_semantic_cooldown_reset_clears_window_and_doubling() {
+        let cooldown = SemanticCooldown::new();
+        cooldown.on_cap_hit();
+        cooldown.on_cap_hit(); // next_window has now doubled past the baseline
+        assert!(cooldown.is_active());
+        assert_ne!(cooldown.peek_next_window(), SEMANTIC_COOLDOWN_INITIAL);
+
+        cooldown.reset("test");
+
+        assert!(!cooldown.is_active());
+        assert_eq!(cooldown.peek_next_window(), SEMANTIC_COOLDOWN_INITIAL);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_semantic_cooldown_reset_is_a_silent_noop_when_never_cooling() {
+        // The drain worker calls reset() on every successful embed, which happens far more
+        // often than any cap-hit. Resetting an already-baseline cooldown must stay a cheap,
+        // observable no-op (verified here by state staying unchanged; log quietness is by
+        // inspection of the `if had_cooldown` guard).
+        let cooldown = SemanticCooldown::new();
+        cooldown.reset("drain");
+        assert!(!cooldown.is_active());
+        assert_eq!(cooldown.peek_next_window(), SEMANTIC_COOLDOWN_INITIAL);
+    }
+
+    #[tokio::test]
+    async fn test_drain_worker_success_resets_semantic_cooldown() {
+        // ADR 0042 decision 3: the drain worker's first successful embed resets the shared
+        // cool-down, even if a prior search cap-hit left it active with a doubled window.
+        let (store, _db_path) = temp_store("cooldown_reset_on_drain_success").await;
+        seed_pending_message(&store, "msg1", "text", "hello").await;
+
+        let embedder = Arc::new(crate::embedder::FakeEmbedder::new("test-model", 4));
+        let notify = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        let cooldown = Arc::new(SemanticCooldown::new());
+        // Simulate a prior search cap-hit: cooldown is active, next_window has doubled.
+        cooldown.on_cap_hit();
+        assert!(cooldown.is_active());
+        assert_ne!(cooldown.peek_next_window(), SEMANTIC_COOLDOWN_INITIAL);
+
+        let worker_handle = tokio::spawn(run_embedding_drain_worker(
+            embedder.clone(),
+            store.clone(),
+            notify.clone(),
+            cancel_clone,
+            Duration::from_secs(1),
+            64,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            10,
+            cooldown.clone(),
+        ));
+
+        notify.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), worker_handle).await;
+
+        // The successful embed above must have reset the shared cool-down.
+        assert!(!cooldown.is_active(), "drain worker's successful embed should clear the cool-down");
+        assert_eq!(
+            cooldown.peek_next_window(),
+            SEMANTIC_COOLDOWN_INITIAL,
+            "drain worker's successful embed should reset the doubling window to baseline"
+        );
     }
 
     // --- M2.3.9: Kind-gated text preparation ---
@@ -896,6 +1117,7 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(60),
             10,
+            Arc::new(SemanticCooldown::new()),
         ));
 
         // Wake the worker
@@ -944,6 +1166,7 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(60),
             10,
+            Arc::new(SemanticCooldown::new()),
         ));
 
         // Wake the worker multiple times to drain all rows
@@ -1002,6 +1225,7 @@ mod tests {
             Duration::from_millis(50), // Short backoff cap for testing
             Duration::from_secs(60),
             10, // Failure threshold for notify-only
+            Arc::new(SemanticCooldown::new()),
         ));
 
         // Wake the worker a few times to trigger repeated transport failures.
@@ -1069,6 +1293,7 @@ mod tests {
             Duration::from_millis(50), // Short backoff cap for testing
             Duration::from_secs(60),
             10, // Failure threshold for notify-only
+            Arc::new(SemanticCooldown::new()),
         ));
 
         // Wake the worker many times — more than 3 to ensure that if the bug were
@@ -1130,6 +1355,7 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(60),
             10,
+            Arc::new(SemanticCooldown::new()),
         ));
 
         // Wake the worker many times — more than 3 to prove cap-3 does NOT engage.
@@ -1192,6 +1418,7 @@ mod tests {
             Duration::from_millis(50), // Very short backoff for testing
             Duration::from_secs(60),
             10,
+            Arc::new(SemanticCooldown::new()),
         ));
 
         // Actively notify the worker many times to ensure it gets chances to run
@@ -1279,6 +1506,7 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_millis(50), // Very short loading timeout for testing
             3, // Low failure threshold
+            Arc::new(SemanticCooldown::new()),
         ));
 
         // Wake the worker multiple times

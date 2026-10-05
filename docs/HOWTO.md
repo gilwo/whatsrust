@@ -375,10 +375,30 @@ matches (no shared keyword — the case this exists for) need
 `cosine ≥ WHATSRUST_SEMANTIC_MIN_SCORE` to be admitted.
 `WHATSRUST_SEMANTIC_SCAN_CAP` (default 50000 vectors) bounds the scan; a
 scope larger than that skips vector recall for that query and falls back to
-plain FTS5 + rerank. With no sidecar configured (or an unhealthy one, or a
-query-embed failure/timeout), search is byte-identical to plain FTS5 keyword
-search — no errors, no blocking. See
+plain FTS5 + rerank. With no sidecar configured (or an unhealthy one, a
+query-embed failure, or a query-embed timeout — see below), search is
+byte-identical to plain FTS5 keyword search — no errors, no blocking. See
 `docs/adr/0041-hybrid-recall-bounded-vector-scan.md`.
+
+**The query-embed wait and cool-down (ADR 0042).** Each search gets one overall
+budget, `WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS` (default **20s**), covering both
+waiting for the sidecar to finish loading (if `health()` reports `Loading`) and
+waiting for the embed reply. The embed request is sent once and never re-sent —
+re-sending would just queue behind the original in the sidecar's one-at-a-time
+stdin loop. If it's still pending at 5s, 10s, and 20s (whichever checkpoints
+fall inside the budget), you'll see a log line like:
+```
+search: query embed still pending after 10s (sidecar slow — likely swapping)
+```
+If the whole budget runs out, that search falls back to lexical-only AND
+semantic search enters a **cool-down**: later searches skip the embed entirely
+(instant keyword-only results, no sidecar round trip) for 30s. The window
+doubles on each further consecutive cap-hit, up to 10 minutes, and resets back
+to 30s on the first successful embed afterward (from either a search or the
+embedding-drain worker). Entering and leaving the cool-down are each logged
+once. Occasional slowness (e.g. the sidecar paging bge-m3's weights back in
+after being idle) still gets the full wait and returns semantic results; only
+a genuinely long stall triggers the cool-down.
 
 ### Model files and cache
 

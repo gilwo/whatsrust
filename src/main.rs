@@ -311,6 +311,18 @@ async fn async_main() -> Result<()> {
     let embedder_failure_threshold: u32 = parse_env_or("WHATSRUST_EMBEDDER_FAILURE_THRESHOLD", bf_default.embedder_failure_threshold);
     let semantic_min_score: f32 = parse_env_or("WHATSRUST_SEMANTIC_MIN_SCORE", bf_default.semantic_min_score);
     let semantic_scan_cap: usize = parse_env_or("WHATSRUST_SEMANTIC_SCAN_CAP", bf_default.semantic_scan_cap);
+    let semantic_query_timeout_secs: u64 =
+        parse_env_or("WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS", bf_default.semantic_query_timeout_secs);
+    // ADR 0042: the CLI (`api.rs::cli_get`) and MCP (`mcp.rs::http_get`/`http_post`) clients
+    // both give up after 30s. A budget >= 30s means those callers would time out before
+    // `search` itself falls back, so warn loudly at startup.
+    if semantic_query_timeout_secs >= 30 {
+        warn!(
+            semantic_query_timeout_secs,
+            "WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS >= 30s — the CLI/MCP clients give up after 30s \
+             and would time out before search falls back to lexical (ADR 0042)"
+        );
+    }
 
     // --- Fail-closed safety validation (ADR 0022) — MUST run before bridge construction ---
     let safety = BackfillSafety {
@@ -366,6 +378,7 @@ async fn async_main() -> Result<()> {
         embedder_failure_threshold,
         semantic_min_score,
         semantic_scan_cap,
+        semantic_query_timeout_secs,
         ..Default::default()
     };
 
@@ -2227,5 +2240,25 @@ mod embedder_config_tests {
 
         // Absence is benign — should return Err (var not set), not panic or fail-closed
         assert!(cmd.is_err(), "WHATSRUST_EMBEDDER_CMD unset should be Ok(None)-like behavior");
+    }
+
+    /// ADR 0042: Verify WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS override is picked up, and
+    /// that the default (20s) stays below the 30s CLI/MCP client timeouts.
+    #[test]
+    fn test_semantic_query_timeout_secs_env_override() {
+        assert_eq!(
+            BridgeConfig::default().semantic_query_timeout_secs,
+            20,
+            "default must stay below the 30s CLI/MCP client timeouts (ADR 0042)"
+        );
+
+        std::env::set_var("WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS", "15");
+        let parsed: u64 = parse_env_or(
+            "WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS",
+            BridgeConfig::default().semantic_query_timeout_secs,
+        );
+        std::env::remove_var("WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS");
+
+        assert_eq!(parsed, 15, "WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS env override should be picked up");
     }
 }
