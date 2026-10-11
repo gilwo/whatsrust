@@ -1,5 +1,7 @@
 # Embedder Sidecar MVP — Build Specification
 
+> **Status:** SUPERSEDED (2026-09-30) by the native Rust embedder sidecar (`embedder-rs/`, ADR 0040), which is now the deployment default. This Python MVP sidecar remains as a legacy parity-check reference.
+
 **Date:** 2026-08-30  
 **Purpose:** Self-contained build + test plan for implementing the whatsrust MVP embedder sidecar  
 **Audience:** An implementer executing this in a fresh session (NO whatsrust code changes)  

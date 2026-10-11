@@ -1,7 +1,7 @@
 # M2 — Semantic Search — Detailed Phase/Task Plan
 
 **Date:** 2026-07-23
-**Status:** Planned (written at M2 start, per IMPLEMENTATION-ROADMAP gate policy)
+**Status:** DONE. Code-complete 2026-09-30 (including ADR 0040/0041/0042); live-validated 2026-10-05 on the real account (bge-m3 hybrid search)
 **Milestone:** M2 of F1. Layers onto M1 (historical fetch + FTS5 lexical search — DONE 2026-07-20).
 **Design (what/how):** `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` — §High-level
 data flow (:33), §Search (:238), §Embedding subsystem (:254), §Config (:352), §Testing strategy
