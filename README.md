@@ -106,7 +106,7 @@ src/
 | Mode | How |
 |------|-----|
 | **Daemon** | `cargo run` -- REPL with 50 commands |
-| **CLI** | `whatsrust send 15551234567 "Hello"` -- JSON to stdout |
+| **CLI** | `whatsrust send 15551234567 "Hello"` -- 50 commands, JSON to stdout |
 | **Library** | `WhatsAppBridge::start(config, tx, cancel)` -- embed in your Rust app |
 | **MCP server** | `whatsrust mcp` -- 35 tools for AI agents (Claude Code, etc.) |
 

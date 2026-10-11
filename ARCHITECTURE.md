@@ -114,7 +114,7 @@ Abort is **three-level** (ADR 0026): a **BATCH** (send request → await respons
 
 `search_inbound` branches on whether a query is given: with `query=Some(q)`, it joins `messages_fts MATCH` (quote-as-phrase sanitized — embedded `"` doubled, no raw FTS5 operator injection) to `messages` by rowid and orders by `f.rank` ascending (BM25, most-relevant first); with `query=None`, it's a plain chronological browse. One query path, EXPLAIN-verified to hit the FTS5 index (no LIKE fallback) — multilingual by construction via the `unicode61 remove_diacritics 2` tokenizer (ADR 0019/0018).
 
-### Semantic search: hybrid recall (ADR 0041; M2.1–M2.6 code-complete, live E2E validation pending)
+### Semantic search: hybrid recall (ADR 0041; M2.1–M2.6 code-complete, live-validated 2026-10-05)
 
 **Opt-in via `WHATSRUST_EMBEDDER_CMD`**: when configured and the query embeds successfully,
 `WhatsAppBridge::search` unions two candidate sets — **lexical** (FTS5, recall width = max of 200

@@ -83,7 +83,7 @@ The entire feature is conditional on this. **No rebase, no fork, no clone** — 
 
 ---
 
-## Milestone 2 — Semantic search  (CODE-COMPLETE 2026-09-30, incl. ADR 0041 hybrid recall + bge-m3 default; live E2E validation after restart PENDING)
+## Milestone 2 — Semantic search  (DONE: code-complete 2026-09-30, incl. ADR 0041 hybrid recall + bge-m3 default; live-validated 2026-10-05)
 
 **Goal:** optional semantic search via the embedder sidecar, layered on M1's stored messages.
 
@@ -97,11 +97,11 @@ The entire feature is conditional on this. **No rebase, no fork, no clone** — 
 - ✅ **M2.6 Config, integration test, wiring — DONE (2026-09-02).** Embedder knobs plumbed through `.env`/`BridgeConfig` with config tests (override + absent-is-benign); `.env.example` completed (FAILURE_THRESHOLD); fake-embedder misbehave mode + real-subprocess trust-but-verify integration tests (wrong dim/count/model_id rejected over the process boundary, CI-safe); additive `/api/status` embed-status counts (watchdog already covers footprint); stale multi-worker-backfill comments reworded; inert per-row-rejection semantics reconciled in ADR 0015/0038 (path a — cap-3 dormant pending a protocol signal). [ADR 0023/0024/0025]
 - ✅ **Native Rust sidecar + bge-m3 default — DONE (2026-09-30).** `embedder-rs/` (candle, ADR 0040) replaces the Python MVP as the deployment target, serving `--model minilm|bge-m3`; **bge-m3 is now the default for `make run-semantic`** (`EMBED_MODEL ?= bge-m3` in the Makefile), MiniLM stays selectable (`EMBED_MODEL=minilm`). Fixes the cold-cache download bug (hf-hub's redirect-following gap) for both models. [ADR 0039/0040]
 - ✅ **Hybrid recall — DONE (2026-09-30).** `WhatsAppBridge::search` unions FTS5 lexical candidates with a bounded brute-force vector scan of the search scope (skipped above `WHATSRUST_SEMANTIC_SCAN_CAP`, default 50000); lexical matches are always kept, vector-only matches need `cosine ≥ WHATSRUST_SEMANTIC_MIN_SCORE`. Fixes the M2.4 limitation where a word-free query (e.g. an English query matching a Hebrew-only message) returned nothing. Default floor raised to **0.55**, calibrated against the real (read-only) `whatsapp.db` for both models (`make calibrate`); right-sized for bge-m3, conservative (vector-only recall effectively off) for MiniLM. `/api/status` → `embeddings` now reports per-active-model `{model_id, embedded, pending, failed, skipped}`. [ADR 0041]
-  **Remaining M2 item: live end-to-end validation against a running daemon with real data, after a restart onto this code (hands-on, not automatable).**
+  **Live end-to-end validation: done 2026-10-05** on the real account with bge-m3. Searches embedded the query (sidecar CPU per search) and returned vector-only Hebrew matches for English queries; the first search after idle took 2-6 s while weights paged back in. The live runs surfaced the sidecar-client desync and `+`-decoding bugs, both fixed (ADR 0042, `decode_query_component`).
 
 **M2 exit criteria (milestone-level):**
-- ✅ With a sidecar configured, semantic search returns relevant results; without one, search cleanly falls back to M1 lexical (no errors, no blocking). — **CODE-COMPLETE, E2E validation pending.**
-- ✅ Drain keeps up under normal backfill (the >100k pathological ceiling is the only coupling); model switch + per-model purge work. — **CODE-COMPLETE, E2E validation pending.**
+- ✅ With a sidecar configured, semantic search returns relevant results; without one, search cleanly falls back to M1 lexical (no errors, no blocking). — **Validated live 2026-10-05.**
+- ✅ Drain keeps up under normal backfill (the >100k pathological ceiling is the only coupling); model switch + per-model purge work. — **Drain and model switch validated live** (MiniLM → bge-m3 re-embedded all rows, old vectors kept as cold storage); per-model purge covered by tests, not exercised live.
 - ⏸️ Multilingual model handles CJK semantically (the lexical gap M1 leaves). — **Deferred to live testing.**
 
 **M2 code-review follow-ups (2026-09-02, deferred — none block push or live E2E).**
