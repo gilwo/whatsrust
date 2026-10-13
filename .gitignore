@@ -13,6 +13,7 @@ review-pack/
 .env
 .venv-embedder/
 embedder-rs/target/
+dist/
 # Session-tracking artifacts (personal, machine-local; not part of the repo)
 *.md.compact.md
 whatsrust-project_*.md

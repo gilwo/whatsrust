@@ -5,13 +5,21 @@
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release run embedder-build run-semantic embedder-smoke calibrate test test-all lint lint-strict fmt fmt-check clean py-sidecar-setup py-sidecar-smoke run-semantic-py
+.PHONY: help build release release-all dist run embedder-build run-semantic embedder-smoke calibrate test test-all lint lint-strict fmt fmt-check clean py-sidecar-setup py-sidecar-smoke run-semantic-py
 
 # Model for the Rust embedder sidecar: bge-m3 (default, stronger multilingual/cross-language
 # recall) or minilm (lighter, faster). Override on the command line, e.g.:
 #   make run-semantic EMBED_MODEL=minilm
 # See docs/HOWTO.md #5a "Choosing a model" and docs/adr/0041-hybrid-recall-bounded-vector-scan.md.
 EMBED_MODEL ?= bge-m3
+
+# Optional per-run device name override for `run`/`run-semantic` (device-name-at-pairing
+# feature; see .env.example WHATSRUST_DEVICE_NAME). Only takes effect when passed
+# explicitly on the command line, e.g. `make run DEVICE_NAME=my-phone` — leaving it unset
+# never overrides a WHATSRUST_DEVICE_NAME already configured in .env.
+ifdef DEVICE_NAME
+DEVICE_NAME_ENV := WHATSRUST_DEVICE_NAME="$(DEVICE_NAME)"
+endif
 
 help: ## Show this help (default target)
 	@echo "whatsrust — available targets:"
@@ -29,8 +37,8 @@ release: ## Build the optimized release binary (cargo build --release; slow: LTO
 # WHATSAPP_PAIR_PHONE for pair-code linking). It does NOT exit on its own —
 # stop it with Ctrl+C (graceful shutdown: drains in-flight sends, backs up the
 # DB). See docs/HOWTO.md #3 "Run the daemon".
-run: ## Run the daemon (interactive: QR login + REPL; Ctrl+C to stop)
-	cargo run
+run: ## Run the daemon (interactive: QR login + REPL; Ctrl+C to stop; optional DEVICE_NAME=<name>)
+	$(DEVICE_NAME_ENV) cargo run
 
 # Native Rust embedder sidecar (embedder-rs/ — separate crate, candle-based;
 # ADR 0040 — Python-free deploy). Built independently so candle stays out of the
@@ -38,15 +46,32 @@ run: ## Run the daemon (interactive: QR login + REPL; Ctrl+C to stop)
 embedder-build: ## Build the Rust embedder sidecar (embedder-rs/ — separate crate)
 	cd embedder-rs && cargo build --release
 
+# Builds both release artifacts a deployment needs: the daemon (`release`) and the Rust
+# embedder sidecar (`embedder-build`). Reuses both targets as prerequisites — no separate
+# recipe body. Slow (LTO + opt-level z on the daemon); see `release` above.
+release-all: release embedder-build ## Build the daemon AND the embedder sidecar in release mode
+
+# Copies the two release-mode binaries `release-all` produces into dist/, so a deployment
+# only needs to ship that one folder. Prints the resulting paths plus a ready-to-use
+# WHATSRUST_EMBEDDER_CMD hint for wiring the sidecar into a copied-elsewhere daemon.
+dist: release-all ## Collect the release binaries (daemon + embedder sidecar) into dist/
+	@mkdir -p dist
+	cp target/release/whatsrust dist/whatsrust
+	cp embedder-rs/target/release/whatsrust-embedder dist/whatsrust-embedder
+	@echo "Daemon:           $(CURDIR)/dist/whatsrust"
+	@echo "Embedder sidecar: $(CURDIR)/dist/whatsrust-embedder"
+	@echo "Hint: WHATSRUST_EMBEDDER_CMD=$(CURDIR)/dist/whatsrust-embedder"
+
 # Runs the daemon with semantic search enabled via the Rust embedder sidecar
 # (whatsrust spawns the sidecar as a child process via WHATSRUST_EMBEDDER_CMD,
 # with WHATSRUST_EMBEDDER_ARGS="--model $(EMBED_MODEL)" selecting the model).
 # Requires a linked account. On first run, the sidecar downloads model weights
 # to ~/.cache/huggingface (lazy, on first embed): ~0.46 GB for minilm, ~2.2 GB
 # for bge-m3. No Python/venv. See docs/HOWTO.md #5a for the full walkthrough.
-run-semantic: embedder-build ## Run the daemon with Rust embedder sidecar enabled (EMBED_MODEL=bge-m3|minilm, default bge-m3; e.g. make run-semantic EMBED_MODEL=minilm)
+run-semantic: embedder-build ## Run the daemon with Rust embedder sidecar enabled (EMBED_MODEL=bge-m3|minilm, default bge-m3; optional DEVICE_NAME=<name>; e.g. make run-semantic EMBED_MODEL=minilm)
 	WHATSRUST_EMBEDDER_CMD=$(CURDIR)/embedder-rs/target/release/whatsrust-embedder \
 	WHATSRUST_EMBEDDER_ARGS="--model $(EMBED_MODEL)" \
+	$(DEVICE_NAME_ENV) \
 	cargo run
 
 test: ## Run the default test suite (cargo test)
@@ -134,5 +159,6 @@ py-sidecar-smoke: ## [Python sidecar] Test the Python embedder sidecar standalon
 run-semantic-py: ## [Python sidecar] Run the daemon with Python embedder sidecar (legacy; requires .venv-embedder)
 	WHATSRUST_EMBEDDER_CMD=./scripts/run-embedder.sh cargo run
 
-clean: ## Remove build artifacts (cargo clean)
+clean: ## Remove build artifacts (cargo clean) and dist/
 	cargo clean
+	rm -rf dist

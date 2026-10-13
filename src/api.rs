@@ -447,6 +447,7 @@ async fn handle_status(bridge: &WhatsAppBridge) -> Vec<u8> {
     let m = bridge.metrics();
     let queue = bridge.queue_depth().await;
     let embeddings = bridge.embedding_status_counts().await;
+    let device_name = bridge.device_name().await;
     json_ok(json!({
         "state": format!("{:?}", state),
         "connected": state == BridgeState::Connected,
@@ -460,6 +461,10 @@ async fn handle_status(bridge: &WhatsAppBridge) -> Vec<u8> {
         "last_inbound_epoch": m.last_inbound_epoch.load(Ordering::Relaxed),
         "last_outbound_epoch": m.last_outbound_epoch.load(Ordering::Relaxed),
         "embeddings": embeddings,
+        // Additive (Part 1, device-name-at-pairing): the name saved at pairing time, or
+        // null when the device hasn't completed pairing yet. See
+        // bridge::resolve_device_name / BridgeConfig::device_name.
+        "device_name": device_name,
     }))
 }
 

@@ -1067,11 +1067,40 @@ impl Store {
     }
 
     /// Clear stored device credentials (used after LoggedOut to trigger re-pairing on reconnect).
+    ///
+    /// Also clears the saved `device_name` metadata key (device-name-at-pairing feature):
+    /// a logout invalidates the session, so the next pairing must re-evaluate the
+    /// configured/env name rather than inherit the one from the session that just ended
+    /// (see `bridge::resolve_device_name`). Both deletes run in one transaction so a crash
+    /// between them can't leave a stale `device_name` behind after the credentials are gone.
     pub async fn clear_device(&self) -> Result<()> {
         self.run(|c| {
-            c.execute("DELETE FROM device WHERE id = 1", [])
-                .map(|_| ())
-                .map_err(db_err)
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            tx.execute("DELETE FROM device WHERE id = 1", [])
+                .map_err(db_err)?;
+            tx.execute("DELETE FROM metadata WHERE key = 'device_name'", [])
+                .map_err(db_err)?;
+            tx.commit().map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Whether the device has completed WhatsApp pairing.
+    ///
+    /// Mirrors wa-rs's `Device::is_registered()` (`wacore/src/store/device.rs`:
+    /// `pn.is_some()`). The `pn` column defaults to `''` for an unpaired device —
+    /// `load_device_from_db` maps an empty string to `None` — and is populated with the
+    /// account's JID once pairing completes, so a non-empty value is the reliable
+    /// "already paired" signal. Returns `false` for a fresh DB with no `device` row.
+    pub async fn is_paired(&self) -> Result<bool> {
+        self.run(|c| {
+            let pn: String = c
+                .query_row("SELECT pn FROM device WHERE id = 1", [], |row| row.get(0))
+                .optional()
+                .map_err(db_err)?
+                .unwrap_or_default();
+            Ok(!pn.is_empty())
         })
         .await
     }
@@ -5510,6 +5539,60 @@ mod tests {
         store.set_metadata("test_key_absent", "world").await.unwrap();
         let val = store.get_metadata("test_key_absent").await.unwrap();
         assert_eq!(val.as_deref(), Some("world"), "second set must overwrite");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // Device-name-at-pairing — is_paired() signal + clear_device() lifecycle
+    // -------------------------------------------------------------------------
+
+    /// (dn-1) On a fresh DB the device is unpaired and `device_name` is absent. After a
+    /// simulated pairing (a non-empty `pn`, the same signal `is_paired()`/wa-rs's
+    /// `Device::is_registered()` check), a previously-saved `device_name` must win over a
+    /// different configured value. `clear_device()` (the logout path) must then clear both
+    /// the pairing state AND the saved name, so the next resolution falls back to a new
+    /// configured value — mirroring the real logout → re-pair flow.
+    #[tokio::test]
+    async fn test_device_name_lifecycle_across_pairing_and_logout() {
+        let dir = unique_test_dir("device-name-lifecycle");
+        let db_path = dir.join("whatsapp.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::new(&db_path).unwrap();
+
+        // Fresh DB: not paired, no saved name yet.
+        assert!(!store.is_paired().await.unwrap(), "fresh DB must be unpaired");
+        assert_eq!(store.get_metadata("device_name").await.unwrap(), None);
+
+        // Mirrors what the pairing-resolution logic in bridge.rs (run_bot_session) does
+        // before pairing: persist the configured name.
+        store.set_metadata("device_name", "my-configured-name").await.unwrap();
+
+        // Simulate pairing completing: wa-rs writes a non-empty `pn` once the handshake
+        // succeeds (see load_device_from_db — empty string maps to None/unregistered).
+        store
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO device (id, pn) VALUES (1, '15551234567@s.whatsapp.net')
+                 ON CONFLICT(id) DO UPDATE SET pn = excluded.pn",
+                [],
+            )
+            .unwrap();
+        assert!(store.is_paired().await.unwrap(), "a device row with a non-empty pn must be paired");
+
+        // The saved name must still be there, independent of any new configured value.
+        let stored = store.get_metadata("device_name").await.unwrap();
+        assert_eq!(stored.as_deref(), Some("my-configured-name"));
+
+        // clear_device() (the logout path) must drop both the credentials and the saved name.
+        store.clear_device().await.unwrap();
+        assert!(!store.is_paired().await.unwrap(), "clear_device must clear the pairing state");
+        assert_eq!(
+            store.get_metadata("device_name").await.unwrap(),
+            None,
+            "clear_device must clear the saved device_name so re-pairing re-evaluates the configured value"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
