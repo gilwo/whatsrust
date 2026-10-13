@@ -306,6 +306,7 @@ Inbound messages arrive as `WhatsAppInbound` with sender, JID, message ID, reply
 | Variable | Default | What it does |
 |----------|---------|-------------|
 | `WHATSAPP_PAIR_PHONE` | *(QR mode)* | Phone number for pair-code linking |
+| `WHATSRUST_DEVICE_NAME` | `whatsrust` | Name shown in WhatsApp's Linked Devices. Used only when pairing; to rename, unlink and re-pair (history is kept) |
 | `WHATSAPP_ALLOWED` | *(everyone)* | Comma-separated sender allowlist |
 | `WHATSRUST_PORT` | `7270` | API server port (0 = disabled) |
 | `WHATSRUST_BIND` | `127.0.0.1` | API bind address |

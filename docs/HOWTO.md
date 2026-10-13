@@ -139,7 +139,9 @@ own `--help` "ENVIRONMENT" section and in `.env.example`. Cross-check with:
 2. **First run:** a QR code is rendered to the terminal. Scan it with
    WhatsApp on your phone (Linked Devices → Link a Device). If
    `WHATSAPP_PAIR_PHONE` is set instead, you'll be prompted for a pair code
-   rather than a QR scan.
+   rather than a QR scan. The device appears in Linked Devices under
+   `WHATSRUST_DEVICE_NAME` (default `whatsrust`); the name is fixed at this
+   point (see §2 and §3a).
 3. Once paired, the process keeps running as:
    - an **interactive REPL** on stdin (type `send <jid> <message>`, `status`,
      `groups`, `quit`, etc. — the daemon prints the full command list at
@@ -169,6 +171,40 @@ whatsrust: cannot connect to whatsrust daemon on 127.0.0.1:7270: Connection refu
 Is the daemon running? Start it with: WHATSRUST_PORT=7270 WHATSRUST_BIND=127.0.0.1 whatsrust
 ```
 (exit code 1 — verified by running `whatsrust status` with no daemon up).
+
+---
+
+## 3a. Re-pairing (rename the device, or after a logout)
+
+**Goal:** link whatsrust to WhatsApp again without losing local history.
+
+Re-pairing does **not** delete your content. When the device is unlinked,
+whatsrust clears only the device credentials and the saved device name
+(`clear_device()`). Messages, the search index, embeddings, backfill jobs and
+cursors all stay in `whatsapp.db` (ADR 0043).
+
+**Steps:**
+1. (Optional) To use a new name, set `WHATSRUST_DEVICE_NAME` in `.env` or the
+   environment first.
+2. On the phone: WhatsApp → Linked Devices → whatsrust → **Log out**. The
+   daemon receives the logout and clears the credentials.
+3. Restart the daemon (or let it reconnect) and scan the new QR code (or enter
+   the pair code).
+
+**What to expect:**
+- History sync runs again, as on any first pairing. The messages it sends are
+  already in the database; duplicates are skipped because each WhatsApp
+  message ID is stored once.
+- Older history stays local; fetch more on demand with `fetch-history` (§4).
+- It's a new device identity to WhatsApp, so contacts' encryption sessions
+  are set up again, and anything still in the outbound queue at the moment of
+  logout may fail and need resending.
+- **Do not delete `whatsapp.db` to re-pair.** That's the only way to lose the
+  content. A startup backup is kept in `whatsapp.db.backups/` if you want an
+  extra copy first.
+
+**Verification:** `curl -s http://127.0.0.1:7270/api/status` shows
+`"device_name"`: `null` until pairing completes, then the name you paired with.
 
 ---
 

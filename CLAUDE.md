@@ -17,7 +17,7 @@ Where to look for what — read the relevant doc before changing related code.
 | **Implementation execution plan (phases, gates, milestone exit criteria)** | `docs/plans/IMPLEMENTATION-ROADMAP.md` |
 | Design specs / plans (the "what/how" blueprints) | `docs/plans/*.md` |
 | Design review reports (cold reviews, reconciliation) | `_reviewer/design/` |
-| Historical fetch + lexical search (M1 — **DONE** 2026-07-20) / semantic search (M2 — **DONE**: code-complete 2026-09-30, live-validated 2026-10-05) | `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (+ ADRs 0001–0042) |
+| Historical fetch + lexical search (M1 — **DONE** 2026-07-20) / semantic search (M2 — **DONE**: code-complete 2026-09-30, live-validated 2026-10-05) | `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (+ ADRs 0001–0043) |
 
 When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md`, MADR format) and link it from `docs/adr/0000-index.md`.
 
@@ -64,3 +64,4 @@ When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md
 - Bounded query-embed wait + cool-down (ADR 0042): `search` waits for the SAME in-flight embed (never re-sent) within one budget (`WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS`, default 20s, covering health-poll + embed); exhausting it falls back to lexical AND trips a shared `SemanticCooldown` (30s, doubling to 10min cap, reset by the first successful embed from search or the drain worker) during which later searches skip the embed entirely.
 - Embedder sidecar: stateless stdio JSON-RPC process (primary: Rust + candle, ADR 0040 — bge-m3 default, MiniLM selectable via `--model`/`WHATSRUST_EMBEDDER_MODEL`/`make run-semantic EMBED_MODEL=minilm`; legacy: Python + sentence-transformers); embedding-drain worker (independent task, set-difference, multi-model, circuit-breaker at pathological-pending ceiling); per-model purge via `purge_embeddings(model_id)` (incremental_vacuum, exposed in API/MCP/CLI)
 - SQLite-first backfill: durable `backfill_jobs` queue + single FIFO worker + connection-gating (defer, not fail, when disconnected)
+- Device name fixed at pairing (ADR 0043): `WHATSRUST_DEVICE_NAME` (default `whatsrust`) is used only while the device is unpaired, then saved as `metadata.device_name`; once paired the saved name wins and the env var is ignored. `clear_device()` (on logout) deletes it with the credentials, so a re-pair picks up the current value. Library consumers set `BridgeConfig.device_name` directly.
