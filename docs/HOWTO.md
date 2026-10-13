@@ -42,6 +42,16 @@ make build          # == cargo build
 # compile than debug because of LTO; this is expected.
 make release         # == cargo build --release
 # binary: target/release/whatsrust
+
+# Release build of BOTH the daemon and the embedder sidecar (embedder-rs/) — the
+# two binaries a deployment needs. Reuses `release` + `embedder-build`; equally slow.
+make release-all
+# binaries: target/release/whatsrust, embedder-rs/target/release/whatsrust-embedder
+
+# Collects both of the above into dist/ and prints their paths plus a ready-to-use
+# WHATSRUST_EMBEDDER_CMD hint — handy for copying a self-contained deployment elsewhere.
+make dist
+# dist/whatsrust, dist/whatsrust-embedder
 ```
 
 **Verification:**
@@ -79,6 +89,13 @@ stderr and the daemon continues with the real environment only.
      instead of scanning a QR code.
    - `WHATSAPP_ALLOWED` — comma-separated digit-only phone numbers; empty
      means accept inbound messages from everyone.
+   - `WHATSRUST_DEVICE_NAME` (default `whatsrust`) — the name shown in
+     WhatsApp's Linked Devices list. WhatsApp only reads this **while pairing
+     a new device**; once paired, the name is stored with the session (the
+     `device_name` metadata key) and this var is ignored on every later start,
+     even if you change it. To rename an existing session: unlink the device
+     in WhatsApp → Linked Devices, set the new `WHATSRUST_DEVICE_NAME`, and
+     restart the daemon to re-pair (scan a new QR code / pair code).
    - `BACKUP_DIR` (default `whatsapp.db.backups`) — where SQLite backups are
      written on startup/shutdown.
 3. (Optional) point at a config file somewhere other than `./.env` by setting

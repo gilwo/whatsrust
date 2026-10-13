@@ -759,7 +759,17 @@ pub struct BridgeConfig {
     pub max_outbound_retries: i32,
     /// Optional channel to receive presence events (typing, recording indicators).
     pub presence_tx: Option<mpsc::Sender<PresenceEvent>>,
-    /// Device name shown in WhatsApp's "Linked Devices" list (default: "Habb").
+    /// Device name shown in WhatsApp's "Linked Devices" list (default: "whatsrust").
+    ///
+    /// Only takes effect while **pairing a new device**: WhatsApp reads `device_props`
+    /// from the client payload sent while unpaired, but the login payload an
+    /// already-paired device sends on every reconnect never resends it (wa-rs
+    /// `Device::get_client_payload`, `wacore/src/store/device.rs`) — the name is fixed
+    /// for the life of that pairing. Once paired, the name actually used is the one
+    /// saved under the `device_name` metadata key at pairing time (see
+    /// `resolve_device_name`), and this field is ignored. To rename, unlink the device
+    /// in WhatsApp → Linked Devices and restart to re-pair with a new value here (or via
+    /// `WHATSRUST_DEVICE_NAME`).
     pub device_name: String,
     /// Maximum message IDs tracked for dedup (default: 4096).
     pub dedup_capacity: usize,
@@ -837,7 +847,7 @@ impl Default for BridgeConfig {
             prune_interval_secs: 3600,
             max_outbound_retries: 3,
             presence_tx: None,
-            device_name: "Habb".to_string(),
+            device_name: "whatsrust".to_string(),
             dedup_capacity: DEDUP_CACHE_CAPACITY,
             backfill_interval_secs: 4,
             backfill_max_concurrent: 1,
@@ -1528,6 +1538,12 @@ impl WhatsAppBridge {
         obj.insert("skipped".to_string(), serde_json::json!(counts.get("skipped").copied().unwrap_or(0)));
 
         serde_json::Value::Object(obj)
+    }
+
+    /// Saved device name (set at pairing time; see `resolve_device_name`). `None` until
+    /// the device has completed pairing. Exposed via `/api/status`.
+    pub async fn device_name(&self) -> Option<String> {
+        self.store.get_metadata("device_name").await.unwrap_or(None)
     }
 
     /// Get the current QR code data (None if already paired or not yet generated).
@@ -2941,10 +2957,41 @@ async fn run_bot_session(
         builder = builder.skip_history_sync();
     }
 
-    // Set device name shown in WhatsApp's "Linked Devices" list
+    // Device name shown in WhatsApp's "Linked Devices" list — resolve it BEFORE building
+    // the bot. The name only takes effect while pairing a new device (wa-rs's login
+    // payload for an already-paired device never resends `device_props`), so once paired
+    // the name saved under the `device_name` metadata key at pairing time wins over the
+    // configured/env value. See `resolve_device_name` for the four cases.
+    let paired = match store.is_paired().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "failed to determine pairing status; assuming not paired");
+            false
+        }
+    };
+    let stored_device_name = match store.get_metadata("device_name").await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "failed to read saved device_name metadata");
+            None
+        }
+    };
+    let (effective_device_name, name_to_persist) =
+        resolve_device_name(paired, stored_device_name.as_deref(), &config.device_name);
+    match &name_to_persist {
+        Some(name) => {
+            if let Err(e) = store.set_metadata("device_name", name).await {
+                warn!(error = %e, "failed to persist device_name metadata");
+            }
+        }
+        None => {
+            debug!(device_name = %effective_device_name, "using device_name saved at a prior pairing; ignoring configured/env value");
+        }
+    }
+
     use wacore::store::device::DevicePropsOverride;
     builder = builder.with_device_props(
-        DevicePropsOverride::new().with_os(config.device_name.clone())
+        DevicePropsOverride::new().with_os(effective_device_name)
     );
 
     if let Some(ref phone) = config.pair_phone {
@@ -4677,6 +4724,39 @@ fn normalize_phone(raw: &str) -> String {
     raw.chars().filter(|c| c.is_ascii_digit()).collect()
 }
 
+/// Decide the effective WhatsApp "Linked Devices" name and what (if anything) should be
+/// (re)written to the `device_name` metadata key, given the device's pairing state.
+///
+/// WhatsApp only reads `device_props` from the client payload sent while unpaired; an
+/// already-paired device's login payload never resends it (wa-rs `Device::get_client_payload`,
+/// `wacore/src/store/device.rs`), so the name is fixed for the life of a pairing:
+///
+/// - **Not paired** (fresh DB, or credentials cleared after logout): use `configured`
+///   (the env override, else `BridgeConfig::device_name`'s default) and persist it, so a
+///   pairing that completes afterward is pinned to the name that was actually sent. If
+///   pairing doesn't complete, nothing changed — the next start re-evaluates `configured`.
+/// - **Paired, with a `stored` name**: that name wins — `configured` is ignored, nothing
+///   new to persist.
+/// - **Paired, with no `stored` name**: a legacy session paired before this feature
+///   existed, when every pairing used the hard-coded "Habb" device name — backfill that
+///   value and persist it.
+///
+/// Returns `(effective_name, name_to_persist)`; the caller should call `set_metadata`
+/// with `name_to_persist` when it's `Some`.
+fn resolve_device_name(paired: bool, stored: Option<&str>, configured: &str) -> (String, Option<String>) {
+    if !paired {
+        let name = configured.to_string();
+        return (name.clone(), Some(name));
+    }
+    match stored {
+        Some(name) => (name.to_string(), None),
+        None => {
+            let legacy = "Habb".to_string();
+            (legacy.clone(), Some(legacy))
+        }
+    }
+}
+
 /// Generate a random jitter in [0, base_ms/2) using xorshift on system time + atomic counter.
 /// The counter prevents identical jitter when called in rapid succession (nanos often repeat).
 fn rand_jitter_ms(base_ms: u64) -> u64 {
@@ -4976,6 +5056,36 @@ mod tests {
         assert_eq!(normalize_phone("+1 (555) 123-4567"), "15551234567");
         assert_eq!(normalize_phone("+44 20 7946 0958"), "442079460958");
         assert_eq!(normalize_phone(""), "");
+    }
+
+    #[test]
+    fn test_resolve_device_name_unpaired_uses_configured_and_persists_it() {
+        let (name, to_store) = resolve_device_name(false, None, "my-device");
+        assert_eq!(name, "my-device");
+        assert_eq!(to_store, Some("my-device".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_device_name_unpaired_empty_env_falls_back_to_default() {
+        // main.rs substitutes BridgeConfig's "whatsrust" default before calling this
+        // function when WHATSRUST_DEVICE_NAME is unset/blank — simulate that input here.
+        let (name, to_store) = resolve_device_name(false, None, "whatsrust");
+        assert_eq!(name, "whatsrust");
+        assert_eq!(to_store, Some("whatsrust".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_device_name_paired_with_stored_ignores_configured() {
+        let (name, to_store) = resolve_device_name(true, Some("OldPhone"), "NewConfiguredName");
+        assert_eq!(name, "OldPhone", "a stored name must win over a different configured value");
+        assert_eq!(to_store, None, "nothing new to persist — the stored name is unchanged");
+    }
+
+    #[test]
+    fn test_resolve_device_name_paired_without_stored_backfills_habb() {
+        let (name, to_store) = resolve_device_name(true, None, "whatever");
+        assert_eq!(name, "Habb", "legacy sessions paired before this feature always used Habb");
+        assert_eq!(to_store, Some("Habb".to_string()));
     }
 
     #[test]

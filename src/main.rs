@@ -154,6 +154,18 @@ fn parse_env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
     }
 }
 
+/// Resolve the configured device name from `WHATSRUST_DEVICE_NAME` (trimmed; absent or
+/// whitespace-only is treated as unset, falling back to `default`). Only takes effect
+/// while pairing a new device — see `BridgeConfig::device_name` and
+/// `bridge::resolve_device_name` for how an already-paired session overrides this.
+fn device_name_from_env(default: &str) -> String {
+    std::env::var("WHATSRUST_DEVICE_NAME")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// Read the API port from env, with fallback chain.
 fn get_port() -> u16 {
     std::env::var("WHATSRUST_PORT")
@@ -294,6 +306,12 @@ async fn async_main() -> Result<()> {
     // --- Backfill knobs (ADR 0021/0022/0023) ---
     let bf_default = bridge::BridgeConfig::default();
 
+    // Device name shown in WhatsApp's "Linked Devices" list — only takes effect while
+    // pairing a new device; an already-paired session keeps using the name saved at
+    // pairing time regardless of this value (see BridgeConfig::device_name doc,
+    // bridge::resolve_device_name).
+    let device_name = device_name_from_env(&bf_default.device_name);
+
     let backfill_interval_secs: u64 = parse_env_or("WHATSRUST_BACKFILL_INTERVAL_SECS", bf_default.backfill_interval_secs);
     let backfill_max_concurrent: u32 = parse_env_or("WHATSRUST_BACKFILL_MAX_CONCURRENT", bf_default.backfill_max_concurrent);
     let backfill_max_messages: i64 = parse_env_or("WHATSRUST_BACKFILL_MAX_MESSAGES", bf_default.backfill_max_messages);
@@ -363,6 +381,7 @@ async fn async_main() -> Result<()> {
         backup_dir,
         send_burst,
         skip_history_sync,
+        device_name,
         backfill_interval_secs,
         backfill_max_concurrent,
         backfill_max_messages,
@@ -2260,5 +2279,36 @@ mod embedder_config_tests {
         std::env::remove_var("WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS");
 
         assert_eq!(parsed, 15, "WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS env override should be picked up");
+    }
+}
+
+#[cfg(test)]
+mod device_name_config_tests {
+    use super::*;
+
+    /// WHATSRUST_DEVICE_NAME override is picked up and trimmed.
+    #[test]
+    fn test_device_name_env_override_is_trimmed() {
+        std::env::set_var("WHATSRUST_DEVICE_NAME", "  My Device  ");
+        let name = device_name_from_env(&BridgeConfig::default().device_name);
+        std::env::remove_var("WHATSRUST_DEVICE_NAME");
+
+        assert_eq!(name, "My Device", "WHATSRUST_DEVICE_NAME override should be picked up and trimmed");
+    }
+
+    /// Whitespace-only (or unset) WHATSRUST_DEVICE_NAME is treated as unset — falls back
+    /// to BridgeConfig's default ("whatsrust").
+    #[test]
+    fn test_device_name_whitespace_only_is_treated_as_unset() {
+        assert_eq!(BridgeConfig::default().device_name, "whatsrust");
+
+        std::env::set_var("WHATSRUST_DEVICE_NAME", "   ");
+        let name = device_name_from_env(&BridgeConfig::default().device_name);
+        std::env::remove_var("WHATSRUST_DEVICE_NAME");
+        assert_eq!(name, "whatsrust", "whitespace-only value must be treated as unset");
+
+        std::env::remove_var("WHATSRUST_DEVICE_NAME");
+        let name = device_name_from_env(&BridgeConfig::default().device_name);
+        assert_eq!(name, "whatsrust", "unset var must fall back to the default");
     }
 }
