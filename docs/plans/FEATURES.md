@@ -98,3 +98,4 @@ now** to preserve focus on F1/F2. Pick up opportunistically or schedule delibera
 - 🟢 Dead-code warning silenced — commit b4b0500
 - 🟢 Design + ADRs for F1/F2 (ADRs 0001–0025 + consolidated design doc) — commit 6817f52
 - 🟢 Doc matrix in CLAUDE.md + `.gitignore` leak hardening — commit 6817f52
+- 🟢 Configurable device name (`WHATSRUST_DEVICE_NAME`, default `whatsrust`), fixed at pairing and stored with the session; re-pairing keeps history (ADR 0043). Plus `make release-all` / `make dist`.
