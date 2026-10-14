@@ -56,6 +56,7 @@ This directory contains Architecture Decision Records (ADRs) for the whatsrust p
 | [0041](0041-hybrid-recall-bounded-vector-scan.md) | Hybrid recall: bounded vector scan alongside FTS5 | 2026-09-26 | Accepted |
 | [0042](0042-cancellation-safe-sidecar-client-and-bounded-query-wait.md) | Cancellation-safe sidecar client; bounded query-embed wait with cool-down | 2026-10-05 | Accepted |
 | [0043](0043-device-name-fixed-at-pairing.md) | Device name is fixed at pairing and stored with the session | 2026-10-13 | Accepted |
+| [0044](0044-api-origin-host-content-type-hardening.md) | Origin/Host/Content-Type gate closes CSRF and DNS-rebinding holes in the API server | 2026-10-14 | Accepted |
 
 ## Revised ADRs
 
@@ -87,4 +88,4 @@ The following ADRs received M2-refinement pointers during M2 planning (2026-07-2
 
 ## Future ADRs
 
-Start numbering at 0044. Follow the established format. Keep each ADR focused on one decision.
+Start numbering at 0045. Follow the established format. Keep each ADR focused on one decision.

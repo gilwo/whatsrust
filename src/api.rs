@@ -15,7 +15,7 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::bridge::{BridgeState, WhatsAppBridge};
 use crate::qr::QrRender;
@@ -31,11 +31,11 @@ const SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-struct HttpRequest {
-    method: String,
-    path: String,
+pub(crate) struct HttpRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
     query: Vec<(String, String)>,
-    headers: Vec<(String, String)>,
+    pub(crate) headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -241,13 +241,147 @@ fn request_has_api_token(req: &HttpRequest, expected_token: &str) -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// Request gate: CSRF / DNS-rebinding / Content-Type hardening (ADR 0044)
+// ---------------------------------------------------------------------------
+//
+// The hand-rolled server above has no browser-level same-origin protection of
+// its own, so it must enforce one. Applied before routing to EVERY route
+// (status, SSE, GETs, media — everything), never just the "obviously
+// dangerous" ones, because a no-cors GET carries no Origin and a valid Host
+// and would otherwise bypass checks 1-2.
+//
+// Deliberately NOT doing: CORS headers or OPTIONS handling. A cross-site
+// preflight should keep failing — answering it would be the first step
+// toward allowing the exact browser requests this gate exists to block.
+
+/// Host values accepted on a loopback bind regardless of the literal bind
+/// address — curl/browsers may address the daemon as any of these three.
+const LOOPBACK_HOST_NAMES: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
+
+/// Case-insensitive lookup of the first header matching `name`.
+fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+}
+
+/// Case-insensitive lookup of every header matching `name` — used to detect
+/// duplicates (e.g. two `Host` headers, which must be rejected outright).
+fn find_all_headers<'a>(headers: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+    headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).collect()
+}
+
+/// Parse a comma-separated allowlist env var into trimmed, non-empty entries.
+/// Default (unset or empty) is an empty allowlist.
+fn parse_allowlist_env(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Extract and normalize the host part of a `Host` header value for
+/// loopback/allowlist comparison:
+/// - un-wraps IPv6 bracket notation (`[::1]:7270` -> `::1`)
+/// - strips a trailing `:port` for the one-colon (hostname/IPv4) case only —
+///   a bare, unbracketed IPv6 literal (two or more colons, e.g. `::1`) is left
+///   as-is rather than risk mis-parsing it as `host:port`
+/// - strips one or more trailing dots (`localhost.` -> `localhost`)
+/// - lowercases the result
+fn normalize_host_header(value: &str) -> String {
+    let v = value.trim();
+    let host_part = if let Some(rest) = v.strip_prefix('[') {
+        match rest.find(']') {
+            Some(end) => &rest[..end],
+            None => v,
+        }
+    } else if v.matches(':').count() == 1 {
+        match v.rfind(':') {
+            Some(idx) if !v[idx + 1..].is_empty() && v[idx + 1..].bytes().all(|b| b.is_ascii_digit()) => &v[..idx],
+            _ => v,
+        }
+    } else {
+        v
+    };
+    host_part.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The CSRF / DNS-rebinding / Content-Type gate. Pure — no I/O, no logging —
+/// so it's unit-testable in isolation; callers log the rejection (method,
+/// path, reason) and must never log header values beyond `reason`, bodies,
+/// or tokens.
+///
+/// Checks, in order:
+/// 1. **Origin** (primary CSRF defence): if present (including the literal
+///    `null`), it must exactly match an entry in `allowed_origins` or the
+///    request is rejected. Browsers set this header on cross-site requests
+///    and it can't be forged by a hostile page, so a match is trusted and
+///    the Host check below is skipped.
+/// 2. **Host** (defeats DNS rebinding, which carries no Origin): required
+///    exactly once, and must resolve to 127.0.0.1/localhost/[::1] on a
+///    loopback bind, or to an `allowed_hosts` entry on either bind type.
+///    Checked whenever Origin is absent and (the bind is loopback OR
+///    `allowed_hosts` is non-empty) — i.e. skipped by default on a
+///    non-loopback bind with no configured allowlist.
+/// 3. **Content-Type** on every POST: must be `application/json` (parameters
+///    like `; charset=utf-8` allowed). This denies the CORS-safelisted
+///    content types (`text/plain`, `application/x-www-form-urlencoded`,
+///    `multipart/form-data`) and a missing type, forcing a preflight that
+///    this server doesn't answer.
+pub(crate) fn gate_request(
+    method: &str,
+    headers: &[(String, String)],
+    is_loopback_bind: bool,
+    allowed_origins: &[String],
+    allowed_hosts: &[String],
+) -> Result<(), (u16, String)> {
+    match find_all_headers(headers, "origin").as_slice() {
+        [] => {}
+        [origin] => {
+            if !allowed_origins.iter().any(|o| o == origin) {
+                return Err((403, format!("Origin '{origin}' is not allowed")));
+            }
+        }
+        _ => return Err((403, "duplicate Origin header".to_string())),
+    }
+
+    // Host is checked on every request, including ones with an allowlisted Origin.
+    if is_loopback_bind || !allowed_hosts.is_empty() {
+        match find_all_headers(headers, "host").as_slice() {
+            [] => return Err((403, "missing Host header".to_string())),
+            [value] => {
+                let normalized = normalize_host_header(value);
+                let is_default_loopback =
+                    is_loopback_bind && LOOPBACK_HOST_NAMES.contains(&normalized.as_str());
+                let is_allowlisted = allowed_hosts.iter().any(|h| normalize_host_header(h) == normalized);
+                if !is_default_loopback && !is_allowlisted {
+                    return Err((403, format!("Host '{value}' is not allowed")));
+                }
+            }
+            _ => return Err((403, "duplicate Host header".to_string())),
+        }
+    }
+
+    // HTTP methods are case-sensitive tokens, but compare case-insensitively so a
+    // lowercase "post" can't skip this check if the router ever accepts it.
+    if method.eq_ignore_ascii_case("POST") {
+        let is_json = find_header(headers, "content-type")
+            .map(|ct| ct.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json"))
+            .unwrap_or(false);
+        if !is_json {
+            return Err((415, "POST requires Content-Type: application/json".to_string()));
+        }
+    }
+
+    Ok(())
+}
+
 const MAX_MEDIA_READ_BYTES: u64 = 50 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Request parsing
 // ---------------------------------------------------------------------------
 
-async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest> {
+pub(crate) async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
 
@@ -1640,6 +1774,9 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
     let conn_sem = Arc::new(Semaphore::new(64));
     // Separate semaphore for SSE so long-lived streams don't starve normal requests.
     let sse_sem = Arc::new(Semaphore::new(SSE_MAX_CONNECTIONS));
+    // CSRF / DNS-rebinding allowlists (ADR 0044) — parsed once at startup.
+    let allowed_origins = Arc::new(parse_allowlist_env("WHATSRUST_ALLOWED_ORIGINS"));
+    let allowed_hosts = Arc::new(parse_allowlist_env("WHATSRUST_ALLOWED_HOSTS"));
 
     loop {
         tokio::select! {
@@ -1656,6 +1793,8 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
                 let api_token = api_token.clone();
                 let sse_sem = sse_sem.clone();
                 let sse_cancel = cancel.clone();
+                let allowed_origins = allowed_origins.clone();
+                let allowed_hosts = allowed_hosts.clone();
                 tokio::spawn(async move {
                     let _permit = permit; // held until handler completes
                     let req = match read_request(&mut stream).await {
@@ -1665,6 +1804,22 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
                             return;
                         }
                     };
+
+                    // CSRF / DNS-rebinding / Content-Type gate (ADR 0044) — applied
+                    // before routing to EVERY route, including SSE and auth, so a
+                    // cross-site "simple" request never reaches a handler.
+                    if let Err((status, reason)) = gate_request(
+                        &req.method,
+                        &req.headers,
+                        is_loopback,
+                        &allowed_origins,
+                        &allowed_hosts,
+                    ) {
+                        debug!(method = %req.method, path = %req.path, reason = %reason, "request rejected by origin/host/content-type gate");
+                        let _ = stream.write_all(&json_err(status, &reason)).await;
+                        return;
+                    }
+
                     if let Some(expected_token) = api_token.as_deref() {
                         if !request_has_api_token(&req, expected_token) {
                             let _ = stream.write_all(&json_err(401, "unauthorized")).await;
@@ -2166,5 +2321,255 @@ mod tests {
         let req = read_request(&mut server_stream).await.expect("request should parse");
         assert_eq!(req.query_get("jid"), Some("972542271337@s.whatsapp.net"));
         assert_eq!(req.query_get("limit"), Some("20"));
+    }
+
+    // -------------------------------------------------------------------------
+    // ADR 0044: CSRF / DNS-rebinding / Content-Type gate — unit tests
+    // -------------------------------------------------------------------------
+
+    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn test_gate_rejects_disallowed_origin() {
+        let h = headers(&[("Origin", "https://evil.example"), ("Host", "127.0.0.1:7270")]);
+        let err = gate_request("GET", &h, true, &[], &[]).unwrap_err();
+        assert_eq!(err.0, 403);
+    }
+
+    #[test]
+    fn test_gate_rejects_null_origin() {
+        let h = headers(&[("Origin", "null"), ("Host", "127.0.0.1:7270")]);
+        let err = gate_request("GET", &h, true, &[], &[]).unwrap_err();
+        assert_eq!(err.0, 403);
+    }
+
+    #[test]
+    fn test_gate_allows_allowlisted_origin() {
+        let h = headers(&[("Origin", "https://trusted.example"), ("Host", "127.0.0.1:7270")]);
+        let allowed = vec!["https://trusted.example".to_string()];
+        assert!(gate_request("GET", &h, true, &allowed, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_gate_checks_host_even_with_allowlisted_origin() {
+        // An allowlisted Origin must not skip Host validation (DNS rebinding defence).
+        let allowed = vec!["https://trusted.example".to_string()];
+        let evil_host = headers(&[("Origin", "https://trusted.example"), ("Host", "evil.example")]);
+        assert_eq!(gate_request("GET", &evil_host, true, &allowed, &[]).unwrap_err().0, 403);
+        let no_host = headers(&[("Origin", "https://trusted.example")]);
+        assert_eq!(gate_request("GET", &no_host, true, &allowed, &[]).unwrap_err().0, 403);
+    }
+
+    #[test]
+    fn test_gate_rejects_duplicate_origin() {
+        let allowed = vec!["https://trusted.example".to_string()];
+        let h = headers(&[
+            ("Origin", "https://trusted.example"),
+            ("Origin", "https://evil.example"),
+            ("Host", "127.0.0.1:7270"),
+        ]);
+        let err = gate_request("GET", &h, true, &allowed, &[]).unwrap_err();
+        assert_eq!(err, (403, "duplicate Origin header".to_string()));
+    }
+
+    #[test]
+    fn test_gate_content_type_check_is_method_case_insensitive() {
+        let h = headers(&[("Host", "127.0.0.1:7270"), ("Content-Type", "text/plain")]);
+        for m in ["POST", "post", "Post"] {
+            assert_eq!(gate_request(m, &h, true, &[], &[]).unwrap_err().0, 415, "method {m}");
+        }
+    }
+
+    #[test]
+    fn test_gate_rejects_evil_host_on_loopback() {
+        let h = headers(&[("Host", "evil.example")]);
+        let err = gate_request("GET", &h, true, &[], &[]).unwrap_err();
+        assert_eq!(err.0, 403);
+    }
+
+    #[test]
+    fn test_gate_allows_loopback_host_variants() {
+        for host in ["127.0.0.1:7270", "localhost", "[::1]:7270", "LOCALHOST."] {
+            let h = headers(&[("Host", host)]);
+            assert!(gate_request("GET", &h, true, &[], &[]).is_ok(), "Host {host} should be allowed");
+        }
+    }
+
+    #[test]
+    fn test_gate_rejects_duplicate_host() {
+        let h = headers(&[("Host", "127.0.0.1"), ("Host", "evil.example")]);
+        let err = gate_request("GET", &h, true, &[], &[]).unwrap_err();
+        assert_eq!(err.0, 403);
+        assert!(err.1.contains("duplicate"), "expected a duplicate-Host rejection, got: {}", err.1);
+    }
+
+    #[test]
+    fn test_gate_rejects_missing_host_on_loopback() {
+        let h: Vec<(String, String)> = Vec::new();
+        let err = gate_request("GET", &h, true, &[], &[]).unwrap_err();
+        assert_eq!(err.0, 403);
+    }
+
+    #[test]
+    fn test_gate_allows_odd_host_on_nonloopback_bind_without_allowlist() {
+        // Non-loopback bind + no ALLOWED_HOSTS configured => Host check is skipped by default.
+        let h = headers(&[("Host", "whatever.example")]);
+        assert!(gate_request("GET", &h, false, &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_gate_nonloopback_bind_with_allowlist_enforces_it() {
+        let allowed = vec!["proxy.example".to_string()];
+        let bad = headers(&[("Host", "whatever.example")]);
+        assert!(gate_request("GET", &bad, false, &[], &allowed).is_err());
+        let good = headers(&[("Host", "proxy.example")]);
+        assert!(gate_request("GET", &good, false, &[], &allowed).is_ok());
+    }
+
+    #[test]
+    fn test_gate_rejects_post_without_json_content_type() {
+        for ct in ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"] {
+            let h = headers(&[("Host", "127.0.0.1"), ("Content-Type", ct)]);
+            let err = gate_request("POST", &h, true, &[], &[]).unwrap_err();
+            assert_eq!(err.0, 415, "Content-Type {ct} should be rejected");
+        }
+        // Missing Content-Type entirely.
+        let h = headers(&[("Host", "127.0.0.1")]);
+        let err = gate_request("POST", &h, true, &[], &[]).unwrap_err();
+        assert_eq!(err.0, 415);
+    }
+
+    #[test]
+    fn test_gate_allows_post_with_json_content_type_and_charset() {
+        let h = headers(&[("Host", "127.0.0.1"), ("Content-Type", "application/json; charset=utf-8")]);
+        assert!(gate_request("POST", &h, true, &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_gate_allows_get_without_content_type() {
+        let h = headers(&[("Host", "127.0.0.1")]);
+        assert!(gate_request("GET", &h, true, &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_normalize_host_header_edge_cases() {
+        assert_eq!(normalize_host_header("127.0.0.1:7270"), "127.0.0.1");
+        assert_eq!(normalize_host_header("LOCALHOST."), "localhost");
+        assert_eq!(normalize_host_header("[::1]:7270"), "::1");
+        assert_eq!(normalize_host_header("::1"), "::1"); // bare IPv6, no brackets — left intact, not mangled as host:port
+        assert_eq!(normalize_host_header("localhost."), "localhost");
+        assert_eq!(normalize_host_header("127.0.0.1."), "127.0.0.1");
+    }
+
+    // -------------------------------------------------------------------------
+    // ADR 0044: gate integration — through the real read_request parser +
+    // (for the passing case) the real handle_request dispatch.
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_csrf_post_with_origin_and_text_plain_is_rejected_before_handler() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+
+        // Mirrors `fetch(url, {method:"POST", mode:"no-cors", body, headers:{"Content-Type":"text/plain"}})`
+        // from an attacker page — no preflight is sent, and the cross-site Origin is present.
+        let body = r#"{"jid":"1@s.whatsapp.net","text":"pwned"}"#;
+        let raw = format!(
+            "POST /api/send HTTP/1.1\r\nHost: 127.0.0.1:7270\r\nOrigin: https://evil.example\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        client.write_all(raw.as_bytes()).await.unwrap();
+
+        let req = read_request(&mut server_stream).await.expect("request should parse");
+        let decision = gate_request(&req.method, &req.headers, true, &[], &[]);
+        assert_eq!(
+            decision,
+            Err((403, "Origin 'https://evil.example' is not allowed".to_string()))
+        );
+        // Structural guarantee (see serve()'s connection loop): it returns on this
+        // Err immediately, before ever calling handle_request/handle_send — so the
+        // attack never reaches a handler that could act on it.
+    }
+
+    #[tokio::test]
+    async fn test_equivalent_request_without_origin_passes_gate_then_hits_bridge_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+
+        // /api/pin-chat calls the WhatsApp client directly (unlike /api/send's
+        // SQLite-first async queue, which accepts the job regardless of connection
+        // state) — with no client connected it deterministically fails with
+        // "not connected" => 503, which is what we want to observe here.
+        let body = r#"{"jid":"1@s.whatsapp.net"}"#;
+        let raw = format!(
+            "POST /api/pin-chat HTTP/1.1\r\nHost: 127.0.0.1:7270\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        client.write_all(raw.as_bytes()).await.unwrap();
+
+        let req = read_request(&mut server_stream).await.expect("request should parse");
+        assert!(gate_request(&req.method, &req.headers, true, &[], &[]).is_ok());
+
+        // The gate passed — dispatch to the real handler. With no WhatsApp client
+        // connected, it fails on bridge state (503); that's expected and fine —
+        // the gate's job is CSRF/rebinding/content-type defence, not connectivity.
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let db_path = std::env::temp_dir().join(format!("whatsrust-gate-test-{ts}.db"));
+        let bridge = crate::bridge::build_test_bridge_with_embedder(
+            &db_path,
+            crate::embedder::FakeEmbedder::new("test-model", 8),
+        )
+        .await;
+
+        let response = handle_request(&bridge, &req, true).await;
+        assert_eq!(http_status_of(&response), 503, "expected a bridge-state failure, not a gate rejection");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // -------------------------------------------------------------------------
+    // ADR 0044: whatsrust's own CLI client must keep passing the gate
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cli_get_request_passes_the_gate() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let req = read_request(&mut stream).await.expect("request should parse");
+            let decision = gate_request(&req.method, &req.headers, true, &[], &[]);
+            let _ = stream.write_all(&json_err(503, "test stub")).await;
+            decision
+        });
+        let _ = cli_get(port, "/api/status").await;
+        let decision = server.await.unwrap();
+        assert!(decision.is_ok(), "cli_get's request must pass the gate: {decision:?}");
+    }
+
+    #[tokio::test]
+    async fn test_cli_post_request_passes_the_gate() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let req = read_request(&mut stream).await.expect("request should parse");
+            let decision = gate_request(&req.method, &req.headers, true, &[], &[]);
+            let _ = stream.write_all(&json_err(503, "test stub")).await;
+            decision
+        });
+        let _ = cli_post(port, "/api/send", r#"{"jid":"1@s.whatsapp.net","text":"hi"}"#).await;
+        let decision = server.await.unwrap();
+        assert!(decision.is_ok(), "cli_post's request must pass the gate: {decision:?}");
     }
 }

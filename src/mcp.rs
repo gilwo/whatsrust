@@ -448,6 +448,58 @@ mod tests {
             "description must mention pacing/limits (paced/clamp/background); got: {desc}"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // ADR 0044: the MCP proxy's own request builders must keep passing the
+    // CSRF/DNS-rebinding/Content-Type gate (src/api.rs::gate_request).
+    // -------------------------------------------------------------------------
+
+    /// Minimal well-formed HTTP response so the blocking client (http_get/http_post)
+    /// gets a reply and returns instead of hanging on its 30s read timeout.
+    const STUB_RESPONSE: &[u8] =
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+
+    #[tokio::test]
+    async fn test_mcp_http_get_request_passes_the_gate() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let client = std::thread::spawn(move || {
+            let _ = http_get(port, "/api/status");
+        });
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let req = crate::api::read_request(&mut stream).await.expect("request should parse");
+        let decision = crate::api::gate_request(&req.method, &req.headers, true, &[], &[]);
+        assert!(decision.is_ok(), "mcp http_get's request must pass the gate: {decision:?}");
+
+        let _ = stream.write_all(STUB_RESPONSE).await;
+        let _ = stream.shutdown().await;
+        client.join().expect("client thread panicked");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_http_post_request_passes_the_gate() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let client = std::thread::spawn(move || {
+            let _ = http_post(port, "/api/send", &json!({"jid": "1@s.whatsapp.net", "text": "hi"}));
+        });
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let req = crate::api::read_request(&mut stream).await.expect("request should parse");
+        let decision = crate::api::gate_request(&req.method, &req.headers, true, &[], &[]);
+        assert!(decision.is_ok(), "mcp http_post's request must pass the gate: {decision:?}");
+
+        let _ = stream.write_all(STUB_RESPONSE).await;
+        let _ = stream.shutdown().await;
+        client.join().expect("client thread panicked");
+    }
 }
 
 /// Normalize bind host — replace wildcard "0.0.0.0" with "127.0.0.1" for connections.
