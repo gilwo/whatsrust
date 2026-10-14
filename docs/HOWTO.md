@@ -105,7 +105,16 @@ stderr and the daemon continues with the real environment only.
    must set both `WHATSRUST_ALLOW_REMOTE=1` **and** `WHATSRUST_API_TOKEN=...`
    (the server enforces the token when remote access is enabled; see
    `src/api.rs`).
-5. Backfill (historical fetch) has three ban-critical knobs that are
+5. **API security (ADR 0044):** even on the loopback default, every request is
+   checked before it's routed. A cross-site `Origin` header is rejected unless
+   it's in `WHATSRUST_ALLOWED_ORIGINS` (comma-separated, default empty). With no
+   `Origin`, the `Host` header must be `127.0.0.1`/`localhost`/`::1` (any port) or
+   listed in `WHATSRUST_ALLOWED_HOSTS` (comma-separated, default empty — e.g. for a
+   reverse proxy) — this defeats DNS rebinding. Every `POST` must send
+   `Content-Type: application/json`; a raw `curl -X POST ... -d '...'` needs
+   `-H 'Content-Type: application/json'` added or it gets 415. A token
+   (`WHATSRUST_API_TOKEN`) is still recommended even when loopback-only.
+6. Backfill (historical fetch) has three ban-critical knobs that are
    validated at startup and will **refuse to start** the daemon if violated
    without an explicit override (ADR 0022):
    - `WHATSRUST_BACKFILL_INTERVAL_SECS` — floor 3s (override:

@@ -140,6 +140,10 @@ against a *trusted* sidecar or rare inputs. Fix opportunistically or during a la
   `defer`-style cleanup opportunistically.
 - [ ] **(Med) Sidecar auto-respawn** — if the sidecar process dies, whatsrust doesn't restart it;
   semantic stays off until daemon restart (follow-up).
+- [ ] **(Low) Flaky test `embed_drain::tests::test_drain_worker_max_batch_clamp`** — it polls
+  with 50 ms sleeps against a wall-clock deadline and failed once in a full-suite run under heavy
+  memory pressure (swap ~32/34 GB), then passed 3/3 alone and in the next full run. Move it to
+  tokio's paused clock (as the ADR 0042 tests do) so it doesn't depend on machine load.
 
 *Double-checked and DISMISSED (do not re-investigate):*
 - **H1 "missing partial-coverage additive test" — FALSE.** `test_search_partial_coverage_keeps_unvectored`

@@ -2015,6 +2015,8 @@ fn print_cli_help() {
     println!("  WHATSRUST_BIND   API bind address (default: 127.0.0.1)");
     println!("  WHATSRUST_ALLOW_REMOTE=1  Permit non-loopback API binds");
     println!("  WHATSRUST_API_TOKEN  Optional API bearer token; required for remote binds");
+    println!("  WHATSRUST_ALLOWED_ORIGINS  Comma-separated allowed Origin values (default: none; see ADR 0044)");
+    println!("  WHATSRUST_ALLOWED_HOSTS   Comma-separated allowed Host values beyond loopback (default: none; see ADR 0044)");
     println!("  WHATSRUST_SEND_BURST     Max burst size before rate limit (default: 5)");
     println!("  WHATSRUST_SKIP_HISTORY_SYNC=1  Skip history sync (leaner pairing, but 1:1 DMs fail with 463; default: off)");
     println!("  WHATSRUST_DEVICE_NAME  Name shown in Linked Devices (default: whatsrust); used only when pairing");
