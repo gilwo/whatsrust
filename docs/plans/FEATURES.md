@@ -15,7 +15,7 @@ live in `docs/plans/*-design.md`; the *execution order* lives in
 
 ## Major Features
 
-### F1 — Historical message fetch + semantic/lexical search 🟡 In progress (Phase 0 GATE passed — GO)
+### F1 — Historical message fetch + semantic/lexical search 🟢 Done (M1 2026-07-20; M2 live-validated 2026-10-05)
 Per-chat historical backfill (`all` / `since:T` / `count:N`) + local FTS5 (lexical) + optional vector (semantic) search.
 - **Design:** `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md`; ADRs 0001–0036.
 - **Execution plan:** `docs/plans/IMPLEMENTATION-ROADMAP.md` (Phase 0 gate → M1 → M2).
@@ -39,7 +39,7 @@ Stateless separate binary, pure vectorizer; stdio JSON-RPC v1; transport-neutral
 - [x] Sidecar binary: MVP Python + sentence-transformers (paraphrase-multilingual-MiniLM-L12-v2, 384-dim) — DONE 2026-08-31; superseded as the deployment default by the native Rust sidecar (`embedder-rs/`, candle), serving MiniLM or **bge-m3** (default for `make run-semantic`) — DONE 2026-09-30 (ADR 0040/0039)
 - [x] Drain worker integration (ADR 0015), multi-model store + purge (ADR 0017) — DONE M2.3/M2.5
 
-### F3 — MCP streamable HTTP transport (on top of stdio) 🔵 Designed-lite / ⚪ needs design pass
+### F3 — MCP streamable HTTP transport (on top of stdio) 🟡 Design in progress (ADR 0045, Proposed)
 Add MCP Streamable HTTP transport alongside the existing stdio transport — so MCP clients
 can connect over HTTP (remote/multiplexed) in addition to spawn-as-child stdio.
 - **Current:** `src/mcp.rs` is **stdio-only** (JSON-RPC over stdin/stdout, proxies to the HTTP daemon).
@@ -48,6 +48,10 @@ can connect over HTTP (remote/multiplexed) in addition to spawn-as-child stdio.
 - **Open design questions (to grill before building):** auth/token model for the HTTP endpoint;
   bind/port (reuse api.rs raw-TCP server vs separate listener); session management & SSE streaming;
   whether it shares the API server's connection semaphore. → Write an ADR + design pass before impl.
+- **Update (2026-10-15):** investigated; direction is a stateless `POST /mcp` inside the daemon on the
+  existing API server (current MCP spec revision 2026-07-28 removed sessions), reusing the ADR 0044
+  request gate and one tool registry shared with stdio. Design doc
+  `docs/plans/2026-10-15-mcp-http-transport-design.md` + ADR 0045 (Proposed) in progress.
 - [ ] Design pass + ADR
 - [ ] Implementation
 
@@ -60,7 +64,61 @@ Run/route multiple WhatsApp accounts from one daemon (or coordinated daemons).
   per-account SQLite DB vs shared DB with account scoping; how the instance-lock model changes; how API/MCP/CLI
   select the target account (path prefix? header? tool param?); event-bus routing per account; QR/pairing per
   account; resource/memory implications vs the lean ethos. → Needs its own design doc + ADR(s).
-- [ ] Design doc + ADR(s)
+- **Investigation scope (2026-10-15):**
+  - **Storage:** one DB holding all accounts (account-scoped tables) vs one DB per account.
+  - **Process model:** one process per account vs one process hosting N bridges.
+  - **Every existing feature must work per account:** backfill and its pacing (anti-ban limits are
+    per account), FTS search, embeddings + the drain worker + per-model purge, the pairing-time
+    device name (ADR 0043), outbound queue and rate limiting, SSE events, the storage watchdog.
+  - **MCP and API addressing (open):** a tool/route parameter selecting the account vs a
+    per-account endpoint (e.g. `/mcp/<account>`, `/api/<account>/...`) vs one MCP server per
+    account process. Interacts with F3 (HTTP MCP) and F5 (profiles: per-account access?).
+  - **Cross-feature:** F6 (encryption): one key for all accounts or one per account.
+- [ ] Investigation + design doc + ADR(s)
+- [ ] Implementation
+
+### F5 — Access profiles: read-only vs full access ⚪ Planned (needs investigation)
+Run whatsrust with a **read-only** profile (list, read, search, status, history, events, and so
+on) as well as the current **full-access** behaviour, so an agent or remote client can be given
+read access without the ability to send, delete or change anything.
+- **Open questions (investigate before design):**
+  - **Where a profile applies:** per process (a startup setting), per token (e.g. a separate
+    read-only token alongside the full one), per transport (REST / MCP stdio / MCP HTTP), or a mix.
+  - **Classifying every operation:** some are clearly read-only (status, groups, group-info,
+    history, search, fetch-status, events, QR?). Others change state on WhatsApp without sending
+    a message (mark-read, typing/presence, subscribe, pin/mute/archive, the first
+    `group-invite-link` call), and `fetch-history` triggers network fetches with ban-risk pacing.
+    Each needs a deliberate classification.
+  - **Enforcement point:** the REST router (covers the CLI and the stdio MCP proxy) plus the MCP tool
+    registry, which F3 plans to give per-tool `readOnlyHint` / `destructiveHint` metadata so a
+    profile can filter `tools/list` as well as block calls.
+  - REPL behaviour under a read-only profile, and how this composes with the ADR 0044 request gate
+    and tokens.
+- **Related:** F3 (tool metadata hook), F4 (per-account profiles?).
+- [ ] Investigation + design + ADR
+- [ ] Implementation
+
+### F6 — Database encryption at rest ⚪ Planned (needs investigation)
+Encrypt `whatsapp.db`, which holds the Signal keys, the message history, the search index and
+embeddings.
+- **Unlock process (user's initial lean):** the passphrase is **entered when the daemon starts** —
+  not from an env var and not from a command-line argument (both leak through process listings,
+  shell history and `.env` files).
+- **Open questions (investigate before design):**
+  - **Mechanism:** SQLCipher via rusqlite's `bundled-sqlcipher` feature (page-level encryption,
+    covers the WAL too) vs alternatives. Impact on build, binary size and query speed, and FTS5 /
+    `incremental_vacuum` compatibility.
+  - **Prompting:** read from the terminal without echo, and before the REPL starts (the REPL owns
+    stdin). What happens with no terminal (`make run` from a script, launchd/systemd): fail closed
+    with a clear message? A later optional unlock source (e.g. the macOS Keychain)?
+  - **Migrating an existing plaintext DB**, wrong-passphrase handling, and passphrase change.
+  - **Everything else that holds a copy of the data:** startup and `--rollback` backups
+    (`whatsapp.db.backups/`, pre-migration `.bak` files) must be encrypted too, or they defeat the
+    point. `--rollback` / `--migrate` need the passphrase. The CLI and the stdio MCP process don't
+    open the DB (they talk to the daemon), so they need no passphrase.
+  - Key handling in memory, and the threat model (lost/stolen disk vs a live compromised machine).
+- **Related:** F4 (one key for all accounts or one per account).
+- [ ] Investigation + design + ADR
 - [ ] Implementation
 
 ---
