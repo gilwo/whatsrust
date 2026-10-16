@@ -17,7 +17,7 @@ Where to look for what — read the relevant doc before changing related code.
 | **Implementation execution plan (phases, gates, milestone exit criteria)** | `docs/plans/IMPLEMENTATION-ROADMAP.md` |
 | Design specs / plans (the "what/how" blueprints) | `docs/plans/*.md` |
 | Design review reports (cold reviews, reconciliation) | `_reviewer/design/` |
-| Historical fetch + lexical search (M1 — **DONE** 2026-07-20) / semantic search (M2 — **DONE**: code-complete 2026-09-30, live-validated 2026-10-05) | `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (+ ADRs 0001–0043) |
+| Historical fetch + lexical search (M1 — **DONE** 2026-07-20) / semantic search (M2 — **DONE**: code-complete 2026-09-30, live-validated 2026-10-05) | `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (+ ADRs 0001–0047) |
 
 When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md`, MADR format) and link it from `docs/adr/0000-index.md`.
 
@@ -51,7 +51,7 @@ When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md
 
 ## Patterns
 - SQLite-first sends: all outbound ops enqueue to SQLite via `enqueue_job()`, worker executes via `execute_job()`
-- `enqueue_and_wait()` subscribes to broadcast BEFORE enqueue for sync send methods
+- `enqueue_and_wait()` subscribes to broadcast BEFORE enqueue for sync send methods; times out after 30s (ADR 0047), returning `SendTimedOut { job_id }` so the caller (REST → 504 + job_id + "do not retry") can report it without the job being cancelled (it stays queued and is usually delivered later)
 - `parse_jid()` for JID normalization (phone → @s.whatsapp.net, group → @g.us)
 - `parking_lot::Mutex<Connection>` + `spawn_blocking` for SQLite
 - `extract_content_inner` recursive descent for inbound message parsing
@@ -65,3 +65,4 @@ When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md
 - Embedder sidecar: stateless stdio JSON-RPC process (primary: Rust + candle, ADR 0040 — bge-m3 default, MiniLM selectable via `--model`/`WHATSRUST_EMBEDDER_MODEL`/`make run-semantic EMBED_MODEL=minilm`; legacy: Python + sentence-transformers); embedding-drain worker (independent task, set-difference, multi-model, circuit-breaker at pathological-pending ceiling); per-model purge via `purge_embeddings(model_id)` (incremental_vacuum, exposed in API/MCP/CLI)
 - SQLite-first backfill: durable `backfill_jobs` queue + single FIFO worker + connection-gating (defer, not fail, when disconnected)
 - Device name fixed at pairing (ADR 0043): `WHATSRUST_DEVICE_NAME` (default `whatsrust`) is used only while the device is unpaired, then saved as `metadata.device_name`; once paired the saved name wins and the env var is ignored. `clear_device()` (on logout) deletes it with the credentials, so a re-pair picks up the current value. Library consumers set `BridgeConfig.device_name` directly.
+- MCP argument validation (ADR 0046): `call_tool` applies `validated_args(name, args)` at a single choke point, rejecting undeclared keys (isError, nothing sent) before any HTTP request; every tool schema sets `additionalProperties: false`; undeclared keys (notably REST-only `path` for local-file media reads) are unreachable via MCP

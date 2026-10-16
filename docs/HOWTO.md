@@ -317,6 +317,14 @@ Cursor, etc.) over JSON-RPC/stdio.
    `whatsrust_fetch_status`, `whatsrust_fetch_cancel`,
    `whatsrust_purge_embeddings`, etc.) — see `README.md` § "MCP server
    for AI agents" for the full narrative list.
+4. **MCP-specific behaviour (ADR 0046):** undeclared arguments are rejected
+   (isError naming them); media tools accept only base64 `data` — the local-file
+   `path` mode (available in the REST API for CLI use) is unreachable via MCP.
+   `whatsrust_contact` takes `phone` (international format, digits only), not a
+   pre-built vCard. `whatsrust_send` via MCP has no link preview or scheduling —
+   use REST async `/api/send` for those. Synchronous sends that time out (30 s)
+   return HTTP 504 with `job_id` and "do not retry" (ADR 0047); the job stays
+   queued and is usually delivered later.
 
 **Verification:** the daemon's `/api/status` responding (§3) implies MCP tool
 calls will succeed, since MCP mode has no state of its own beyond the proxy —

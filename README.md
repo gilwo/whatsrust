@@ -254,7 +254,7 @@ Output:
 
 Plus: SSE streaming (`GET /api/events` -- outbound status, backfill progress per-batch/on-completion, storage-growth alerts), groups, presence, health check, QR.
 
-Async sends return `{ok, job_id}`. Add `?sync=true` to wait for the WhatsApp message ID.
+Async sends return `{ok, job_id}`. Add `?sync=true` to wait for the WhatsApp message ID. A sync send that times out (30 s) returns HTTP 504 with `{ok: false, code: "timeout", error: "...", job_id: N}` and says "do not retry" — the job stays queued and is usually delivered later (ADR 0047).
 
 ### API security
 
@@ -284,6 +284,8 @@ opt into a non-loopback bind (`WHATSRUST_ALLOW_REMOTE=1`).
 Run `whatsrust mcp` to start a Model Context Protocol server with 34 tools over JSON-RPC stdio. Connect it to Claude Code, Cursor, or any MCP-compatible AI agent and your agent can send messages, manage groups, post stories, handle chat operations, and search or backfill chat history (`whatsrust_search`, `whatsrust_fetch_history`, `whatsrust_fetch_status`, `whatsrust_fetch_cancel`) through WhatsApp.
 
 Works out of the box with Claude Code -- just add it to your MCP config and your AI agent gets full WhatsApp access.
+
+**MCP-specific behaviour (ADR 0046):** undeclared arguments are rejected (isError naming them); media tools (`whatsrust_image`, `whatsrust_status_image`, `whatsrust_status_video`) accept only base64 `data` — the local-file `path` mode (available in the REST API for CLI use) is unreachable via MCP. The `whatsrust_contact` tool takes `phone` (international format, digits only, e.g. `972500000000`), not a pre-built vCard. `whatsrust_send` via MCP has no link preview or scheduling — use REST async `/api/send` for those.
 
 ---
 

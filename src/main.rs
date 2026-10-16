@@ -332,13 +332,15 @@ async fn async_main() -> Result<()> {
     let semantic_query_timeout_secs: u64 =
         parse_env_or("WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS", bf_default.semantic_query_timeout_secs);
     // ADR 0042: the CLI (`api.rs::cli_get`) and MCP (`mcp.rs::http_get`/`http_post`) clients
-    // both give up after 30s. A budget >= 30s means those callers would time out before
-    // `search` itself falls back, so warn loudly at startup.
-    if semantic_query_timeout_secs >= 30 {
+    // both give up after `SYNC_CLIENT_TIMEOUT`. A budget >= that means those callers would
+    // time out before `search` itself falls back, so warn loudly at startup.
+    let client_timeout_secs = bridge::SYNC_CLIENT_TIMEOUT.as_secs();
+    if semantic_query_timeout_secs >= client_timeout_secs {
         warn!(
             semantic_query_timeout_secs,
-            "WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS >= 30s — the CLI/MCP clients give up after 30s \
-             and would time out before search falls back to lexical (ADR 0042)"
+            client_timeout_secs,
+            "WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS >= the CLI/MCP client timeout — the clients give up \
+             before search falls back to lexical (ADR 0042)"
         );
     }
 

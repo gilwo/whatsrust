@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
-use crate::bridge::{BridgeState, WhatsAppBridge};
+use crate::bridge::{BridgeState, SendTimedOut, WhatsAppBridge, SYNC_CLIENT_TIMEOUT};
 use crate::qr::QrRender;
 
 /// Maximum concurrent SSE connections (separate from request semaphore).
@@ -26,6 +26,10 @@ const SSE_MAX_CONNECTIONS: usize = 8;
 const SSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Heartbeat interval for SSE keepalive.
 const SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// Appended to a POST client's timeout/read-failure text: the daemon may already have accepted
+/// the request and may still complete it, so the caller must check before retrying.
+pub(crate) const POST_OUTCOME_UNKNOWN: &str =
+    "the request may still be processed by the daemon; check before retrying";
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
@@ -165,8 +169,20 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Vec<u8>>
     serde_json::from_slice(body).map_err(|e| json_err(400, &format!("invalid JSON: {e}")))
 }
 
+/// 504 for a sync send that timed out while its job is still queued. Carries the `job_id`
+/// and a "do not retry" message so a client does not re-send and deliver a duplicate.
+fn send_timeout_response(t: &SendTimedOut) -> Vec<u8> {
+    let body = json!({"ok": false, "code": "timeout", "error": t.to_string(), "job_id": t.job_id});
+    json_response(504, &body.to_string())
+}
+
 /// Classify bridge errors into HTTP status codes for machine-friendly responses.
+/// A [`SendTimedOut`] anywhere in the error chain wins (found by downcast, so added
+/// `.context()` layers cannot hide it); every other error is classified by message.
 fn bridge_err(e: anyhow::Error) -> Vec<u8> {
+    if let Some(t) = e.chain().find_map(|c| c.downcast_ref::<SendTimedOut>()) {
+        return send_timeout_response(t);
+    }
     let msg = e.to_string();
     let status = if msg.contains("not connected") || msg.contains("no client") {
         503
@@ -1869,13 +1885,17 @@ pub async fn cli_get(port: u16, path: &str) -> anyhow::Result<(u16, Vec<u8>)> {
     stream.shutdown().await?;
 
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut buf))
+    tokio::time::timeout(SYNC_CLIENT_TIMEOUT, stream.read_to_end(&mut buf))
         .await
         .map_err(|_| anyhow::anyhow!("timeout reading response from daemon"))??;
     parse_cli_response(&buf)
 }
 
 /// Send a POST request with JSON body to the running daemon.
+///
+/// Waits up to [`SYNC_CLIENT_TIMEOUT`] (longer than the daemon's own sync-send wait) so the
+/// daemon's 504 + job_id normally arrives first. A timeout or read failure here leaves the
+/// outcome unknown, so the error says the request may still be processed.
 pub async fn cli_post(port: u16, path: &str, body: &str) -> anyhow::Result<(u16, Vec<u8>)> {
     let host = cli_connect_host(&api_bind_host());
     let auth_header = configured_api_token()
@@ -1891,9 +1911,10 @@ pub async fn cli_post(port: u16, path: &str, body: &str) -> anyhow::Result<(u16,
     stream.shutdown().await?;
 
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut buf))
+    tokio::time::timeout(SYNC_CLIENT_TIMEOUT, stream.read_to_end(&mut buf))
         .await
-        .map_err(|_| anyhow::anyhow!("timeout reading response from daemon"))??;
+        .map_err(|_| anyhow::anyhow!("timeout reading response from daemon; {POST_OUTCOME_UNKNOWN}"))?
+        .map_err(|e| anyhow::anyhow!("failed reading response from daemon: {e}; {POST_OUTCOME_UNKNOWN}"))?;
     parse_cli_response(&buf)
 }
 
@@ -2571,5 +2592,98 @@ mod tests {
         let _ = cli_post(port, "/api/send", r#"{"jid":"1@s.whatsapp.net","text":"hi"}"#).await;
         let decision = server.await.unwrap();
         assert!(decision.is_ok(), "cli_post's request must pass the gate: {decision:?}");
+    }
+
+    // -------------------------------------------------------------------------
+    // Sync-send timeout: typed SendTimedOut -> 504 with job_id + "do not retry",
+    // and clients that outwait the daemon (and warn on POST read failures).
+    // -------------------------------------------------------------------------
+
+    fn assert_send_timeout_response(raw: &[u8], job_id: i64) {
+        assert_eq!(http_status_of(raw), 504);
+        let body = parse_response_json(raw);
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["code"], json!("timeout"));
+        assert_eq!(body["job_id"], json!(job_id));
+        let msg = body["error"].as_str().expect("error message");
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(msg.contains("still queued"), "{msg}");
+        assert!(msg.contains("do not retry"), "{msg}");
+        assert!(msg.contains(&format!("job {job_id}")), "{msg}");
+    }
+
+    #[test]
+    fn test_bridge_err_send_timed_out_is_504_with_job_id_and_do_not_retry() {
+        let raw = bridge_err(anyhow::Error::new(SendTimedOut { job_id: 42 }));
+        assert_send_timeout_response(&raw, 42);
+    }
+
+    #[test]
+    fn test_bridge_err_finds_send_timed_out_under_context_layers() {
+        let wrapped = anyhow::Error::new(SendTimedOut { job_id: 7 })
+            .context("sending reply")
+            .context("handling request");
+        let raw = bridge_err(wrapped);
+        assert_send_timeout_response(&raw, 7);
+    }
+
+    #[test]
+    fn test_bridge_err_other_errors_keep_their_status_and_carry_no_job_id() {
+        let cases = [
+            ("client not connected", 503),
+            ("no client", 503),
+            ("bad JID: x", 400),
+            ("empty JID", 400),
+            ("sender_jid required for group reactions", 400),
+            ("upstream request timed out", 504), // old string mapping is unchanged
+            ("boom", 500),
+        ];
+        for (msg, status) in cases {
+            let raw = bridge_err(anyhow::anyhow!(msg));
+            assert_eq!(http_status_of(&raw), status, "{msg}");
+            assert!(parse_response_json(&raw).get("job_id").is_none(), "{msg}: no job_id without a typed timeout");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_sync_send_timeout_over_rest_returns_504_with_the_queued_job_id() {
+        // Full path: handle_send(sync) -> enqueue_and_wait (no worker, virtual 30s) -> bridge_err.
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let db_path = std::env::temp_dir().join(format!("whatsrust-sync-timeout-test-{ts}.db"));
+        let bridge = crate::bridge::build_test_bridge_with_embedder(
+            &db_path,
+            crate::embedder::FakeEmbedder::new("test-model", 8),
+        )
+        .await;
+
+        let response = handle_send(&bridge, br#"{"jid":"1@s.whatsapp.net","text":"hi"}"#, true).await;
+
+        let queued = bridge
+            .store()
+            .claim_next_job()
+            .await
+            .unwrap()
+            .expect("the timed-out job must still be queued");
+        assert_send_timeout_response(&response, queued.id);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cli_post_client_timeout_says_request_may_still_be_processed() {
+        // Accepts at the kernel level (listen backlog) but never answers.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let start = tokio::time::Instant::now();
+        let err = cli_post(port, "/api/send", r#"{"jid":"1@s.whatsapp.net","text":"hi"}"#)
+            .await
+            .expect_err("no reply, so the client must time out");
+
+        assert!(start.elapsed() >= SYNC_CLIENT_TIMEOUT, "must wait the shared client timeout");
+        let msg = err.to_string();
+        assert!(msg.contains("timeout reading response"), "{msg}");
+        assert!(msg.contains("may still be processed"), "{msg}");
+        drop(listener);
     }
 }
