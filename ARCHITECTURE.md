@@ -11,7 +11,7 @@ src/
   media_utils.rs     Media enrichment: image dims + JPEG thumbnails, audio waveform data
   bridge_events.rs   Broadcast event bus: BridgeEvent, OutboundStatusEvent, DeliveryStatus
   api.rs             REST API (59 endpoints), SSE streaming, CLI HTTP client
-  mcp.rs             MCP server (35 tools, JSON-RPC over stdio)
+  mcp.rs             MCP server (34 tools, JSON-RPC over stdio)
   storage.rs         rusqlite Signal Protocol store + typed job queue + v8 unified messages table (FTS5 search, embed_status) + embeddings (multi-model BLOB vectors) + backfill queue/cursor
   backfill.rs        Historical backfill worker: two-phase on-demand fetch (HistoryCorrelator), FIFO pagination, contained-C targets, pacer, 3-level abort
   embedder.rs        Embedder trait (sidecar contract), StdioEmbedder (JSON-RPC stdio), FakeEmbedder (test seam), cosine_similarity
@@ -83,11 +83,11 @@ src/
 
 **M1** (per-chat historical backfill + FTS5 lexical search) is **complete** — all four sub-milestones shipped and live-E2E-validated. It builds a local, searchable message archive alongside the live timeline.
 
-**M2** (semantic/embedding-based search, sidecar-backed) is **code-complete** (embedder sidecar contract + drain worker + hybrid recall, ADR 0041, + multi-model purge); end-to-end validation against a live daemon is **pending**. Semantic search is **opt-in** via `WHATSRUST_EMBEDDER_CMD` and **dormant** (degrades gracefully to FTS5 lexical) when the sidecar is absent or down. (ADR 0006/0008/0015-0017/0024/0038/0039/0041)
+**M2** (semantic/embedding-based search, sidecar-backed) is **complete** (embedder sidecar contract + drain worker + hybrid recall, ADR 0041, + multi-model purge; code-complete 2026-09-30, live-validated 2026-10-05). Semantic search is **opt-in** via `WHATSRUST_EMBEDDER_CMD` and **dormant** (degrades gracefully to FTS5 lexical) when the sidecar is absent or down. (ADR 0006/0008/0015-0017/0024/0038/0039/0041)
 
 ### Schema (v8)
 
-`messages` is a single unified table for both live and backfilled history: `chat_jid`, `sender_jid`, `message_id` (unique), `content_kind`, `body_text`, `timestamp`, `from_me`, `source` (`'live'` | `'backfill'`), `embed_status` (`'pending'`/`'embedded'`/`'failed'`/`'skipped'` — tracks embedding-drain worker progress) (ADR 0009/0016). Sibling tables: `media_refs` (lazily-hydrated media pointers, ADR 0005), `embeddings` (multi-model BLOB vector storage with composite PK `(message_id, model_id)`, ADR 0017 — M2.1–M2.5 complete, wiring pending), `backfill_cursor` (per-chat frontier: oldest known message + `more_remain`/`exhausted` flags, ADR 0003), `backfill_jobs` (durable job queue, ADR 0010/0033), and `metadata` (generic KV singletons, e.g. the storage-watchdog baseline, ADR 0036, and the `device_name` fixed at pairing, ADR 0043).
+`messages` is a single unified table for both live and backfilled history: `chat_jid`, `sender_jid`, `message_id` (unique), `content_kind`, `body_text`, `timestamp`, `from_me`, `source` (`'live'` | `'backfill'`), `embed_status` (`'pending'`/`'embedded'`/`'failed'`/`'skipped'` — tracks embedding-drain worker progress) (ADR 0009/0016). Sibling tables: `media_refs` (lazily-hydrated media pointers, ADR 0005), `embeddings` (multi-model BLOB vector storage with composite PK `(message_id, model_id)`, ADR 0017 — M2 complete), `backfill_cursor` (per-chat frontier: oldest known message + `more_remain`/`exhausted` flags, ADR 0003), `backfill_jobs` (durable job queue, ADR 0010/0033), and `metadata` (generic KV singletons, e.g. the storage-watchdog baseline, ADR 0036, and the `device_name` fixed at pairing, ADR 0043).
 
 `messages_fts` is an external-content FTS5 index (`content='messages'`, `content_rowid='id'`, `unicode61 remove_diacritics 2` tokenizer for Hebrew/Arabic/multilingual support) kept in sync by `'delete'`-command AFTER INSERT/UPDATE/DELETE triggers on `messages` (ADR 0019). The v7→v8 upgrade is a staged copy-then-drop migration: pristine pre-migration backup → FTS5 availability probe → migrate inside one transaction → post-commit validation → circuit-breaker pin (blocks retry-looping a broken migration) with `--rollback`/`--migrate` recovery flags (ADR 0028-0032). Everything still runs through the single `Arc<parking_lot::Mutex<Connection>>`.
 
