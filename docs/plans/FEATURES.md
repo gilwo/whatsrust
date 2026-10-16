@@ -2,7 +2,7 @@
 
 **Type:** Live document — kept up to date as features land. Update the **Status** of an
 item when work starts/completes; add a dated note in its row's detail.
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 This is the single tracking surface for in-flight and planned work on this experimental
 fork. The *why* for each design lives in the ADRs (`docs/adr/`); the *what/how* blueprints
@@ -39,21 +39,26 @@ Stateless separate binary, pure vectorizer; stdio JSON-RPC v1; transport-neutral
 - [x] Sidecar binary: MVP Python + sentence-transformers (paraphrase-multilingual-MiniLM-L12-v2, 384-dim) — DONE 2026-08-31; superseded as the deployment default by the native Rust sidecar (`embedder-rs/`, candle), serving MiniLM or **bge-m3** (default for `make run-semantic`) — DONE 2026-09-30 (ADR 0040/0039)
 - [x] Drain worker integration (ADR 0015), multi-model store + purge (ADR 0017) — DONE M2.3/M2.5
 
-### F3 — MCP streamable HTTP transport (on top of stdio) 🟡 Design in progress (ADR 0045, Proposed)
+### F3 — MCP streamable HTTP transport (on top of stdio) 🔵 Designed
 Add MCP Streamable HTTP transport alongside the existing stdio transport — so MCP clients
 can connect over HTTP (remote/multiplexed) in addition to spawn-as-child stdio.
-- **Current:** `src/mcp.rs` is **stdio-only** (JSON-RPC over stdin/stdout, proxies to the HTTP daemon).
-- **Goal:** support the MCP **Streamable HTTP** transport (single endpoint, POST + optional SSE stream)
-  as an opt-in alongside stdio; reuse the existing tool dispatch.
-- **Open design questions (to grill before building):** auth/token model for the HTTP endpoint;
-  bind/port (reuse api.rs raw-TCP server vs separate listener); session management & SSE streaming;
-  whether it shares the API server's connection semaphore. → Write an ADR + design pass before impl.
-- **Update (2026-10-15):** investigated; direction is a stateless `POST /mcp` inside the daemon on the
-  existing API server (current MCP spec revision 2026-07-28 removed sessions), reusing the ADR 0044
-  request gate and one tool registry shared with stdio. Design doc
-  `docs/plans/2026-10-15-mcp-http-transport-design.md` + ADR 0045 (Proposed) in progress.
-- [ ] Design pass + ADR
-- [ ] Implementation
+- **Status:** ADR 0045 accepted 2026-10-16; implementation not started.
+- **Design:** A dedicated `/mcp` listener runs inside the daemon on its own port (`WHATSRUST_MCP_PORT`, off by default), serving only the `/mcp` route. Supports dual-era clients: modern (2026-07-28) and legacy (2025-11-25, 2025-06-18) from one stateless endpoint. In-process dispatch to existing REST handlers via a shared tool registry (`src/mcp_registry.rs`). Separate configuration: `WHATSRUST_MCP_TOKEN` (required, ≥22 characters, must differ from `WHATSRUST_API_TOKEN`), `WHATSRUST_MCP_BIND` (default `127.0.0.1`, independent of `WHATSRUST_BIND`), `WHATSRUST_MCP_ALLOW_REMOTE` (opt-in for non-loopback bind, logs loud warning), and `WHATSRUST_MCP_READ_ONLY` (server-side read-only switch). Stdio proxy stays unchanged.
+- **References:** Design doc `docs/plans/2026-10-15-mcp-http-transport-design.md`, ADR 0045.
+- [x] Design pass + ADR
+- [ ] Phase 0a: Pure refactors (head/body split, ApiResponse, RestRequest, CallContext)
+- [ ] Phase 0b: Config enforcement (token policy, bind both listeners in main())
+- [ ] Phase 1: Shared registry (access_class, integral float normalisation, ADR 0046 amendment)
+- [ ] Phase 2: `/mcp` skeleton (opt-in, separate bind, routing, era detection, read-only switch)
+- [ ] Phase 3: Legacy request handling (lanes, golden test, official SDK test, proxy snippet tested)
+- [ ] Phase 4: Modern request handling (dual-era staging)
+- [ ] Phase 5: Polish, logging, metrics, documentation
+- **Follow-ups (planned, not in MVP):**
+  - Native TLS for the MCP listener (first release uses a reverse proxy for HTTPS)
+  - Two-token rotation with overlap (requires daemon restart today)
+  - `whatsrust_send_async` tool (non-blocking send, returns job_id immediately)
+  - F5 per-token access profiles, built on the `AccessClass` infrastructure
+  - Rate limiting for read operations and non-queued network-touching tools (no owner yet; separate effort from F5)
 
 ### F4 — Multi-account support ⚪ Planned (needs design)
 Run/route multiple WhatsApp accounts from one daemon (or coordinated daemons).
@@ -90,8 +95,8 @@ read access without the ability to send, delete or change anything.
     `group-invite-link` call), and `fetch-history` triggers network fetches with ban-risk pacing.
     Each needs a deliberate classification.
   - **Enforcement point:** the REST router (covers the CLI and the stdio MCP proxy) plus the MCP tool
-    registry, which F3 plans to give per-tool `readOnlyHint` / `destructiveHint` metadata so a
-    profile can filter `tools/list` as well as block calls.
+    registry. F3 adds a server-side access class (Read/Write) in the tool registry, plus the
+    `WHATSRUST_MCP_READ_ONLY` switch. Profiles build on the access class, not on the advisory hints.
   - REPL behaviour under a read-only profile, and how this composes with the ADR 0044 request gate
     and tokens.
 - **Related:** F3 (tool metadata hook), F4 (per-account profiles?).

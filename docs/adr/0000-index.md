@@ -57,6 +57,7 @@ This directory contains Architecture Decision Records (ADRs) for the whatsrust p
 | [0042](0042-cancellation-safe-sidecar-client-and-bounded-query-wait.md) | Cancellation-safe sidecar client; bounded query-embed wait with cool-down | 2026-10-05 | Accepted |
 | [0043](0043-device-name-fixed-at-pairing.md) | Device name is fixed at pairing and stored with the session | 2026-10-13 | Accepted |
 | [0044](0044-api-origin-host-content-type-hardening.md) | Origin/Host/Content-Type gate closes CSRF and DNS-rebinding holes in the API server | 2026-10-14 | Accepted |
+| [0045](0045-mcp-streamable-http-transport-in-daemon.md) | MCP Streamable HTTP transport via dedicated `/mcp` listener inside the daemon | 2026-10-15 | Accepted |
 | [0046](0046-mcp-forwards-only-declared-tool-arguments.md) | MCP forwards only declared tool arguments | 2026-10-15 | Accepted |
 | [0047](0047-sync-send-timeout-returns-job-id.md) | Sync send timeout returns job_id and says "do not retry" | 2026-10-15 | Accepted |
 
