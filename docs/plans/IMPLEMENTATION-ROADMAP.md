@@ -144,6 +144,9 @@ against a *trusted* sidecar or rare inputs. Fix opportunistically or during a la
   with 50 ms sleeps against a wall-clock deadline and failed once in a full-suite run under heavy
   memory pressure (swap ~32/34 GB), then passed 3/3 alone and in the next full run. Move it to
   tokio's paused clock (as the ADR 0042 tests do) so it doesn't depend on machine load.
+- [ ] **(Med) Native TLS for the MCP listener** — F3 follow-up; until then a non-loopback MCP bind sends the token in cleartext.
+- [ ] **(Low) Two-token rotation for the MCP listener** — F3 follow-up; requires daemon restart today.
+- [ ] **(Med) Rate limiting for MCP reads and chat-management operations** — no owner yet; F5 does not cover it.
 - [x] **(Med) MCP `whatsrust_send` tool schema declares `link_preview` and `schedule_at`**, but it
   calls `/api/send?sync=true`, which rejects both with 400 → the params can never work via MCP. **RESOLVED 2026-10-15:** both fields removed from the MCP schema; REST and CLI keep them.
 - [ ] **(Low) `/api/contact` keeps a leading `+` in `phone`** and then prepends its own `+`,
@@ -165,6 +168,21 @@ against a *trusted* sidecar or rare inputs. Fix opportunistically or during a la
   **312 lib / 327 bin** green (+ fake-embedder suite 333) — the reviewer read notes, not `cargo test`.
 - **M5 (LoadingTimer / `Instant` monotonicity)** — premise is largely incorrect (`Instant` is
   monotonic and unaffected by NTP); no action beyond an optional doc note.
+
+---
+
+## F3 — MCP Streamable HTTP listener (designed, not started)
+
+**Goal:** Dedicated `/mcp` HTTP listener inside the daemon for MCP clients, alongside the existing stdio transport.
+
+**Phases:** See design doc §14 (`docs/plans/2026-10-15-mcp-http-transport-design.md`) for detailed phase descriptions and exit criteria.
+- Phase 0a: Pure refactors (head/body split, ApiResponse, RestRequest, CallContext, HTTP helpers)
+- Phase 0b: Config enforcement (token policy, bind both listeners in main() before bridge start, ADR 0044 amendment)
+- Phase 1: Shared registry (access_class, integral float normalisation, ADR 0046 amendment, mcp.rs:644 test change)
+- Phase 2: `/mcp` skeleton (opt-in, separate bind, routing, era detection, read-only switch)
+- Phase 3: Legacy request handling (lanes, golden test, official SDK test, proxy snippet tested — primary path for initial release)
+- Phase 4: Modern request handling (instructions text notes message text is untrusted, history/search descriptions note untrusted)
+- Phase 5: Polish, logging, metrics, documentation
 
 ---
 

@@ -18,6 +18,7 @@ Where to look for what — read the relevant doc before changing related code.
 | Design specs / plans (the "what/how" blueprints) | `docs/plans/*.md` |
 | Design review reports (cold reviews, reconciliation) | `_reviewer/design/` |
 | Historical fetch + lexical search (M1 — **DONE** 2026-07-20) / semantic search (M2 — **DONE**: code-complete 2026-09-30, live-validated 2026-10-05) | `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (+ ADRs 0001–0047) |
+| MCP Streamable HTTP listener (F3 — designed, ADR 0045 accepted; not implemented) | `docs/plans/2026-10-15-mcp-http-transport-design.md` (+ ADRs 0045–0047) |
 
 When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md`, MADR format) and link it from `docs/adr/0000-index.md`.
 
