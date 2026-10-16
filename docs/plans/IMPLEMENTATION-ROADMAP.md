@@ -144,6 +144,16 @@ against a *trusted* sidecar or rare inputs. Fix opportunistically or during a la
   with 50 ms sleeps against a wall-clock deadline and failed once in a full-suite run under heavy
   memory pressure (swap ~32/34 GB), then passed 3/3 alone and in the next full run. Move it to
   tokio's paused clock (as the ADR 0042 tests do) so it doesn't depend on machine load.
+- [x] **(Med) MCP `whatsrust_send` tool schema declares `link_preview` and `schedule_at`**, but it
+  calls `/api/send?sync=true`, which rejects both with 400 → the params can never work via MCP. **RESOLVED 2026-10-15:** both fields removed from the MCP schema; REST and CLI keep them.
+- [ ] **(Low) `/api/contact` keeps a leading `+` in `phone`** and then prepends its own `+`,
+  producing `TEL:++972…`. Strip leading `+` in `handle_contact`.
+- [ ] **(Low) `enqueue_and_wait` skips `Lagged` broadcast errors**; a lagged receiver can miss the
+  Sent event and report a timeout for a job that was sent (covered by the 504 wording; consider
+  re-checking the job row on timeout).
+- [ ] **(Low) Add an MCP `whatsrust_send_async` tool** (jid, text, mentions, link_preview,
+  schedule_at → job_id) if an agent needs scheduling or link previews — currently both are only
+  available via REST async `/api/send`.
 
 *Double-checked and DISMISSED (do not re-investigate):*
 - **H1 "missing partial-coverage additive test" — FALSE.** `test_search_partial_coverage_keeps_unvectored`

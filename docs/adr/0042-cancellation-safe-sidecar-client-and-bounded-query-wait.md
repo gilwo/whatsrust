@@ -71,3 +71,12 @@ wait per search; the logs show what is slow and why.
 **Negative:** a search can take up to the budget (20 s by default) when the sidecar is slow; one more
 setting; the cool-down can briefly hide semantic results after a stall has ended, until the next
 successful embed resets it.
+
+## Amendment (2026-10-15)
+
+ADR 0047 raised the CLI and MCP client timeout from 30 s to `SYNC_CLIENT_TIMEOUT` (45 s) so the
+daemon's structured timeout response for synchronous sends (504 + job_id + "do not retry") arrives
+first. The startup warning for `WHATSRUST_SEMANTIC_QUERY_TIMEOUT_SECS` now fires at `>=
+SYNC_CLIENT_TIMEOUT` (45 s) instead of `>= 30 s`, because that is the effective ceiling for
+interactive calls. The default query-embed budget (20 s) still stays comfortably below the client
+timeout.

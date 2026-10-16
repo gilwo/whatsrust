@@ -50,6 +50,41 @@ const MSG_CACHE_CAP: usize = 256;
 /// TTL for cached group metadata (5 minutes).
 const GROUP_CACHE_TTL: Duration = Duration::from_secs(300);
 
+/// How long a synchronous send (`enqueue_and_wait`) waits for the outbound worker to report
+/// the job Sent/Failed before giving up with [`SendTimedOut`].
+pub const SYNC_SEND_WAIT: Duration = Duration::from_secs(30);
+
+/// Extra time a client waits beyond [`SYNC_SEND_WAIT`], so the daemon's structured 504
+/// (carrying the job_id) reaches it before the client's own read timeout fires.
+const CLIENT_WAIT_MARGIN: Duration = Duration::from_secs(15);
+
+/// Read timeout for clients (CLI, MCP) calling an endpoint that may block for up to
+/// [`SYNC_SEND_WAIT`]. Strictly longer than the daemon's wait, so a slow send surfaces as
+/// the daemon's 504 (with job_id and "do not retry") instead of a bare client-side timeout.
+pub const SYNC_CLIENT_TIMEOUT: Duration = SYNC_SEND_WAIT.saturating_add(CLIENT_WAIT_MARGIN);
+
+/// A synchronous send was not reported Sent/Failed within [`SYNC_SEND_WAIT`]. The job is
+/// still queued and is usually delivered later, so the caller must NOT retry the send
+/// (that would deliver a duplicate); `job_id` identifies the queued job.
+#[derive(Debug)]
+pub struct SendTimedOut {
+    /// Outbound queue job that is still pending delivery.
+    pub job_id: i64,
+}
+
+impl std::fmt::Display for SendTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "send timed out after {}s: job {} is still queued and may still be delivered; do not retry",
+            SYNC_SEND_WAIT.as_secs(),
+            self.job_id
+        )
+    }
+}
+
+impl std::error::Error for SendTimedOut {}
+
 // ---------------------------------------------------------------------------
 // Group metadata cache
 // ---------------------------------------------------------------------------
@@ -822,9 +857,9 @@ pub struct BridgeConfig {
     pub semantic_scan_cap: usize,
     /// Overall budget in seconds for `search`'s query-embed path — covers both waiting for
     /// the sidecar to finish loading AND waiting for the embed reply (ADR 0042, default: 20).
-    /// Kept below the CLI/MCP client timeouts (30s, `api.rs::cli_get`, `mcp.rs::http_get`/
-    /// `http_post`) so an interactive caller never gives up before `search` itself does; a
-    /// configured value >= 30 logs a startup warning.
+    /// Kept below the CLI/MCP client timeouts ([`SYNC_CLIENT_TIMEOUT`], `api.rs::cli_get`,
+    /// `mcp.rs::http_get`/`http_post`) so an interactive caller never gives up before `search`
+    /// itself does; a configured value >= that timeout logs a startup warning.
     pub semantic_query_timeout_secs: u64,
 }
 
@@ -1821,12 +1856,16 @@ impl WhatsAppBridge {
 
     /// Enqueue a job, wait for the outbound worker to send it, return the WA message ID.
     /// Subscribes to the event bus *before* enqueueing to avoid missing the Sent event.
+    ///
+    /// If no Sent/Failed event arrives within [`SYNC_SEND_WAIT`] the job stays queued (and is
+    /// usually delivered later), so this returns a [`SendTimedOut`] carrying the job_id —
+    /// reachable via `anyhow::Error::downcast_ref` / `chain()` — rather than a plain string.
     async fn enqueue_and_wait(&self, jid: &str, op_kind: crate::outbound::OutboundOpKind, payload_json: &str, payload_blob: Option<Vec<u8>>) -> Result<String> {
         // Subscribe BEFORE enqueue to avoid race with fast worker
         let mut rx = self.event_tx.subscribe();
         let job_id = self.enqueue_op(jid, op_kind, payload_json, payload_blob).await?;
 
-        let timeout = tokio::time::timeout(Duration::from_secs(30), async {
+        let timeout = tokio::time::timeout(SYNC_SEND_WAIT, async {
             loop {
                 match rx.recv().await {
                     Ok(evt) => {
@@ -1854,7 +1893,7 @@ impl WhatsAppBridge {
                 }
             }
         });
-        timeout.await.context("send timed out (30s)")?
+        timeout.await.map_err(|_| SendTimedOut { job_id })?
     }
 
     /// Enqueue an outbound job and wake the worker. Returns the job_id.
@@ -6824,6 +6863,59 @@ mod tests {
             crate::embed_drain::SEMANTIC_COOLDOWN_INITIAL,
             "a successful embed from search must reset the doubling window back to baseline"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Sync-send timeout: typed SendTimedOut carrying the still-queued job_id ---
+
+    #[test]
+    fn test_sync_client_timeout_is_strictly_longer_than_sync_send_wait() {
+        // Clients must outlast the daemon's wait so its 504 (job_id, "do not retry") reaches them.
+        assert!(SYNC_CLIENT_TIMEOUT > SYNC_SEND_WAIT);
+    }
+
+    #[test]
+    fn test_send_timed_out_display_states_timeout_job_id_and_do_not_retry() {
+        let msg = SendTimedOut { job_id: 42 }.to_string();
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(msg.contains(&format!("{}s", SYNC_SEND_WAIT.as_secs())), "{msg}");
+        assert!(msg.contains("job 42"), "{msg}");
+        assert!(msg.contains("still queued") && msg.contains("may still be delivered"), "{msg}");
+        assert!(msg.contains("do not retry"), "{msg}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_enqueue_and_wait_timeout_returns_typed_error_and_leaves_job_queued() {
+        // No outbound worker runs in the test bridge, so no Sent/Failed event ever arrives and
+        // the (virtual-time) wait expires. The job must remain queued and be named in the error.
+        let dir = std::env::temp_dir().join(format!("test_sync_send_timeout_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let bridge = build_test_bridge_with_embedder(&db_path, crate::embedder::FakeEmbedder::new("test-model", 3)).await;
+
+        let start = tokio::time::Instant::now();
+        let err = bridge
+            .enqueue_and_wait(
+                "1@s.whatsapp.net",
+                crate::outbound::OutboundOpKind::Text,
+                r#"{"text":"hi","mentions":[]}"#,
+                None,
+            )
+            .await
+            .expect_err("no worker, so the wait must time out");
+
+        let timed_out = err.downcast_ref::<SendTimedOut>().expect("error must be a typed SendTimedOut");
+        assert!(start.elapsed() >= SYNC_SEND_WAIT, "must wait the full SYNC_SEND_WAIT before timing out");
+        assert!(err.to_string().contains("do not retry"), "{err}");
+
+        let queued = bridge
+            .store()
+            .claim_next_job()
+            .await
+            .unwrap()
+            .expect("the job must still be queued after the wait times out");
+        assert_eq!(queued.id, timed_out.job_id, "the error must name the job that is still queued");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
