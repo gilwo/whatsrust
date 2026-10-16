@@ -33,7 +33,7 @@ When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md
 - `src/outbound.rs` — typed outbound ops (21 OpKinds), payload structs, execute_job() builds wa::Message + uploads media
 - `src/bridge_events.rs` — broadcast event bus: BridgeEvent, OutboundStatusEvent, OutboundJobState, DeliveryStatus
 - `src/api.rs` — REST API server (59 endpoints) + SSE streaming + CLI HTTP client
-- `src/mcp.rs` — MCP server (35 tools, JSON-RPC over stdio, proxies to HTTP daemon)
+- `src/mcp.rs` — MCP server (34 tools, JSON-RPC over stdio, proxies to HTTP daemon)
 - `src/storage.rs` — rusqlite Signal Protocol store + typed outbound queue + v8 unified `messages` table (live + backfill, with `embed_status` column) + `embeddings` table (multi-model BLOB vectors) + FTS5 search + backfill job queue/cursor + `metadata` KV
 - `src/backfill.rs` — historical backfill worker: two-phase async on-demand fetch (`client.fetch_message_history` → session-id → later `Event::HistorySync` correlated via `HistoryCorrelator`), single-worker FIFO pagination, contained-C target model (`since`/`all`/`count`), dedicated `BackfillPacer`, 3-level abort (batch/job/task), behind `HistorySource`/`BatchSink` trait seams
 - `src/embedder.rs` — Embedder trait (sidecar contract), StdioEmbedder (JSON-RPC stdio transport), FakeEmbedder (test seam), cosine_similarity (Rust-side vector rerank)

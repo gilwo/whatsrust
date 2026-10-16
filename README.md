@@ -18,7 +18,7 @@
 &nbsp;
 [![59 API Endpoints](https://img.shields.io/badge/API-59_endpoints-green?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#api)
 &nbsp;
-[![35 MCP Tools](https://img.shields.io/badge/MCP-35_tools-blueviolet?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#mcp-server-for-ai-agents)
+[![34 MCP Tools](https://img.shields.io/badge/MCP-34_tools-blueviolet?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#mcp-server-for-ai-agents)
 &nbsp;
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust/pulls)
 
@@ -52,7 +52,7 @@ We needed WhatsApp inside agent software and got tired of babysitting a Node sid
 | **Chat management** | Manual API calls | **12 operations** (pin, mute, archive, star...) |
 | **Group management** | Manual | **12 methods**, full CRUD |
 | **Anti-ban protection** | None | Read receipt batching, typing sim, jitter |
-| **AI agent support** | None | **35 MCP tools** for Claude Code, etc. |
+| **AI agent support** | None | **34 MCP tools** for Claude Code, etc. |
 | **History & search** | DIY | Paced per-chat backfill + FTS5 lexical + opt-in semantic search (embedder sidecar, multilingual, relevance-ranked) |
 
 ---
@@ -87,7 +87,7 @@ src/
   media_utils.rs     Media enrichment: image dims + thumbnails, audio waveform
   bridge_events.rs   Broadcast event bus (tokio::sync::broadcast)
   api.rs             REST API (59 endpoints) + SSE + CLI HTTP client
-  mcp.rs             MCP server (35 tools, JSON-RPC over stdio)
+  mcp.rs             MCP server (34 tools, JSON-RPC over stdio)
   storage.rs         rusqlite store + v8 messages table (FTS5, embed_status) + embeddings (vectors) + schema migrations
   backfill.rs        Historical backfill worker (on-demand fetch, FIFO, pacer)
   polls.rs           Poll crypto (HKDF-SHA256 + AES-256-GCM)
@@ -108,7 +108,7 @@ src/
 | **Daemon** | `cargo run` -- REPL with 50 commands |
 | **CLI** | `whatsrust send 15551234567 "Hello"` -- 50 commands, JSON to stdout |
 | **Library** | `WhatsAppBridge::start(config, tx, cancel)` -- embed in your Rust app |
-| **MCP server** | `whatsrust mcp` -- 35 tools for AI agents (Claude Code, etc.) |
+| **MCP server** | `whatsrust mcp` -- 34 tools for AI agents (Claude Code, etc.) |
 
 ---
 
@@ -134,7 +134,7 @@ Text stories with custom background colors and fonts. Image and video stories. R
 
 Trigger a per-chat backfill on demand -- fetch `all` history, everything `since` a timestamp, or a `count` of messages -- and watch it run as a paced background job with the same anti-ban discipline as live sends. The daemon clamps every request (cooldown, queue depth, max messages) so a misbehaving script or agent can't hammer WhatsApp.
 
-Once fetched, search your history locally: **FTS5 lexical** (BM25 relevance-ranked, fully offline, multilingual — Hebrew, Arabic, and more) is always-on. **Semantic search** (embedding-based, via an opt-in embedder sidecar) layers on top with **hybrid recall** (ADR 0041): configure `WHATSRUST_EMBEDDER_CMD` and the bridge unions FTS5 candidates with a bounded vector scan of the chat's stored embeddings, so paraphrase and cross-language queries with no shared words (e.g. an English query matching a Hebrew message) can still find a match, not just reorder FTS hits; lexical matches are always kept, and results fall back additively to plain FTS5 when the sidecar is absent, down, or the scope exceeds the scan cap (no errors, no blocking). The native Rust sidecar (`embedder-rs/`, candle-based; ADR 0040) is primary — Python-free, one-toolchain deploy, serving either **BAAI/bge-m3** (1024-dim, default for `make run-semantic`, stronger multilingual/cross-language recall) or **MiniLM** (384-dim, lighter/faster — `make run-semantic EMBED_MODEL=minilm`). A legacy Python reference (`scripts/embedder-sidecar.py`, sentence-transformers, MiniLM only) remains for parity checks. End-to-end validation is pending; the semantic path is code-complete but not yet live-tested against a running daemon.
+Once fetched, search your history locally: **FTS5 lexical** (BM25 relevance-ranked, fully offline, multilingual — Hebrew, Arabic, and more) is always-on. **Semantic search** (embedding-based, via an opt-in embedder sidecar) layers on top with **hybrid recall** (ADR 0041): configure `WHATSRUST_EMBEDDER_CMD` and the bridge unions FTS5 candidates with a bounded vector scan of the chat's stored embeddings, so paraphrase and cross-language queries with no shared words (e.g. an English query matching a Hebrew message) can still find a match, not just reorder FTS hits; lexical matches are always kept, and results fall back additively to plain FTS5 when the sidecar is absent, down, or the scope exceeds the scan cap (no errors, no blocking). The native Rust sidecar (`embedder-rs/`, candle-based; ADR 0040) is primary — Python-free, one-toolchain deploy, serving either **BAAI/bge-m3** (1024-dim, default for `make run-semantic`, stronger multilingual/cross-language recall) or **MiniLM** (384-dim, lighter/faster — `make run-semantic EMBED_MODEL=minilm`). A legacy Python reference (`scripts/embedder-sidecar.py`, sentence-transformers, MiniLM only) remains for parity checks.
 
 ### Stays alive
 
@@ -281,7 +281,7 @@ opt into a non-loopback bind (`WHATSRUST_ALLOW_REMOTE=1`).
 
 ## MCP server for AI agents
 
-Run `whatsrust mcp` to start a Model Context Protocol server with 35 tools over JSON-RPC stdio. Connect it to Claude Code, Cursor, or any MCP-compatible AI agent and your agent can send messages, manage groups, post stories, handle chat operations, and search or backfill chat history (`whatsrust_search`, `whatsrust_fetch_history`, `whatsrust_fetch_status`, `whatsrust_fetch_cancel`) through WhatsApp.
+Run `whatsrust mcp` to start a Model Context Protocol server with 34 tools over JSON-RPC stdio. Connect it to Claude Code, Cursor, or any MCP-compatible AI agent and your agent can send messages, manage groups, post stories, handle chat operations, and search or backfill chat history (`whatsrust_search`, `whatsrust_fetch_history`, `whatsrust_fetch_status`, `whatsrust_fetch_cancel`) through WhatsApp.
 
 Works out of the box with Claude Code -- just add it to your MCP config and your AI agent gets full WhatsApp access.
 

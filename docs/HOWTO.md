@@ -312,7 +312,7 @@ Cursor, etc.) over JSON-RPC/stdio.
    ```
    Adjust the `command` path to your built binary (debug or release) and add
    any `env` vars you need (e.g. `WHATSRUST_PORT` if not using the default).
-3. 35 tools are exposed (send, reply, react, groups, chat management,
+3. 34 tools are exposed (send, reply, react, groups, chat management,
    status/stories, `whatsrust_search`, `whatsrust_fetch_history`,
    `whatsrust_fetch_status`, `whatsrust_fetch_cancel`,
    `whatsrust_purge_embeddings`, etc.) — see `README.md` § "MCP server
@@ -496,10 +496,9 @@ search still works (pure FTS5) and the daemon logs
 `no embedder configured or construction failed` at DEBUG — non-fatal by
 design.
 
-**Note:** end-to-end validation of the semantic search path against a live
-daemon with real data is pending; the code (including ADR 0041 hybrid
-recall) is complete and unit/integration-tested but not yet live-tested in
-a real-world scenario. Use at your own risk; report issues to the repo.
+**Note:** the semantic search path (including ADR 0041 hybrid recall) has been
+live-validated (2026-10-05) against a running daemon with real data. Report
+issues to the repo.
 
 ---
 
