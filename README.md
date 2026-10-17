@@ -105,7 +105,7 @@ src/
 
 | Mode | How |
 |------|-----|
-| **Daemon** | `cargo run` -- REPL with 50 commands |
+| **Daemon** | `cargo run` -- REPL with 51 commands |
 | **CLI** | `whatsrust send 15551234567 "Hello"` -- 50 commands, JSON to stdout |
 | **Library** | `WhatsAppBridge::start(config, tx, cancel)` -- embed in your Rust app |
 | **MCP server** | `whatsrust mcp` -- 34 tools for AI agents (Claude Code, etc.) |
@@ -337,6 +337,8 @@ Inbound messages arrive as `WhatsAppInbound` with sender, JID, message ID, reply
 | `WHATSRUST_API_TOKEN` | *(none)* | Bearer token for API auth |
 | `BACKUP_DIR` | `whatsapp.db.backups` | SQLite backup directory |
 | `RUST_LOG` | `info` | Log level (`debug` for protocol) |
+
+Full list of variables, with defaults and safety notes: `.env.example`.
 
 ---
 

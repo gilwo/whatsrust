@@ -2,7 +2,7 @@
 
 **Type:** Live document — kept up to date as features land. Update the **Status** of an
 item when work starts/completes; add a dated note in its row's detail.
-**Last updated:** 2026-10-17
+**Last updated:** 2026-10-18
 
 This is the single tracking surface for in-flight and planned work on this experimental
 fork. The *why* for each design lives in the ADRs (`docs/adr/`); the *what/how* blueprints
@@ -39,10 +39,10 @@ Stateless separate binary, pure vectorizer; stdio JSON-RPC v1; transport-neutral
 - [x] Sidecar binary: MVP Python + sentence-transformers (paraphrase-multilingual-MiniLM-L12-v2, 384-dim) — DONE 2026-08-31; superseded as the deployment default by the native Rust sidecar (`embedder-rs/`, candle), serving MiniLM or **bge-m3** (default for `make run-semantic`) — DONE 2026-09-30 (ADR 0040/0039)
 - [x] Drain worker integration (ADR 0015), multi-model store + purge (ADR 0017) — DONE M2.3/M2.5
 
-### F3 — MCP streamable HTTP transport (on top of stdio) 🔵 Designed
+### F3 — MCP streamable HTTP transport (on top of stdio) 🟡 In progress
 Add MCP Streamable HTTP transport alongside the existing stdio transport — so MCP clients
 can connect over HTTP (remote/multiplexed) in addition to spawn-as-child stdio.
-- **Status:** ADR 0045 accepted 2026-10-16; implementation not started.
+- **Status:** ADR 0045 accepted 2026-10-16; implementation in progress: Phase 0a, the behaviour-change step and Phase 0b done (2026-10-17/18); Phases 1–5 open.
 - **Design:** A dedicated `/mcp` listener runs inside the daemon on its own port (`WHATSRUST_MCP_PORT`, off by default), serving only the `/mcp` route. Supports dual-era clients: modern (2026-07-28) and legacy (2025-11-25, 2025-06-18) from one stateless endpoint. In-process dispatch to existing REST handlers via a shared tool registry (`src/mcp_registry.rs`). Separate configuration: `WHATSRUST_MCP_TOKEN` (required, ≥22 characters, must differ from `WHATSRUST_API_TOKEN`), `WHATSRUST_MCP_BIND` (default `127.0.0.1`, independent of `WHATSRUST_BIND`), `WHATSRUST_MCP_ALLOW_REMOTE` (opt-in for non-loopback bind, logs loud warning), and `WHATSRUST_MCP_READ_ONLY` (server-side read-only switch). Stdio proxy stays unchanged.
 - **References:** Design doc `docs/plans/2026-10-15-mcp-http-transport-design.md`, ADR 0045.
 - [x] Design pass + ADR
