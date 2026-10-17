@@ -83,7 +83,7 @@ this GET never revokes/regenerates an existing link; left unchanged.
 ## Consequences
 
 **Positive:** the default loopback API, which has no token, now has a real browser-facing
-defence; a reverse-proxy or multi-origin-tool deployment can still opt in via the two allowlists;
+defence; a reverse-proxy or multi-origin-tool deployment can still opt in via the two allowlists (amended 2026-10-18);
 the check is a single, independently-tested function reused for every route including the
 planned HTTP MCP endpoint (the MCP spec's Streamable HTTP transport requires Origin validation
 for the same reason — this gate is written to be reused there directly, not re-derived).
@@ -115,3 +115,16 @@ the RFC's 400; it's still rejected.
 The gate and token checks now run before the body is read (request pipeline: head → gate → token → framing → body). This closes the DoS consideration mentioned in the original "Not done" section. Large uploads are now buffered only after authentication passes.
 
 The `415 Unsupported Media Type` response is now `HTTP/1.1 415 Unsupported Media Type` (reason phrase and JSON `code: "unsupported_media_type"`). The original implementation returned `415 Unknown` with `code: "internal_error"`.
+
+## Amendment (2026-10-18)
+
+**Proxy allowlists now require a token.** An allowlist (`WHATSRUST_ALLOWED_HOSTS` or `WHATSRUST_ALLOWED_ORIGINS`) without `WHATSRUST_API_TOKEN` now stops the daemon at startup with the fix, replacing the original statement that proxies opt in via the allowlists without a token.
+
+**API config violations now exit at startup** (F3 Phase 0b, ADR 0045 fail-closed pattern, ADR 0022). Four configs that previously ran with "logs an error and keeps running" or "runs with no API" now exit the daemon before the instance lock and DB open, printing the cause and exact fix:
+
+1. `WHATSRUST_BIND` is non-loopback and `WHATSRUST_ALLOW_REMOTE` is not set.
+2. `WHATSRUST_BIND` is non-loopback, `WHATSRUST_ALLOW_REMOTE=1`, and no `WHATSRUST_API_TOKEN`.
+3. `WHATSRUST_ALLOWED_HOSTS` or `WHATSRUST_ALLOWED_ORIGINS` is non-empty and there is no token, even on loopback (new rule; replaces original allowlist-without-token behaviour).
+4. The REST port is in use, or `WHATSRUST_BIND` is not an address of this machine.
+
+**Library callers:** `api::serve()` shares the same validator but logs and returns instead of exiting.

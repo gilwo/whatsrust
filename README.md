@@ -276,8 +276,7 @@ own, so every route enforces three checks before dispatch (ADR 0044):
 
 The request body is read only after the gate and token checks pass. `Transfer-Encoding` (e.g. chunked) is not supported (411; send `Content-Length` instead). `Expect: 100-continue` is honoured after authentication.
 
-A token is still recommended even on loopback (`WHATSRUST_API_TOKEN`) -- it's mandatory once you
-opt into a non-loopback bind (`WHATSRUST_ALLOW_REMOTE=1`).
+**Either proxy allowlist requires `WHATSRUST_API_TOKEN`**, or the daemon refuses to start (amended 2026-10-18, ADR 0044). Invalid API configs (missing required token, non-loopback without `WHATSRUST_ALLOW_REMOTE`, port in use) stop the daemon at startup with the fix. A token is still recommended even on loopback -- it's mandatory once you opt into a non-loopback bind (`WHATSRUST_ALLOW_REMOTE=1`).
 
 ---
 

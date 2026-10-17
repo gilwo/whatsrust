@@ -274,7 +274,8 @@ fn bool_env_var(name: &str) -> bool {
     )
 }
 
-fn api_bind_host() -> String {
+/// The REST listener's bind host from `WHATSRUST_BIND` (default `127.0.0.1`).
+pub fn api_bind_host() -> String {
     std::env::var("WHATSRUST_BIND").unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
@@ -1940,41 +1941,156 @@ fn format_sse_event(event: &crate::bridge_events::BridgeEvent) -> Option<String>
 // Server
 // ---------------------------------------------------------------------------
 
-/// Start the API server. Blocks until cancelled.
-pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationToken) {
-    let bind = api_bind_host();
-    if !is_loopback_bind(&bind) && !bool_env_var("WHATSRUST_ALLOW_REMOTE") {
-        error!(
-            bind = %bind,
-            "refusing non-loopback API bind without WHATSRUST_ALLOW_REMOTE=1"
-        );
-        return;
+/// REST listener settings read from the environment: the startup rules check them and
+/// [`serve_with_listener`] enforces them.
+struct ApiSettings {
+    bind: String,
+    allow_remote: bool,
+    token: Option<String>,
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+}
+
+impl ApiSettings {
+    fn from_env() -> Self {
+        Self {
+            bind: api_bind_host(),
+            allow_remote: bool_env_var("WHATSRUST_ALLOW_REMOTE"),
+            token: configured_api_token(),
+            allowed_hosts: parse_allowlist_env("WHATSRUST_ALLOWED_HOSTS"),
+            allowed_origins: parse_allowlist_env("WHATSRUST_ALLOWED_ORIGINS"),
+        }
     }
-    let api_token = configured_api_token();
-    if !is_loopback_bind(&bind) && api_token.is_none() {
-        error!(
-            bind = %bind,
-            "refusing non-loopback API bind without WHATSRUST_API_TOKEN"
-        );
-        return;
+}
+
+/// Startup rules for a REST listener that is about to bind (design doc §13, rules 4 and 5).
+/// The `Err` text is the whole message: what is wrong, the exact fix, "Refusing to start."
+/// A token that is empty or only whitespace counts as unset, as in [`configured_api_token`].
+fn validate_api_listener(
+    bind: &str,
+    allow_remote: bool,
+    token: Option<&str>,
+    allowed_hosts: &[String],
+    allowed_origins: &[String],
+) -> Result<(), String> {
+    let has_token = token.is_some_and(|t| !t.trim().is_empty());
+    if !is_loopback_bind(bind) {
+        if !allow_remote {
+            return Err(format!(
+                "WHATSRUST_BIND={bind} is not a loopback address, but WHATSRUST_ALLOW_REMOTE is not set.\n\
+                 To expose the API on the network, set WHATSRUST_ALLOW_REMOTE=1 and WHATSRUST_API_TOKEN \
+                 (e.g. `openssl rand -base64 32`); to keep it local, unset WHATSRUST_BIND or set \
+                 WHATSRUST_BIND=127.0.0.1. Refusing to start."
+            ));
+        }
+        if !has_token {
+            return Err(format!(
+                "WHATSRUST_BIND={bind} is not a loopback address and WHATSRUST_API_TOKEN is not set.\n\
+                 Set WHATSRUST_API_TOKEN (e.g. `openssl rand -base64 32`), or keep the API local by \
+                 unsetting WHATSRUST_BIND and WHATSRUST_ALLOW_REMOTE. Refusing to start."
+            ));
+        }
     }
-    let listener = match TcpListener::bind((&*bind, port)).await {
-        Ok(l) => {
+    if !has_token && (!allowed_hosts.is_empty() || !allowed_origins.is_empty()) {
+        let set = match (allowed_hosts.is_empty(), allowed_origins.is_empty()) {
+            (false, false) => "WHATSRUST_ALLOWED_HOSTS and WHATSRUST_ALLOWED_ORIGINS",
+            (false, true) => "WHATSRUST_ALLOWED_HOSTS",
+            _ => "WHATSRUST_ALLOWED_ORIGINS",
+        };
+        return Err(format!(
+            "A proxy allowlist is configured ({set}) but WHATSRUST_API_TOKEN is not set.\n\
+             Set WHATSRUST_API_TOKEN (e.g. `openssl rand -base64 32`), or unset {set}. \
+             Refusing to start."
+        ));
+    }
+    Ok(())
+}
+
+/// Startup rules for the REST listener on `port`. Port 0 is headless (no listener), so nothing
+/// is checked. [`serve`] has no headless mode and calls [`validate_api_listener`] directly.
+fn validate_api_startup(
+    port: u16,
+    bind: &str,
+    allow_remote: bool,
+    token: Option<&str>,
+    allowed_hosts: &[String],
+    allowed_origins: &[String],
+) -> Result<(), String> {
+    if port == 0 {
+        return Ok(());
+    }
+    validate_api_listener(bind, allow_remote, token, allowed_hosts, allowed_origins)
+}
+
+/// [`validate_api_startup`] on the environment's settings. The daemon calls it before the
+/// bridge is built and exits with the `Err` text.
+pub fn validate_api_startup_from_env(port: u16) -> Result<(), String> {
+    let s = ApiSettings::from_env();
+    validate_api_startup(port, &s.bind, s.allow_remote, s.token.as_deref(), &s.allowed_hosts, &s.allowed_origins)
+}
+
+/// Bind the REST listener to `bind:port`. The `Err` text is the whole startup message: the
+/// variables involved, the OS error and the fix.
+pub async fn bind_api_listener(bind: &str, port: u16) -> Result<TcpListener, String> {
+    match TcpListener::bind((bind, port)).await {
+        Ok(listener) => {
             info!(bind = %bind, port = port, "API server listening");
-            l
+            Ok(listener)
         }
         Err(e) => {
-            error!(error = %e, bind = %bind, port = port, "failed to bind API server");
+            let fix = if e.kind() == std::io::ErrorKind::AddrInUse {
+                format!(
+                    "Port {port} is already in use; stop the other process or set WHATSRUST_PORT to a \
+                     free port (WHATSRUST_PORT=0 turns the API off)."
+                )
+            } else {
+                "Check that WHATSRUST_BIND is an address of this machine and that WHATSRUST_PORT is \
+                 allowed (WHATSRUST_PORT=0 turns the API off)."
+                    .to_string()
+            };
+            Err(format!(
+                "Cannot bind the REST API (WHATSRUST_BIND={bind}, WHATSRUST_PORT={port}): {e}.\n\
+                 {fix} Refusing to start."
+            ))
+        }
+    }
+}
+
+/// Start the API server. Blocks until cancelled.
+///
+/// Library entry point: it binds `WHATSRUST_BIND:port` itself. A configuration that fails the
+/// startup rules, or a bind that fails, is logged and the function returns; it never exits the
+/// process. The daemon validates and binds in `main` and calls [`serve_with_listener`].
+#[allow(dead_code)] // Public API for library consumers (habb); the daemon uses serve_with_listener
+pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationToken) {
+    let s = ApiSettings::from_env();
+    // `serve` always listens (port 0 picks an ephemeral port), so there is no headless case.
+    if let Err(msg) = validate_api_listener(&s.bind, s.allow_remote, s.token.as_deref(), &s.allowed_hosts, &s.allowed_origins) {
+        error!("{msg}");
+        return;
+    }
+    let listener = match bind_api_listener(&s.bind, port).await {
+        Ok(l) => l,
+        Err(msg) => {
+            error!("{msg}");
             return;
         }
     };
+    serve_with_listener(bridge, listener, cancel).await;
+}
+
+/// Serve the API on an already-bound `listener` until cancelled. The caller has validated the
+/// settings and bound `listener` to `WHATSRUST_BIND`; token and allowlists come from the
+/// environment.
+pub async fn serve_with_listener(bridge: Arc<WhatsAppBridge>, listener: TcpListener, cancel: CancellationToken) {
+    let s = ApiSettings::from_env();
 
     // Allowlists (ADR 0044) and the SSE semaphore are built once at startup.
     let cfg = Arc::new(ServeConfig {
-        is_loopback: is_loopback_bind(&bind),
-        api_token,
-        allowed_origins: parse_allowlist_env("WHATSRUST_ALLOWED_ORIGINS"),
-        allowed_hosts: parse_allowlist_env("WHATSRUST_ALLOWED_HOSTS"),
+        is_loopback: is_loopback_bind(&s.bind),
+        api_token: s.token,
+        allowed_origins: s.allowed_origins,
+        allowed_hosts: s.allowed_hosts,
         sse_sem: Arc::new(Semaphore::new(SSE_MAX_CONNECTIONS)),
         sse_cancel: cancel.clone(),
     });
@@ -2005,7 +2121,7 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
 }
 
 /// Per-listener settings that [`serve_connection`] reads for every accepted connection.
-/// [`serve`] builds one from the environment; tests build one explicitly.
+/// [`serve_with_listener`] builds one from the environment; tests build one explicitly.
 struct ServeConfig {
     /// Whether the listener is bound to a loopback address (gates `path` media uploads and
     /// the default `Host` allowance).
@@ -3447,5 +3563,213 @@ mod tests {
         assert!(msg.contains("timeout reading response"), "{msg}");
         assert!(msg.contains("may still be processed"), "{msg}");
         drop(listener);
+    }
+
+    // -------------------------------------------------------------------------
+    // F3 Phase 0b: REST listener startup rules (pure, no environment)
+    // -------------------------------------------------------------------------
+
+    /// Owned allowlist entries for the startup-rule tests.
+    fn allowlist(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A startup refusal names every `needles` entry and ends with the closing line.
+    fn assert_refusal(msg: &str, needles: &[&str]) {
+        assert!(msg.ends_with("Refusing to start."), "{msg}");
+        for needle in needles {
+            assert!(msg.contains(needle), "message must contain {needle:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_startup_allowlist_without_token_is_refused() {
+        let hosts = allowlist(&["proxy.example"]);
+        let origins = allowlist(&["https://proxy.example"]);
+
+        let msg = validate_api_startup(7270, "127.0.0.1", false, None, &hosts, &[]).unwrap_err();
+        assert_refusal(&msg, &["WHATSRUST_ALLOWED_HOSTS", "WHATSRUST_API_TOKEN", "openssl rand -base64 32"]);
+        assert!(!msg.contains("WHATSRUST_ALLOWED_ORIGINS"), "{msg}");
+
+        let msg = validate_api_startup(7270, "127.0.0.1", false, None, &[], &origins).unwrap_err();
+        assert_refusal(&msg, &["WHATSRUST_ALLOWED_ORIGINS", "WHATSRUST_API_TOKEN", "openssl rand -base64 32"]);
+        assert!(!msg.contains("WHATSRUST_ALLOWED_HOSTS"), "{msg}");
+
+        let msg = validate_api_startup(7270, "127.0.0.1", false, None, &hosts, &origins).unwrap_err();
+        assert_refusal(&msg, &["WHATSRUST_ALLOWED_HOSTS and WHATSRUST_ALLOWED_ORIGINS", "WHATSRUST_API_TOKEN"]);
+    }
+
+    #[test]
+    fn test_startup_allowlist_with_token_is_ok() {
+        let hosts = allowlist(&["proxy.example"]);
+        let origins = allowlist(&["https://proxy.example"]);
+        assert!(validate_api_startup(7270, "127.0.0.1", false, Some("secret"), &hosts, &origins).is_ok());
+    }
+
+    #[test]
+    fn test_startup_non_loopback_without_allow_remote_is_refused() {
+        // With or without a token: the missing opt-in is reported first.
+        for token in [None, Some("secret")] {
+            let msg = validate_api_startup(7270, "0.0.0.0", false, token, &[], &[]).unwrap_err();
+            assert_refusal(
+                &msg,
+                &["WHATSRUST_BIND=0.0.0.0", "WHATSRUST_ALLOW_REMOTE=1", "WHATSRUST_API_TOKEN", "openssl rand -base64 32"],
+            );
+        }
+    }
+
+    #[test]
+    fn test_startup_non_loopback_allow_remote_without_token_is_refused() {
+        let msg = validate_api_startup(7270, "192.168.1.10", true, None, &[], &[]).unwrap_err();
+        assert_refusal(&msg, &["WHATSRUST_BIND=192.168.1.10", "WHATSRUST_API_TOKEN", "openssl rand -base64 32"]);
+        assert!(!msg.contains("WHATSRUST_ALLOW_REMOTE is not set"), "the opt-in is present: {msg}");
+    }
+
+    #[test]
+    fn test_startup_non_loopback_allow_remote_with_token_is_ok() {
+        assert!(validate_api_startup(7270, "0.0.0.0", true, Some("secret"), &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_startup_loopback_default_needs_no_token() {
+        for bind in ["127.0.0.1", "::1", "localhost"] {
+            assert!(validate_api_startup(7270, bind, false, None, &[], &[]).is_ok(), "{bind}");
+            // ALLOW_REMOTE only matters for a non-loopback bind.
+            assert!(validate_api_startup(7270, bind, true, None, &[], &[]).is_ok(), "{bind}");
+        }
+    }
+
+    #[test]
+    fn test_startup_headless_port_zero_skips_every_rule() {
+        let hosts = allowlist(&["proxy.example"]);
+        let origins = allowlist(&["https://proxy.example"]);
+        assert!(validate_api_startup(0, "0.0.0.0", false, None, &hosts, &origins).is_ok());
+        assert!(validate_api_startup(0, "0.0.0.0", true, None, &[], &[]).is_ok());
+        assert!(validate_api_startup(0, "127.0.0.1", false, None, &hosts, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_startup_whitespace_only_token_counts_as_unset() {
+        let hosts = allowlist(&["proxy.example"]);
+        for blank in ["", " ", "   ", "\t\n"] {
+            assert!(
+                validate_api_startup(7270, "127.0.0.1", false, Some(blank), &hosts, &[]).is_err(),
+                "allowlist with token {blank:?}"
+            );
+            assert!(
+                validate_api_startup(7270, "0.0.0.0", true, Some(blank), &[], &[]).is_err(),
+                "remote bind with token {blank:?}"
+            );
+        }
+        // Padding around a real token is trimmed away, not rejected.
+        assert!(validate_api_startup(7270, "0.0.0.0", true, Some("  secret  "), &hosts, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_listener_rules_have_no_headless_case() {
+        // `serve` has no port-0 headless mode, so it calls the rules without the port gate.
+        assert!(validate_api_listener("0.0.0.0", false, Some("secret"), &[], &[]).is_err());
+        assert!(validate_api_listener("127.0.0.1", false, None, &[], &[]).is_ok());
+    }
+
+    // -------------------------------------------------------------------------
+    // F3 Phase 0b: binding the REST listener
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_bind_api_listener_binds_a_free_port() {
+        let listener = bind_api_listener("127.0.0.1", 0).await.expect("a free port binds");
+        assert_ne!(listener.local_addr().unwrap().port(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bind_api_listener_port_in_use_names_the_fix() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = taken.local_addr().unwrap().port();
+
+        let msg = bind_api_listener("127.0.0.1", port).await.expect_err("the port is taken");
+
+        assert_refusal(
+            &msg,
+            &[
+                "WHATSRUST_BIND=127.0.0.1",
+                &format!("WHATSRUST_PORT={port}"),
+                &format!("Port {port} is already in use"),
+                "stop the other process or set WHATSRUST_PORT",
+                "(os error",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bind_api_listener_other_failure_names_bind_and_port() {
+        // TEST-NET-3 is not an address of this machine, so the OS refuses the bind.
+        let msg = bind_api_listener("203.0.113.1", 7270).await.expect_err("not a local address");
+
+        assert_refusal(&msg, &["WHATSRUST_BIND=203.0.113.1", "WHATSRUST_PORT=7270", "Check that WHATSRUST_BIND"]);
+        assert!(!msg.contains("already in use"), "{msg}");
+    }
+
+    // -------------------------------------------------------------------------
+    // F3 Phase 0b: library entry points
+    // -------------------------------------------------------------------------
+
+    /// A disconnected test bridge and its database path (the caller removes the file).
+    async fn test_bridge_for_serve(tag: &str) -> (Arc<WhatsAppBridge>, std::path::PathBuf) {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let db_path = std::env::temp_dir().join(format!("whatsrust-serve-{tag}-{ts}.db"));
+        let bridge = crate::bridge::build_test_bridge_with_embedder(
+            &db_path,
+            crate::embedder::FakeEmbedder::new("test-model", 8),
+        )
+        .await;
+        (Arc::new(bridge), db_path)
+    }
+
+    /// `serve` reads its settings from the environment, which tests must not change, so this
+    /// drives the bind-failure path; a refused configuration also just returns. The refused
+    /// path itself is covered by the `validate_api_listener` tests, which `serve` calls with
+    /// no copy of the rules.
+    #[tokio::test]
+    async fn test_serve_logs_and_returns_when_it_cannot_listen() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let (bridge, db_path) = test_bridge_for_serve("bind-fail").await;
+
+        tokio::time::timeout(Duration::from_secs(5), serve(bridge, port, CancellationToken::new()))
+            .await
+            .expect("serve must return, not run or exit, when it cannot listen");
+
+        drop(taken);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_serve_with_listener_serves_the_given_listener_until_cancelled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (bridge, db_path) = test_bridge_for_serve("listener").await;
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(serve_with_listener(bridge, listener, cancel.clone()));
+
+        // Whatever the environment's token or allowlists say, the accept loop answers in HTTP.
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+            .await
+            .expect("the server answers")
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 "), "{}", String::from_utf8_lossy(&response));
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the accept loop stops on cancel")
+            .unwrap();
+        let _ = std::fs::remove_file(&db_path);
     }
 }
