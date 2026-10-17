@@ -144,6 +144,7 @@ against a *trusted* sidecar or rare inputs. Fix opportunistically or during a la
   with 50 ms sleeps against a wall-clock deadline and failed once in a full-suite run under heavy
   memory pressure (swap ~32/34 GB), then passed 3/3 alone and in the next full run. Move it to
   tokio's paused clock (as the ADR 0042 tests do) so it doesn't depend on machine load.
+- [ ] **(Med) wa-rs upgrade check** — current pin `9e8c70e2` (2026-07-01); upstream HEAD `7c4021d4` seen 2026-10-18 (newer than the pin). Check `oxidezap/whatsapp-rust` for new commits/tags, assess breaking changes, run tests + live smoke test per CLAUDE.md upgrade procedure. Untracked analysis file (2026-06-29, v0.6.0→main) pre-dates pin, advisory only.
 - [ ] **(Med) Native TLS for the MCP listener** — F3 follow-up; until then a non-loopback MCP bind sends the token in cleartext.
 - [ ] **(Low) Two-token rotation for the MCP listener** — F3 follow-up; requires daemon restart today.
 - [ ] **(Med) Rate limiting for MCP reads and chat-management operations** — no owner yet; F5 does not cover it.
