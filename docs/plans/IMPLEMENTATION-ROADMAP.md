@@ -176,7 +176,8 @@ against a *trusted* sidecar or rare inputs. Fix opportunistically or during a la
 **Goal:** Dedicated `/mcp` HTTP listener inside the daemon for MCP clients, alongside the existing stdio transport.
 
 **Phases:** See design doc §14 (`docs/plans/2026-10-15-mcp-http-transport-design.md`) for detailed phase descriptions and exit criteria.
-- Phase 0a: Pure refactors (head/body split, ApiResponse, RestRequest, CallContext, HTTP helpers)
+- Phase 0a: Pure refactors (head/body split, ApiResponse, RestRequest, CallContext) — done 2026-10-17
+- Behaviour-change step after 0a: gate + token before body read, lingering drain, new reason phrases, 415 code, 411 chunked, 417 Expect, read deadlines
 - Phase 0b: Config enforcement (token policy, bind both listeners in main() before bridge start, ADR 0044 amendment)
 - Phase 1: Shared registry (access_class, integral float normalisation, ADR 0046 amendment, mcp.rs:644 test change)
 - Phase 2: `/mcp` skeleton (opt-in, separate bind, routing, era detection, read-only switch)

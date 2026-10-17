@@ -33,7 +33,8 @@ When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md
 - `src/bridge.rs` — core bridge: events, all message types, typing, groups, polls, presence, delivery receipts, group cache
 - `src/outbound.rs` — typed outbound ops (21 OpKinds), payload structs, execute_job() builds wa::Message + uploads media
 - `src/bridge_events.rs` — broadcast event bus: BridgeEvent, OutboundStatusEvent, OutboundJobState, DeliveryStatus
-- `src/api.rs` — REST API server (59 endpoints) + SSE streaming + CLI HTTP client
+- `src/api.rs` — REST API server (59 endpoints) + SSE streaming + CLI HTTP client; `serve_connection` per connection, handlers return `ApiResponse`
+- `src/api/golden_tests.rs` — byte-for-byte REST wire golden tests (fixtures change only in a deliberate, labelled behaviour change; a failing case prints the new bytes as a Rust literal)
 - `src/mcp.rs` — MCP server (34 tools, JSON-RPC over stdio, proxies to HTTP daemon)
 - `src/storage.rs` — rusqlite Signal Protocol store + typed outbound queue + v8 unified `messages` table (live + backfill, with `embed_status` column) + `embeddings` table (multi-model BLOB vectors) + FTS5 search + backfill job queue/cursor + `metadata` KV
 - `src/backfill.rs` — historical backfill worker: two-phase async on-demand fetch (`client.fetch_message_history` → session-id → later `Event::HistorySync` correlated via `HistoryCorrelator`), single-worker FIFO pagination, contained-C target model (`since`/`all`/`count`), dedicated `BackfillPacer`, 3-level abort (batch/job/task), behind `HistorySource`/`BatchSink` trait seams
@@ -67,3 +68,4 @@ When making an architectural decision, add an ADR (`docs/adr/NNNN-kebab-title.md
 - SQLite-first backfill: durable `backfill_jobs` queue + single FIFO worker + connection-gating (defer, not fail, when disconnected)
 - Device name fixed at pairing (ADR 0043): `WHATSRUST_DEVICE_NAME` (default `whatsrust`) is used only while the device is unpaired, then saved as `metadata.device_name`; once paired the saved name wins and the env var is ignored. `clear_device()` (on logout) deletes it with the credentials, so a re-pair picks up the current value. Library consumers set `BridgeConfig.device_name` directly.
 - MCP argument validation (ADR 0046): `call_tool` applies `validated_args(name, args)` at a single choke point, rejecting undeclared keys (isError, nothing sent) before any HTTP request; every tool schema sets `additionalProperties: false`; undeclared keys (notably REST-only `path` for local-file media reads) are unreachable via MCP
+- REST handlers return `ApiResponse` (`into_bytes()` is the only serializer), and the per-connection pipeline in `serve_connection` is head → body → gate → token → route

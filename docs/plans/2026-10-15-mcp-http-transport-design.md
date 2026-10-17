@@ -955,20 +955,26 @@ All configuration reuses existing env vars plus four new variables:
 
 ### Phase 0a: Pure Refactors (Ship Independently, Behaviour-Neutral)
 
-- **Byte-for-byte REST golden test:** Run before and after refactor to verify REST behaviour is unchanged.
-- Head/body split: `read_request_head(stream, deadline) → (method, path, headers, content_length, leftover)` and `read_request_body(stream, content_length, limit, leftover, deadline) → Vec<u8>`. Gate and token run between phases. `read_request` wrapper remains for mcp.rs tests. Lingering drain after early rejection (≤64 KiB or ≤1 s).
-- `ApiResponse` refactor: handlers return `{status, content_type, headers: Vec<(&str, String)>, body}`, `serve()` serializes. All handlers updated to return `ApiResponse` with `headers: vec![]` by default. Reason phrases added for 202, 405, 411, 415, 417. SSE stays a separate path (returns bytes directly).
-- `RestRequest` struct: `{method, path, query: Vec<(String,String)>, body, context}` with `CallContext {loopback_file_access}`.
+Phase 0a changes no byte the REST server writes: same status lines (including today's reason phrases, so a 415 is still written as `HTTP/1.1 415 Unknown`), header order, bodies, error ordering, timeouts and size limits.
+
+- **Byte-for-byte REST golden test:** `serve()` builds a `ServeConfig` (loopback flag, token, allowlists, SSE semaphore and cancel token) from the environment and hands each connection to `serve_connection(stream, bridge, &ServeConfig)`. The golden test drives `serve_connection` over a loopback socket pair with explicit configs (no environment variables) and compares every response byte against fixtures captured from the pre-refactor server. It runs before and after each refactor below.
+- Head/body split: `read_request_head(stream) → RequestHead {method, path, query, headers, content_length, leftover}` and `read_request_body(stream, &head, limit) → Option<Vec<u8>>`, where `leftover` carries the body bytes that arrived with the head. `serve_connection` keeps today's order (head, body, gate, token, route), the same 10 s per-read timeouts, the same 1 MiB / 70 MiB (media) limits and the same `None` conditions. `read_request` remains as a head-then-body wrapper for the mcp.rs tests. No deadline parameters yet.
+- `ApiResponse` refactor: `handle_request` and all handlers return `{status, content_type, headers: Vec<(&'static str, String)>, body}`, and `ApiResponse::into_bytes()` is the one serializer. With empty `headers` it emits exactly what `http_response` emitted; extra headers go after `Content-Length`. The reason-phrase table is unchanged: 202, 405, 411, 415 and 417 are still written as `Unknown`. SSE stays a separate path (returns bytes directly).
+- `RestRequest` struct: `{method, path, query: Vec<(String,String)>, body, context}` with `CallContext {loopback_file_access}`. `handle_request` takes a `RestRequest`; `serve_connection` builds it after the gate and token check. No handler reads request headers, so the conversion drops nothing a handler uses.
 - Tests for the above.
 
 **REST-visible changes moved to a separate labelled step (not in Phase 0a):**
+- Gate and token run before the body read (changes error ordering).
+- Lingering drain after early rejection (≤64 KiB or ≤1 s).
+- Reason phrases added for 202, 405, 411, 415, 417.
 - 415 `json_err` code change (`internal_error` → `unsupported_media_type`).
 - 411 on chunked bodies.
-- Gate-before-body ordering (changes error ordering).
-- Lingering drain.
 - `Expect: 417` (unsupported).
+- Deadline parameters on `read_request_head` / `read_request_body`.
 
-**Exit criteria:** Byte-for-byte REST golden test passes before and after. Gate and token run before body read. Handlers return structured responses. REST behaviour is unchanged for existing clients.
+That step updates the golden fixtures on purpose, so every changed byte shows up in review.
+
+**Exit criteria:** Byte-for-byte REST golden test passes before and after with unchanged fixtures. Handlers return structured responses. Request order is still head, body, gate, token, route. REST behaviour is unchanged for existing clients.
 
 ### Phase 0b: Config Enforcement (Ship Separately with Release Note)
 

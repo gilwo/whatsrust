@@ -581,10 +581,10 @@ do, via the Makefile.
 
 **Steps:**
 ```bash
-make test        # cargo test — default suite (231 lib + 233 bin tests, verified)
+make test        # cargo test — default suite (404 lib + 400 bin tests, verified 2026-10-17)
 make test-all     # cargo test --features fake-embedder — also runs the
-                   # fake-embedder sidecar round-trip tests (234 lib tests;
-                   # 3 extra tests vs `make test`, gated behind the
+                   # fake-embedder sidecar round-trip tests (413 lib + 409 bin;
+                   # 9 extra tests per target vs `make test`, gated behind the
                    # non-default `fake-embedder` Cargo feature so a plain
                    # `cargo build`/`cargo test` never touches that sidecar
                    # binary)
@@ -611,14 +611,16 @@ make fmt          # cargo fmt — reformats the codebase in place. Not run as
 - `make help` — lists all targets with one-line descriptions, default target.
 - `make build` — `Finished \`dev\` profile [unoptimized + debuginfo] target(s)`, exit 0.
 - `make lint` — `whatsrust (bin "whatsrust") generated 38 warnings`, exit 0 (non-fatal).
-- `make test` — `test result: ok. 231 passed; 0 failed ...` (lib) and
-  `test result: ok. 233 passed; 0 failed ...` (bin), exit 0.
-- `make test-all` — `test result: ok. 234 passed; 0 failed ...` (lib, includes
-  the 3 fake-embedder-gated tests) and `233 passed` (bin), exit 0.
+- `make test` — `test result: ok. 404 passed; 0 failed ...` (lib) and
+  `test result: ok. 400 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-17).
+- `make test-all` — `test result: ok. 413 passed; 0 failed ...` (lib, includes
+  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 409 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-17).
 
 `CONTRIBUTING.md` asks contributors to run `cargo test` and `cargo clippy`
 before submitting a PR — `make test` and `make lint` are equivalent to that,
 plus `make test-all` for full coverage of the embedder sidecar path.
+
+**REST golden tests:** The test suite includes byte-for-byte golden tests of the REST API's wire output (`src/api/golden_tests.rs`). These tests pin every byte the server writes for 121 full requests plus 29 helper-level fixtures. A failing golden case means the REST wire output changed. If the change is deliberate (e.g. fixing a status code or reason phrase), paste the printed literal into the fixture and call the change out in the commit message. Otherwise it is a regression.
 
 ---
 
