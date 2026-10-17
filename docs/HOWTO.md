@@ -74,6 +74,11 @@ variables win; `.env` only fills variables that are otherwise unset.** An
 absent `.env` file is a silent no-op; a malformed one prints a warning to
 stderr and the daemon continues with the real environment only.
 
+**Note:** `.env` is loaded only by the daemon (`whatsrust` with no arguments).
+The CLI and `whatsrust mcp` read the process environment, so export
+`WHATSRUST_API_TOKEN` (and any other needed vars) for them. See §2a "Upgrade
+notes" for more.
+
 **Steps:**
 1. Copy the example file:
    ```bash
