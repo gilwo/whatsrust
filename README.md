@@ -269,10 +269,12 @@ own, so every route enforces three checks before dispatch (ADR 0044):
   default empty -- e.g. for a reverse proxy, or another loopback address such as `127.0.0.2`).
   This defeats DNS rebinding. Missing or duplicate `Host` (or `Origin`) headers are rejected.
 - **Content-Type:** every `POST` must send `Content-Type: application/json` (parameters like
-  `; charset=utf-8` are fine) or it gets 415. **If you're scripting against the API with
+  `; charset=utf-8` are fine) or it gets `415 Unsupported Media Type` (`code: "unsupported_media_type"`). **If you're scripting against the API with
   `curl`, add `-H 'Content-Type: application/json'` to every `-X POST`** -- plain-text or
   form-encoded POSTs are rejected on purpose, since those are exactly what a hostile web page
   can send without a CORS preflight.
+
+The request body is read only after the gate and token checks pass. `Transfer-Encoding` (e.g. chunked) is not supported (411; send `Content-Length` instead). `Expect: 100-continue` is honoured after authentication.
 
 A token is still recommended even on loopback (`WHATSRUST_API_TOKEN`) -- it's mandatory once you
 opt into a non-loopback bind (`WHATSRUST_ALLOW_REMOTE=1`).

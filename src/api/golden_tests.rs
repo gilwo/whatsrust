@@ -4,7 +4,10 @@
 //! with an explicit [`ServeConfig`] (no environment variables) and compares every byte the
 //! server writes against the expected response stored next to the request. The expected
 //! strings were captured from the server before the ApiResponse / head-body-split refactors
-//! and must not change in a behaviour-neutral change.
+//! and must not change in a behaviour-neutral change. The labelled step that followed (gate and
+//! token before the body, 411 / 417 framing checks, `100 Continue`, reason phrases, the 415
+//! code) changed some of them on purpose; the cases it added or changed are under "framing"
+//! and "request order" below, plus every 415.
 //!
 //! The only normalisation is `"uptime_secs":<n>` in the status body, rewritten to `0` with
 //! `Content-Length` recomputed (see [`normalize_uptime`]). Nothing else in the corpus is
@@ -152,13 +155,32 @@ const HOST_NOT_ALLOWED: &str = "HTTP/1.1 403 Forbidden\r\n\
     \r\n\
     {\"code\":\"forbidden\",\"error\":\"Host 'evil.example' is not allowed\",\"ok\":false}";
 
-/// Gate rejection of a POST without a JSON content type: written as `415 Unknown` with code `internal_error`.
-const UNSUPPORTED_MEDIA_TYPE: &str = "HTTP/1.1 415 Unknown\r\n\
+/// Gate rejection of a POST without a JSON content type.
+const UNSUPPORTED_MEDIA_TYPE: &str = "HTTP/1.1 415 Unsupported Media Type\r\n\
     Content-Type: application/json\r\n\
-    Content-Length: 91\r\n\
+    Content-Length: 99\r\n\
     Connection: close\r\n\
     \r\n\
-    {\"code\":\"internal_error\",\"error\":\"POST requires Content-Type: application/json\",\"ok\":false}";
+    {\"code\":\"unsupported_media_type\",\"error\":\"POST requires Content-Type: application/json\",\"ok\":false}";
+
+/// 411 for any request carrying `Transfer-Encoding`.
+const LENGTH_REQUIRED: &str = "HTTP/1.1 411 Length Required\r\n\
+    Content-Type: application/json\r\n\
+    Content-Length: 103\r\n\
+    Connection: close\r\n\
+    \r\n\
+    {\"code\":\"length_required\",\"error\":\"Transfer-Encoding is not supported; send Content-Length\",\"ok\":false}";
+
+/// 417 for an `Expect` value other than `100-continue`.
+const EXPECTATION_FAILED: &str = "HTTP/1.1 417 Expectation Failed\r\n\
+    Content-Type: application/json\r\n\
+    Content-Length: 69\r\n\
+    Connection: close\r\n\
+    \r\n\
+    {\"code\":\"expectation_failed\",\"error\":\"unsupported Expect\",\"ok\":false}";
+
+/// The interim response written before the body of an `Expect: 100-continue` request.
+const CONTINUE: &str = "HTTP/1.1 100 Continue\r\n\r\n";
 
 /// 401 for a missing or wrong API token.
 const UNAUTHORIZED: &str = "HTTP/1.1 401 Unauthorized\r\n\
@@ -245,6 +267,11 @@ fn post(path: &str, headers: &str, body: &str) -> Vec<u8> {
         body.len()
     )
     .into_bytes()
+}
+
+/// `POST {path}` whose `Content-Length` says `declared` bytes while `body` is what is actually sent.
+fn post_declaring(path: &str, headers: &str, declared: usize, body: &str) -> Vec<u8> {
+    format!("POST {path} HTTP/1.1\r\n{headers}Content-Length: {declared}\r\n\r\n{body}").into_bytes()
 }
 
 /// Loopback JSON POST.
@@ -466,8 +493,175 @@ fn corpus() -> Vec<Case> {
             format!("GET /health HTTP/1.1\r\n{HOST}NoColonHere\r\n\r\n").into_bytes(),
             STATUS_OK,
         ),
-        case("expect_continue_ignored", Cfg::Loopback, expect_continue, NOT_CONNECTED),
-        case("chunked_body_reads_as_empty", Cfg::Loopback, chunked.into_bytes(), EMPTY_BODY_REJECTED),
+        // --- framing: Transfer-Encoding and Expect, decided from the head before any body byte ---
+        case("expect_continue_body_already_sent", Cfg::Loopback, expect_continue, NOT_CONNECTED),
+        case(
+            "expect_continue_case_insensitive",
+            Cfg::Loopback,
+            post("/api/pin-chat", &format!("{HOST}{JSON}Expect: 100-Continue\r\n"), pin_body),
+            NOT_CONNECTED,
+        ),
+        case(
+            "expect_continue_no_body_no_interim",
+            Cfg::Loopback,
+            get("/health", &format!("{HOST}Expect: 100-continue\r\n")),
+            STATUS_OK,
+        ),
+        case(
+            "expect_other_value_rejected",
+            Cfg::Loopback,
+            post("/api/pin-chat", &format!("{HOST}{JSON}Expect: 200-ok\r\n"), pin_body),
+            EXPECTATION_FAILED,
+        ),
+        case(
+            "expect_other_value_rejected_on_get",
+            Cfg::Loopback,
+            get("/health", &format!("{HOST}Expect: nope\r\n")),
+            EXPECTATION_FAILED,
+        ),
+        case(
+            "expect_other_value_body_never_read",
+            Cfg::Loopback,
+            // 100 bytes declared, none sent: reading the body would end in the truncated-body 400.
+            post_declaring("/api/pin-chat", &format!("{HOST}{JSON}Expect: nope\r\n"), 100, ""),
+            EXPECTATION_FAILED,
+        ),
+        case(
+            "expect_second_header_other_value_rejected",
+            Cfg::Loopback,
+            post("/api/pin-chat", &format!("{HOST}{JSON}Expect: 100-continue\r\nExpect: nope\r\n"), pin_body),
+            EXPECTATION_FAILED,
+        ),
+        case("chunked_body_rejected", Cfg::Loopback, chunked.into_bytes(), LENGTH_REQUIRED),
+        case(
+            "transfer_encoding_identity_rejected",
+            Cfg::Loopback,
+            post("/api/pin-chat", &format!("{HOST}{JSON}Transfer-Encoding: identity\r\n"), pin_body),
+            LENGTH_REQUIRED,
+        ),
+        case(
+            "transfer_encoding_with_content_length_rejected",
+            Cfg::Loopback,
+            // `post` adds a Content-Length too: that pair is the ambiguous one, refused like any other.
+            post("/api/pin-chat", &format!("{HOST}{JSON}Transfer-Encoding: chunked\r\n"), pin_body),
+            LENGTH_REQUIRED,
+        ),
+        case(
+            "transfer_encoding_padded_name_rejected",
+            Cfg::Loopback,
+            post("/api/pin-chat", &format!("{HOST}{JSON}Transfer-Encoding : chunked\r\n"), pin_body),
+            LENGTH_REQUIRED,
+        ),
+        case(
+            "transfer_encoding_on_get_rejected",
+            Cfg::Loopback,
+            get("/health", &format!("{HOST}Transfer-Encoding: chunked\r\n")),
+            LENGTH_REQUIRED,
+        ),
+        case(
+            "transfer_encoding_on_sse_rejected",
+            Cfg::Loopback,
+            get("/api/events", &format!("{HOST}Transfer-Encoding: chunked\r\n")),
+            LENGTH_REQUIRED,
+        ),
+        case(
+            "transfer_encoding_before_size_check",
+            Cfg::Loopback,
+            post_declaring("/api/send", &format!("{HOST}{JSON}Transfer-Encoding: chunked\r\n"), 1_048_577, ""),
+            LENGTH_REQUIRED,
+        ),
+        case(
+            "size_check_before_expect",
+            Cfg::Loopback,
+            post_declaring("/api/send", &format!("{HOST}{JSON}Expect: nope\r\n"), 1_048_577, ""),
+            BAD_REQUEST,
+        ),
+        case(
+            "oversize_with_expect_continue_gets_no_interim",
+            Cfg::Loopback,
+            post_declaring("/api/send", &format!("{HOST}{JSON}Expect: 100-continue\r\n"), 1_048_577, ""),
+            BAD_REQUEST,
+        ),
+        // --- request order: gate, then token, then framing, all before the body ---
+        case(
+            "oversize_content_length_missing_token",
+            Cfg::Token,
+            post_declaring("/api/send", &format!("{HOST}{JSON}"), 1_048_577, ""),
+            UNAUTHORIZED,
+        ),
+        case(
+            "oversize_content_length_with_token",
+            Cfg::Token,
+            post_declaring("/api/send", &format!("{HOST}{JSON}{TOKEN_HEADER}"), 1_048_577, ""),
+            BAD_REQUEST,
+        ),
+        case(
+            "oversize_media_content_length_missing_token",
+            Cfg::Token,
+            post_declaring("/api/image", &format!("{HOST}{JSON}"), 73_400_321, ""),
+            UNAUTHORIZED,
+        ),
+        case(
+            "truncated_body_bad_origin",
+            Cfg::Loopback,
+            post_declaring("/api/pin-chat", &format!("{HOST}{JSON}Origin: https://evil.example\r\n"), 100, "0123456789"),
+            ORIGIN_NOT_ALLOWED,
+        ),
+        case(
+            "truncated_body_bad_content_type",
+            Cfg::Loopback,
+            post_declaring("/api/pin-chat", &format!("{HOST}Content-Type: text/plain\r\n"), 100, "0123456789"),
+            UNSUPPORTED_MEDIA_TYPE,
+        ),
+        case(
+            "truncated_body_missing_token",
+            Cfg::Token,
+            post_declaring("/api/pin-chat", &format!("{HOST}{JSON}"), 100, "0123456789"),
+            UNAUTHORIZED,
+        ),
+        case(
+            "truncated_body_with_token",
+            Cfg::Token,
+            post_declaring("/api/pin-chat", &format!("{HOST}{JSON}{TOKEN_HEADER}"), 100, "0123456789"),
+            BAD_REQUEST,
+        ),
+        case(
+            "chunked_bad_origin",
+            Cfg::Loopback,
+            post("/api/pin-chat", &format!("{HOST}{JSON}Origin: https://evil.example\r\nTransfer-Encoding: chunked\r\n"), pin_body),
+            ORIGIN_NOT_ALLOWED,
+        ),
+        case(
+            "chunked_missing_token",
+            Cfg::Token,
+            post("/api/pin-chat", &format!("{HOST}{JSON}Transfer-Encoding: chunked\r\n"), pin_body),
+            UNAUTHORIZED,
+        ),
+        case(
+            "chunked_with_token",
+            Cfg::Token,
+            post("/api/pin-chat", &format!("{HOST}{JSON}{TOKEN_HEADER}Transfer-Encoding: chunked\r\n"), pin_body),
+            LENGTH_REQUIRED,
+        ),
+        case(
+            "expect_other_value_missing_token",
+            Cfg::Token,
+            post("/api/pin-chat", &format!("{HOST}{JSON}Expect: nope\r\n"), pin_body),
+            UNAUTHORIZED,
+        ),
+        case(
+            "expect_continue_missing_token_gets_no_interim",
+            Cfg::Token,
+            // The body is not sent and not read: a 100 or a truncated-body 400 would show here.
+            post_declaring("/api/pin-chat", &format!("{HOST}{JSON}Expect: 100-continue\r\n"), 50, ""),
+            UNAUTHORIZED,
+        ),
+        case(
+            "expect_continue_bad_origin_gets_no_interim",
+            Cfg::Loopback,
+            post_declaring("/api/pin-chat", &format!("{HOST}{JSON}Origin: https://evil.example\r\nExpect: 100-continue\r\n"), 50, ""),
+            ORIGIN_NOT_ALLOWED,
+        ),
         // --- request gate (ADR 0044) ---
         case(
             "gate_origin_denied",
@@ -1216,14 +1410,44 @@ fn test_rest_response_helpers_golden() {
                 {\"code\":\"not_found\",\"error\":\"m\",\"ok\":false}",
         ),
         (
-            "json_err_415".into(),
-            wire(json_err(415, "m")),
-            "HTTP/1.1 415 Unknown\r\n\
+            "json_err_405".into(),
+            wire(json_err(405, "m")),
+            "HTTP/1.1 405 Method Not Allowed\r\n\
                 Content-Type: application/json\r\n\
-                Content-Length: 48\r\n\
+                Content-Length: 52\r\n\
                 Connection: close\r\n\
                 \r\n\
-                {\"code\":\"internal_error\",\"error\":\"m\",\"ok\":false}",
+                {\"code\":\"method_not_allowed\",\"error\":\"m\",\"ok\":false}",
+        ),
+        (
+            "json_err_411".into(),
+            wire(json_err(411, "m")),
+            "HTTP/1.1 411 Length Required\r\n\
+                Content-Type: application/json\r\n\
+                Content-Length: 49\r\n\
+                Connection: close\r\n\
+                \r\n\
+                {\"code\":\"length_required\",\"error\":\"m\",\"ok\":false}",
+        ),
+        (
+            "json_err_415".into(),
+            wire(json_err(415, "m")),
+            "HTTP/1.1 415 Unsupported Media Type\r\n\
+                Content-Type: application/json\r\n\
+                Content-Length: 56\r\n\
+                Connection: close\r\n\
+                \r\n\
+                {\"code\":\"unsupported_media_type\",\"error\":\"m\",\"ok\":false}",
+        ),
+        (
+            "json_err_417".into(),
+            wire(json_err(417, "m")),
+            "HTTP/1.1 417 Expectation Failed\r\n\
+                Content-Type: application/json\r\n\
+                Content-Length: 52\r\n\
+                Connection: close\r\n\
+                \r\n\
+                {\"code\":\"expectation_failed\",\"error\":\"m\",\"ok\":false}",
         ),
         (
             "json_err_429".into(),
@@ -1427,15 +1651,15 @@ fn test_rest_response_helpers_golden() {
     // Reason phrases: only these statuses have one; every other code is written as "Unknown".
     let reason_lines = [
         (200, "HTTP/1.1 200 OK"),
-        (202, "HTTP/1.1 202 Unknown"),
+        (202, "HTTP/1.1 202 Accepted"),
         (400, "HTTP/1.1 400 Bad Request"),
         (401, "HTTP/1.1 401 Unauthorized"),
         (403, "HTTP/1.1 403 Forbidden"),
         (404, "HTTP/1.1 404 Not Found"),
-        (405, "HTTP/1.1 405 Unknown"),
-        (411, "HTTP/1.1 411 Unknown"),
-        (415, "HTTP/1.1 415 Unknown"),
-        (417, "HTTP/1.1 417 Unknown"),
+        (405, "HTTP/1.1 405 Method Not Allowed"),
+        (411, "HTTP/1.1 411 Length Required"),
+        (415, "HTTP/1.1 415 Unsupported Media Type"),
+        (417, "HTTP/1.1 417 Expectation Failed"),
         (418, "HTTP/1.1 418 Unknown"),
         (429, "HTTP/1.1 429 Too Many Requests"),
         (500, "HTTP/1.1 500 Internal Server Error"),
@@ -1515,5 +1739,179 @@ async fn test_rest_read_timeouts_golden() {
             "{name} must wait out the 10 s read timeout"
         );
     }
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// A connected loopback pair: `(client, server_side)`.
+async fn connected_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    (client, server)
+}
+
+/// `Expect: 100-continue` with valid auth: the server writes `100 Continue` first, and the
+/// client sends the body only after reading it, whether none or part of the body came with
+/// the head.
+#[tokio::test]
+async fn test_rest_expect_continue_interim_precedes_the_final_response() {
+    let (bridge, db_path) = test_bridge("expect-continue").await;
+    let cfg = config(Cfg::Token);
+    let body = r#"{"jid":"1@s.whatsapp.net"}"#;
+    let head = format!(
+        "POST /api/pin-chat HTTP/1.1\r\n{HOST}{JSON}{TOKEN_HEADER}Expect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    for already_sent in [0, 5] {
+        let (mut client, server) = connected_pair().await;
+        let client_side = async {
+            client.write_all(head.as_bytes()).await.unwrap();
+            client.write_all(&body.as_bytes()[..already_sent]).await.unwrap();
+            // The body is withheld until the server has said to send it.
+            let mut interim = vec![0u8; CONTINUE.len()];
+            client.read_exact(&mut interim).await.unwrap();
+            assert_eq!(String::from_utf8(interim).unwrap(), CONTINUE, "{already_sent} body bytes sent early");
+            client.write_all(&body.as_bytes()[already_sent..]).await.unwrap();
+            let mut rest = Vec::new();
+            client.read_to_end(&mut rest).await.unwrap();
+            rest
+        };
+        let (_, rest) = tokio::join!(serve_connection(server, &bridge, &cfg), client_side);
+        assert_eq!(String::from_utf8(rest).unwrap(), NOT_CONNECTED, "{already_sent} body bytes sent early");
+    }
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// A request that fails the gate, the token check or a framing check gets only its final error:
+/// no `100 Continue`, and the body that the client never sends is never waited for. The client
+/// keeps the connection open and reads to EOF, so a server that went on to read the body would
+/// stall for its 10 s read timeout.
+#[tokio::test]
+async fn test_rest_rejected_expect_continue_gets_no_interim_and_no_body_read() {
+    let (bridge, db_path) = test_bridge("expect-rejected").await;
+    let with_expect = |headers: &str| format!("{HOST}{headers}Expect: 100-continue\r\n");
+    let cases = [
+        ("bad origin", Cfg::Loopback, with_expect(&format!("{JSON}Origin: https://evil.example\r\n")), ORIGIN_NOT_ALLOWED),
+        ("bad content type", Cfg::Loopback, with_expect("Content-Type: text/plain\r\n"), UNSUPPORTED_MEDIA_TYPE),
+        ("missing token", Cfg::Token, with_expect(JSON), UNAUTHORIZED),
+        ("chunked", Cfg::Loopback, with_expect(&format!("{JSON}Transfer-Encoding: chunked\r\n")), LENGTH_REQUIRED),
+    ];
+    for (name, kind, headers, expected) in cases {
+        let (mut client, server) = connected_pair().await;
+        let client_side = async {
+            let request = post_declaring("/api/pin-chat", &headers, 50, "01234");
+            client.write_all(&request).await.unwrap();
+            let mut out = Vec::new();
+            client.read_to_end(&mut out).await.unwrap();
+            out
+        };
+        let cfg = config(kind);
+        let both = async { tokio::join!(serve_connection(server, &bridge, &cfg), client_side).1 };
+        let out = tokio::time::timeout(Duration::from_secs(5), both)
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the server waited for a body it should not read"));
+        assert_eq!(String::from_utf8(out).unwrap(), expected, "{name}");
+    }
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Block the test thread briefly so bytes just written on loopback reach the other socket. A
+/// paused clock jumps to the next timer as soon as the runtime is idle, which can beat bytes
+/// still in flight in the kernel; the exact-timing tests therefore run over in-memory pipes (see
+/// the `head_from_slow_client` unit tests), and the wire-level ones call this after each write.
+fn let_bytes_land() {
+    std::thread::sleep(Duration::from_millis(5));
+}
+
+/// The head has a 20 s wall-clock deadline: a head trickled at 7 s, 7 s and 6.5 s steps, so
+/// never idle for the 10 s read timeout, but whose blank line would only arrive at 20.5 s, is
+/// answered with the usual 400. Without the deadline this head would complete and be served
+/// 200. The last chunk lands while the server is draining after its 400, so nothing is left
+/// unread when it closes. Virtual time makes the waits instant; the exact 20 s cutoff is
+/// asserted by the unit tests over an in-memory pipe.
+#[tokio::test(start_paused = true)]
+async fn test_rest_head_wall_clock_deadline_golden() {
+    let (bridge, db_path) = test_bridge("head-deadline").await;
+    let cfg = config(Cfg::Loopback);
+    let (mut client, server) = connected_pair().await;
+    let steps: [(Duration, &[u8]); 4] = [
+        (Duration::ZERO, b"GET /health HTTP/1.1\r\n"),
+        (Duration::from_secs(7), b"X-A: 1\r\n"),
+        (Duration::from_secs(7), b"X-B: 2\r\n"),
+        (Duration::from_millis(6500), b"\r\n"),
+    ];
+    let client_side = async {
+        for (wait, chunk) in steps {
+            tokio::time::sleep(wait).await;
+            client.write_all(chunk).await.unwrap();
+            let_bytes_land();
+        }
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        out
+    };
+    let (_, out) = tokio::join!(serve_connection(server, &bridge, &cfg), client_side);
+    assert_eq!(String::from_utf8(out).unwrap(), BAD_REQUEST);
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// An early rejection while the client is still sending a body of up to 64 KiB delivers the
+/// complete response: the server keeps reading until the client has finished, instead of
+/// closing on unread data (which resets the connection and can discard the response).
+#[tokio::test]
+async fn test_rest_early_rejection_delivers_response_while_the_body_is_still_sent() {
+    let (bridge, db_path) = test_bridge("drain").await;
+    let body = vec![b'x'; 60 * 1024];
+    let cases = [
+        ("gate", Cfg::Loopback, format!("{HOST}Content-Type: text/plain\r\n"), UNSUPPORTED_MEDIA_TYPE),
+        ("token", Cfg::Token, format!("{HOST}{JSON}"), UNAUTHORIZED),
+        ("chunked", Cfg::Loopback, format!("{HOST}{JSON}Transfer-Encoding: chunked\r\n"), LENGTH_REQUIRED),
+    ];
+    for (name, kind, headers, expected) in cases {
+        let (mut client, server) = connected_pair().await;
+        let client_side = async {
+            let head = format!("POST /api/pin-chat HTTP/1.1\r\n{headers}Content-Length: {}\r\n\r\n", body.len());
+            client.write_all(head.as_bytes()).await.unwrap();
+            // The rejection is written long before the upload ends.
+            for piece in body.chunks(4096) {
+                tokio::task::yield_now().await;
+                client.write_all(piece).await.unwrap_or_else(|e| panic!("{name}: upload cut off: {e}"));
+            }
+            let mut out = Vec::new();
+            client.read_to_end(&mut out).await.unwrap_or_else(|e| panic!("{name}: response lost: {e}"));
+            out
+        };
+        let cfg = config(kind);
+        let (_, out) = tokio::join!(serve_connection(server, &bridge, &cfg), client_side);
+        assert_eq!(String::from_utf8(out).unwrap(), expected, "{name}");
+    }
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// The drain is bounded: a client that never stops sending cannot keep the server waiting. The
+/// exact 64 KiB and 1 s limits are pinned by the `respond_and_drain` unit tests; here only the
+/// connection's end is checked. What the client receives past 64 KiB is deliberately not
+/// asserted, since the connection may reset once the server stops reading.
+#[tokio::test]
+async fn test_rest_early_rejection_does_not_wait_for_an_endless_upload() {
+    let (bridge, db_path) = test_bridge("drain-bounded").await;
+    let cfg = config(Cfg::Token);
+    let (mut client, server) = connected_pair().await;
+    let head = format!("POST /api/send HTTP/1.1\r\n{HOST}{JSON}Content-Length: 1048576\r\n\r\n");
+    client.write_all(head.as_bytes()).await.unwrap();
+    let (mut reader, mut writer) = client.into_split();
+    let uploader = tokio::spawn(async move {
+        let chunk = vec![b'x'; 16 * 1024];
+        while writer.write_all(&chunk).await.is_ok() {}
+    });
+    let downloader = tokio::spawn(async move {
+        let mut sink = Vec::new();
+        let _ = reader.read_to_end(&mut sink).await;
+    });
+    tokio::time::timeout(Duration::from_secs(10), serve_connection(server, &bridge, &cfg))
+        .await
+        .expect("the server must stop draining an endless upload");
+    uploader.abort();
+    downloader.abort();
     let _ = std::fs::remove_file(&db_path);
 }

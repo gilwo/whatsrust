@@ -12,7 +12,7 @@ use tokio::sync::Semaphore;
 
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -35,6 +35,9 @@ pub(crate) const POST_OUTCOME_UNKNOWN: &str =
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
+/// A whole request, head and body, as [`read_request`] returns it to tests. The server itself
+/// goes from [`RequestHead`] straight to [`RestRequest`].
+#[cfg(test)]
 pub(crate) struct HttpRequest {
     pub(crate) method: String,
     pub(crate) path: String,
@@ -43,16 +46,9 @@ pub(crate) struct HttpRequest {
     body: Vec<u8>,
 }
 
+#[cfg(test)]
 impl HttpRequest {
-    fn header_get(&self, key: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, v)| v.as_str())
-    }
-
-    /// Drop the transport-level headers (already used by the gate and token check) and attach
-    /// `context`, leaving what a route handler needs.
+    /// Drop the transport-level headers and attach `context`, leaving what a route handler needs.
     fn into_rest(self, context: CallContext) -> RestRequest {
         RestRequest {
             method: self.method,
@@ -166,10 +162,15 @@ impl ApiResponse {
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         let status_text = match self.status {
             200 => "OK",
+            202 => "Accepted",
             400 => "Bad Request",
             401 => "Unauthorized",
             403 => "Forbidden",
             404 => "Not Found",
+            405 => "Method Not Allowed",
+            411 => "Length Required",
+            415 => "Unsupported Media Type",
+            417 => "Expectation Failed",
             429 => "Too Many Requests",
             500 => "Internal Server Error",
             503 => "Service Unavailable",
@@ -223,6 +224,10 @@ fn json_err(status: u16, msg: &str) -> ApiResponse {
         401 => "unauthorized",
         403 => "forbidden",
         404 => "not_found",
+        405 => "method_not_allowed",
+        411 => "length_required",
+        415 => "unsupported_media_type",
+        417 => "expectation_failed",
         429 => "rate_limited",
         503 => "unavailable",
         504 => "timeout",
@@ -308,16 +313,15 @@ fn ct_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
-fn request_has_api_token(req: &HttpRequest, expected_token: &str) -> bool {
-    if let Some(tok) = req.header_get("x-api-token") {
+/// Whether `headers` carry `expected_token` as `X-API-Token` or as an `Authorization: Bearer`
+/// token. Reads headers only, so it runs before any body byte is read.
+fn request_has_api_token(headers: &[(String, String)], expected_token: &str) -> bool {
+    if let Some(tok) = find_header(headers, "x-api-token") {
         if ct_eq(tok, expected_token) {
             return true;
         }
     }
-    if let Some(bearer) = req
-        .header_get("authorization")
-        .and_then(|v| v.strip_prefix("Bearer "))
-    {
+    if let Some(bearer) = find_header(headers, "authorization").and_then(|v| v.strip_prefix("Bearer ")) {
         return ct_eq(bearer, expected_token);
     }
     false
@@ -463,6 +467,20 @@ const MAX_MEDIA_READ_BYTES: u64 = 50 * 1024 * 1024;
 // Request parsing
 // ---------------------------------------------------------------------------
 
+/// Longest a single read of the head or the body may wait for the client.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Wall-clock budget for receiving a whole request head, counted from accept. Only the head has
+/// a total deadline: the body is bounded per read by [`READ_IDLE_TIMEOUT`] alone, because after
+/// the auth checks only authenticated clients reach it and a large upload can be slow.
+const HEAD_READ_DEADLINE: Duration = Duration::from_secs(20);
+/// Interim response for `Expect: 100-continue`, written before the body is read.
+const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+/// The instant by which the head of a request accepted now must be complete.
+fn head_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + HEAD_READ_DEADLINE
+}
+
 /// A parsed request line and headers, plus any body bytes that arrived in the same reads.
 pub(crate) struct RequestHead {
     /// HTTP method as sent, e.g. `GET`.
@@ -479,7 +497,20 @@ pub(crate) struct RequestHead {
 }
 
 impl RequestHead {
-    /// Combine the head with its body into a complete request.
+    /// Combine the head with its body and the caller's `context` into the request the router
+    /// sees. The transport headers were already used by the checks on the head and are dropped.
+    fn into_rest(self, body: Vec<u8>, context: CallContext) -> RestRequest {
+        RestRequest {
+            method: self.method,
+            path: self.path,
+            query: self.query,
+            body,
+            context,
+        }
+    }
+
+    /// Combine the head with its body into a whole request.
+    #[cfg(test)]
     fn into_request(self, body: Vec<u8>) -> HttpRequest {
         HttpRequest {
             method: self.method,
@@ -489,6 +520,39 @@ impl RequestHead {
             body,
         }
     }
+
+    /// The rejection for a request whose framing this server cannot honour, decided from the
+    /// head alone so no body byte is read for it. Checked in order:
+    /// - any `Transfer-Encoding` header (the reader cannot decode chunked bodies, and refusing
+    ///   every value leaves no `Content-Length` / `Transfer-Encoding` ambiguity): 411;
+    /// - `Content-Length` over `limit`: 400, as for any unreadable request;
+    /// - an `Expect` value other than `100-continue`: 417.
+    fn framing_error(&self, limit: usize) -> Option<ApiResponse> {
+        // Trimmed so `Transfer-Encoding : chunked` (a padded name) is refused too.
+        if self.headers.iter().any(|(name, _)| name.trim().eq_ignore_ascii_case("transfer-encoding")) {
+            return Some(json_err(411, "Transfer-Encoding is not supported; send Content-Length"));
+        }
+        if self.content_length > limit {
+            return Some(bad_request());
+        }
+        let unsupported_expect = find_all_headers(&self.headers, "expect")
+            .iter()
+            .any(|v| !v.eq_ignore_ascii_case("100-continue"));
+        unsupported_expect.then(|| json_err(417, "unsupported Expect"))
+    }
+
+    /// Whether the client sent `Expect: 100-continue` and has not sent the whole body yet, so
+    /// it is waiting for a `100 Continue` before it does.
+    fn awaiting_continue(&self) -> bool {
+        let expects_continue = find_header(&self.headers, "expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+        expects_continue && self.leftover.len() < self.content_length
+    }
+}
+
+/// The response for a request that cannot be read: a malformed, oversize or stalled head, an
+/// oversize `Content-Length`, or a body that never fully arrives.
+fn bad_request() -> ApiResponse {
+    json_err(400, "bad request")
 }
 
 /// Body size limit for a request to `path`: 70 MiB for media endpoints (base64 of 50 MiB),
@@ -505,16 +569,21 @@ fn max_body_bytes(path: &str) -> usize {
     if is_media_route { 70 * 1024 * 1024 } else { 1024 * 1024 }
 }
 
-/// Read until the blank line that ends the request head (10 s per read) and parse it.
-/// `None` on timeout, EOF, I/O error, a head over 128 KiB, or a head that does not parse.
-pub(crate) async fn read_request_head(stream: &mut tokio::net::TcpStream) -> Option<RequestHead> {
+/// Read until the blank line that ends the request head and parse it. Each read waits at most
+/// [`READ_IDLE_TIMEOUT`], and the whole head must be in by `deadline` (see [`head_deadline`]).
+/// `None` on either timeout, EOF, I/O error, a head over 128 KiB, or a head that does not parse.
+pub(crate) async fn read_request_head<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    deadline: tokio::time::Instant,
+) -> Option<RequestHead> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
 
     // Read until end of headers
     let header_end;
     loop {
-        match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut tmp)).await {
+        let wait_until = (tokio::time::Instant::now() + READ_IDLE_TIMEOUT).min(deadline);
+        match tokio::time::timeout_at(wait_until, stream.read(&mut tmp)).await {
             Ok(Ok(0)) | Err(_) => return None,
             Ok(Ok(n)) => {
                 buf.extend_from_slice(&tmp[..n]);
@@ -576,11 +645,12 @@ pub(crate) async fn read_request_head(stream: &mut tokio::net::TcpStream) -> Opt
     })
 }
 
-/// Read the body that `head` declares (10 s per read), starting from the bytes that arrived
-/// with the head. `None` if the declared length exceeds `limit` (nothing is read then), or the
-/// stream ends, errors or stalls before the whole body arrives.
-pub(crate) async fn read_request_body(
-    stream: &mut tokio::net::TcpStream,
+/// Read the body that `head` declares, starting from the bytes that arrived with the head. Each
+/// read waits at most [`READ_IDLE_TIMEOUT`]; there is no total deadline. `None` if the declared
+/// length exceeds `limit` (nothing is read then), or the stream ends, errors or stalls before
+/// the whole body arrives.
+pub(crate) async fn read_request_body<R: AsyncRead + Unpin>(
+    stream: &mut R,
     head: &RequestHead,
     limit: usize,
 ) -> Option<Vec<u8>> {
@@ -595,7 +665,7 @@ pub(crate) async fn read_request_body(
     let mut tmp = [0u8; 4096];
     let mut body = head.leftover.clone();
     while body.len() < content_length {
-        match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut tmp)).await {
+        match tokio::time::timeout(READ_IDLE_TIMEOUT, stream.read(&mut tmp)).await {
             Ok(Ok(0)) | Err(_) => break,
             Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
             Ok(Err(_)) => break,
@@ -612,7 +682,7 @@ pub(crate) async fn read_request_body(
 /// Read one whole request: the head, then the body under the limit for its path.
 #[cfg(test)]
 pub(crate) async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest> {
-    let head = read_request_head(stream).await?;
+    let head = read_request_head(stream, head_deadline()).await?;
     let body = read_request_body(stream, &head, max_body_bytes(&head.path)).await?;
     Some(head.into_request(body))
 }
@@ -1952,57 +2022,95 @@ struct ServeConfig {
     sse_cancel: CancellationToken,
 }
 
-/// Read one request from `stream`, run it through the gate and token check, and write the
-/// response (or hand the stream to the SSE handler). The stream closes when this returns.
-async fn serve_connection(mut stream: tokio::net::TcpStream, bridge: &WhatsAppBridge, cfg: &ServeConfig) {
-    let Some(head) = read_request_head(&mut stream).await else {
-        let _ = stream.write_all(&json_err(400, "bad request").into_bytes()).await;
-        return;
-    };
-    let Some(body) = read_request_body(&mut stream, &head, max_body_bytes(&head.path)).await else {
-        let _ = stream.write_all(&json_err(400, "bad request").into_bytes()).await;
-        return;
-    };
-    let req = head.into_request(body);
+/// Most request bytes [`respond_and_drain`] discards after an early rejection.
+const DRAIN_MAX_BYTES: usize = 64 * 1024;
+/// Longest [`respond_and_drain`] spends discarding them.
+const DRAIN_MAX_TIME: Duration = Duration::from_secs(1);
 
-    // CSRF / DNS-rebinding / Content-Type gate (ADR 0044) — applied
-    // before routing to EVERY route, including SSE and auth, so a
-    // cross-site "simple" request never reaches a handler.
+/// Write `response` to a client whose request body has not been fully read, then close without
+/// a reset: shut down the write half, read and discard what the client is still sending (until
+/// EOF, [`DRAIN_MAX_BYTES`] or [`DRAIN_MAX_TIME`]), and drop the stream. Closing a socket with
+/// unread data makes the OS reset the connection, and the client can lose the response.
+async fn respond_and_drain<S>(mut stream: S, response: ApiResponse)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if stream.write_all(&response.into_bytes()).await.is_err() {
+        return;
+    }
+    let _ = stream.shutdown().await;
+    let mut sink = [0u8; 4096];
+    let mut drained = 0;
+    let _ = tokio::time::timeout(DRAIN_MAX_TIME, async {
+        while drained < DRAIN_MAX_BYTES {
+            let want = sink.len().min(DRAIN_MAX_BYTES - drained);
+            match stream.read(&mut sink[..want]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drained += n,
+            }
+        }
+    })
+    .await;
+}
+
+/// The checks that need only the request head, in order: the CSRF / DNS-rebinding /
+/// Content-Type gate (403/415, ADR 0044), the API token (401), then the framing checks
+/// (411/400/417). `Some` is the response to send instead of reading the body, so no body byte
+/// is read for a request that fails any of them.
+fn reject_from_head(head: &RequestHead, cfg: &ServeConfig) -> Option<ApiResponse> {
+    // The gate applies to EVERY route, including SSE and auth, so a cross-site "simple"
+    // request never reaches a handler.
     if let Err((status, reason)) = gate_request(
-        &req.method,
-        &req.headers,
+        &head.method,
+        &head.headers,
         cfg.is_loopback,
         &cfg.allowed_origins,
         &cfg.allowed_hosts,
     ) {
-        debug!(method = %req.method, path = %req.path, reason = %reason, "request rejected by origin/host/content-type gate");
-        let _ = stream.write_all(&json_err(status, &reason).into_bytes()).await;
-        return;
+        debug!(method = %head.method, path = %head.path, reason = %reason, "request rejected by origin/host/content-type gate");
+        return Some(json_err(status, &reason));
     }
-
     if let Some(expected_token) = cfg.api_token.as_deref() {
-        if !request_has_api_token(&req, expected_token) {
-            let _ = stream.write_all(&json_err(401, "unauthorized").into_bytes()).await;
-            return;
+        if !request_has_api_token(&head.headers, expected_token) {
+            return Some(json_err(401, "unauthorized"));
         }
+    }
+    head.framing_error(max_body_bytes(&head.path))
+}
+
+/// Read one request from `stream`, run its head through the gate, token and framing checks
+/// before reading the body, and write the response (or hand the stream to the SSE handler).
+/// A response written before the body is fully read goes through [`respond_and_drain`]. The
+/// stream closes when this returns.
+async fn serve_connection(mut stream: tokio::net::TcpStream, bridge: &WhatsAppBridge, cfg: &ServeConfig) {
+    let Some(head) = read_request_head(&mut stream, head_deadline()).await else {
+        return respond_and_drain(stream, bad_request()).await;
+    };
+    if let Some(response) = reject_from_head(&head, cfg) {
+        return respond_and_drain(stream, response).await;
     }
 
     // SSE endpoint — long-lived, uses dedicated semaphore
-    if req.method == "GET" && req.path == "/api/events" {
+    if head.method == "GET" && head.path == "/api/events" {
         let sse_permit = match cfg.sse_sem.clone().try_acquire_owned() {
             Ok(p) => p,
-            Err(_) => {
-                let _ = stream.write_all(&json_err(503, "too many SSE connections").into_bytes()).await;
-                return;
-            }
+            Err(_) => return respond_and_drain(stream, json_err(503, "too many SSE connections")).await,
         };
         handle_sse(bridge, &mut stream, &cfg.sse_cancel).await;
         drop(sse_permit);
         return;
     }
 
+    // Only a request that passed every check above gets its 100 Continue.
+    if head.awaiting_continue() && stream.write_all(CONTINUE_RESPONSE).await.is_err() {
+        return;
+    }
+    let Some(body) = read_request_body(&mut stream, &head, max_body_bytes(&head.path)).await else {
+        return respond_and_drain(stream, bad_request()).await;
+    };
+
     let context = CallContext { loopback_file_access: cfg.is_loopback };
-    let response = handle_request(bridge, &req.into_rest(context)).await;
+    let response = handle_request(bridge, &head.into_rest(body, context)).await;
     let _ = stream.write_all(&response.into_bytes()).await;
 }
 
@@ -2147,18 +2255,12 @@ mod tests {
 
     #[test]
     fn test_request_has_api_token_accepts_bearer_and_header() {
-        let req = HttpRequest {
-            method: "GET".into(),
-            path: "/".into(),
-            query: Vec::new(),
-            headers: vec![
-                ("Authorization".into(), "Bearer secret".into()),
-                ("X-API-Token".into(), "secret".into()),
-            ],
-            body: Vec::new(),
-        };
-        assert!(request_has_api_token(&req, "secret"));
-        assert!(!request_has_api_token(&req, "wrong"));
+        let headers = vec![
+            ("Authorization".to_string(), "Bearer secret".to_string()),
+            ("X-API-Token".to_string(), "secret".to_string()),
+        ];
+        assert!(request_has_api_token(&headers, "secret"));
+        assert!(!request_has_api_token(&headers, "wrong"));
     }
 
     #[test]
@@ -2273,7 +2375,8 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// The serializer `ApiResponse::into_bytes` replaced, verbatim — the oracle for
-    /// "the wire format did not change".
+    /// "the wire format did not change". It predates the reason phrases for 202, 405, 411, 415
+    /// and 417, so the comparison below leaves those five out.
     fn legacy_http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
         let status_text = match status {
             200 => "OK",
@@ -2298,9 +2401,7 @@ mod tests {
 
     #[test]
     fn test_api_response_into_bytes_matches_legacy_serializer() {
-        let statuses = [
-            200, 202, 400, 401, 403, 404, 405, 411, 415, 417, 418, 429, 500, 503, 504, 0, 999,
-        ];
+        let statuses = [200, 400, 401, 403, 404, 418, 429, 500, 503, 504, 0, 999];
         let bodies: [&[u8]; 3] = [b"", br#"{"ok":true}"#, &[0, 159, 146, 150, 255, b'\r', b'\n']];
         for status in statuses {
             for content_type in ["application/json", "image/png", "text/plain"] {
@@ -2314,6 +2415,50 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_api_response_reason_phrases() {
+        let cases = [
+            (200, "OK"),
+            (202, "Accepted"),
+            (400, "Bad Request"),
+            (405, "Method Not Allowed"),
+            (411, "Length Required"),
+            (415, "Unsupported Media Type"),
+            (417, "Expectation Failed"),
+            (418, "Unknown"),
+            (0, "Unknown"),
+        ];
+        for (status, phrase) in cases {
+            let raw = ApiResponse::new(status, "application/json", b"{}".to_vec()).into_bytes();
+            let status_line = String::from_utf8(raw).unwrap().lines().next().unwrap().to_string();
+            assert_eq!(status_line, format!("HTTP/1.1 {status} {phrase}"));
+        }
+    }
+
+    #[test]
+    fn test_json_err_codes() {
+        let cases = [
+            (400, "bad_request"),
+            (401, "unauthorized"),
+            (403, "forbidden"),
+            (404, "not_found"),
+            (405, "method_not_allowed"),
+            (411, "length_required"),
+            (415, "unsupported_media_type"),
+            (417, "expectation_failed"),
+            (429, "rate_limited"),
+            (500, "internal_error"),
+            (503, "unavailable"),
+            (504, "timeout"),
+            (418, "internal_error"),
+        ];
+        for (status, code) in cases {
+            let body = parse_response_json(&json_err(status, "m").into_bytes());
+            assert_eq!(body["code"], code, "status {status}");
+            assert_eq!(body["ok"], false);
         }
     }
 
@@ -2580,7 +2725,7 @@ mod tests {
             .await
             .unwrap();
 
-        let head = read_request_head(&mut server).await.expect("head should parse");
+        let head = read_request_head(&mut server, head_deadline()).await.expect("head should parse");
         assert_eq!(head.method, "POST");
         assert_eq!(head.path, "/api/send");
         assert_eq!(head.query, vec![("sync".to_string(), "true".to_string())]);
@@ -2604,7 +2749,7 @@ mod tests {
             .write_all(b"POST /api/send HTTP/1.1\r\nContent-Length: 10\r\n\r\n012")
             .await
             .unwrap();
-        let head = read_request_head(&mut server).await.expect("head should parse");
+        let head = read_request_head(&mut server, head_deadline()).await.expect("head should parse");
         assert_eq!(head.leftover, b"012", "only the first body bytes arrived with the head");
 
         client.write_all(b"3456").await.unwrap();
@@ -2620,7 +2765,7 @@ mod tests {
             .write_all(b"POST /api/send HTTP/1.1\r\nContent-Length: 4\r\n\r\nabcdEXTRA")
             .await
             .unwrap();
-        let head = read_request_head(&mut server).await.expect("head should parse");
+        let head = read_request_head(&mut server, head_deadline()).await.expect("head should parse");
         let body = read_request_body(&mut server, &head, 1024).await.expect("body should be complete");
         assert_eq!(body, b"abcd");
     }
@@ -2629,7 +2774,7 @@ mod tests {
     async fn test_request_body_over_limit_is_rejected_without_reading() {
         let (mut client, mut server) = socket_pair().await;
         client.write_all(b"POST /api/send HTTP/1.1\r\nContent-Length: 10\r\n\r\n").await.unwrap();
-        let head = read_request_head(&mut server).await.expect("head should parse");
+        let head = read_request_head(&mut server, head_deadline()).await.expect("head should parse");
 
         // Nothing more is sent: a reader that tried to fetch the body would wait out its 10 s timeout.
         let over = tokio::time::timeout(Duration::from_secs(2), read_request_body(&mut server, &head, 9))
@@ -2649,7 +2794,7 @@ mod tests {
             .write_all(b"POST /api/send HTTP/1.1\r\nContent-Length: 10\r\n\r\n01234")
             .await
             .unwrap();
-        let head = read_request_head(&mut server).await.expect("head should parse");
+        let head = read_request_head(&mut server, head_deadline()).await.expect("head should parse");
         client.shutdown().await.unwrap();
         assert!(read_request_body(&mut server, &head, 1024).await.is_none());
     }
@@ -2658,7 +2803,7 @@ mod tests {
     async fn test_request_without_content_length_has_empty_body() {
         let (mut client, mut server) = socket_pair().await;
         client.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\nstray").await.unwrap();
-        let head = read_request_head(&mut server).await.expect("head should parse");
+        let head = read_request_head(&mut server, head_deadline()).await.expect("head should parse");
         assert_eq!(head.content_length, 0);
         assert_eq!(read_request_body(&mut server, &head, 1024).await, Some(Vec::new()));
     }
@@ -2673,7 +2818,7 @@ mod tests {
 
         let (mut client, mut server) = socket_pair().await;
         client.write_all(raw).await.unwrap();
-        let head = read_request_head(&mut server).await.expect("head should parse");
+        let head = read_request_head(&mut server, head_deadline()).await.expect("head should parse");
         let body = read_request_body(&mut server, &head, max_body_bytes(&head.path)).await.expect("body");
         let split = head.into_request(body);
 
@@ -2683,6 +2828,259 @@ mod tests {
         assert_eq!(whole.headers, split.headers);
         assert_eq!(whole.body, split.body);
         assert_eq!(whole.body, b"hello");
+    }
+
+    // -------------------------------------------------------------------------
+    // Head deadline, framing checks and the lingering drain
+    // -------------------------------------------------------------------------
+
+    /// A head as the parser would build it, for the framing checks.
+    fn head_with(headers: &[(&str, &str)], content_length: usize, leftover: &[u8]) -> RequestHead {
+        RequestHead {
+            method: "POST".to_string(),
+            path: "/api/send".to_string(),
+            query: Vec::new(),
+            headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            content_length,
+            leftover: leftover.to_vec(),
+        }
+    }
+
+    /// Status and `code` of a rejection, or `None` when the request may proceed.
+    fn rejection(head: &RequestHead, limit: usize) -> Option<(u16, String)> {
+        head.framing_error(limit).map(|r| {
+            let status = r.status;
+            let code = parse_response_json(&r.into_bytes())["code"].as_str().unwrap().to_string();
+            (status, code)
+        })
+    }
+
+    #[test]
+    fn test_framing_error_accepts_plain_and_expect_continue_requests() {
+        assert_eq!(rejection(&head_with(&[], 0, b""), 10), None);
+        assert_eq!(rejection(&head_with(&[("Content-Length", "10")], 10, b""), 10), None, "limit is inclusive");
+        for value in ["100-continue", "100-Continue", "100-CONTINUE"] {
+            assert_eq!(rejection(&head_with(&[("Expect", value)], 5, b""), 10), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn test_framing_error_rejects_any_transfer_encoding_with_411() {
+        for headers in [
+            vec![("Transfer-Encoding", "chunked")],
+            vec![("transfer-encoding", "identity")],
+            vec![("Transfer-Encoding", "")],
+            vec![("Transfer-Encoding", "chunked"), ("Content-Length", "5")],
+            vec![("Transfer-Encoding ", "chunked")],
+            vec![(" Transfer-Encoding", "chunked")],
+        ] {
+            assert_eq!(rejection(&head_with(&headers, 5, b""), 10), Some((411, "length_required".to_string())), "{headers:?}");
+        }
+    }
+
+    #[test]
+    fn test_framing_error_oversize_content_length_is_the_plain_400() {
+        let head = head_with(&[], 11, b"");
+        assert_eq!(rejection(&head, 10), Some((400, "bad_request".to_string())));
+        let body = parse_response_json(&head.framing_error(10).unwrap().into_bytes());
+        assert_eq!(body["error"], "bad request");
+    }
+
+    #[test]
+    fn test_framing_error_rejects_other_expect_values_with_417() {
+        for headers in [
+            vec![("Expect", "200-ok")],
+            vec![("Expect", "100-continue, other")],
+            vec![("Expect", "")],
+            vec![("Expect", "100-continue"), ("Expect", "other")],
+        ] {
+            assert_eq!(rejection(&head_with(&headers, 5, b""), 10), Some((417, "expectation_failed".to_string())), "{headers:?}");
+        }
+    }
+
+    #[test]
+    fn test_framing_error_checks_transfer_encoding_then_size_then_expect() {
+        let both = [("Transfer-Encoding", "chunked"), ("Expect", "nope")];
+        assert_eq!(rejection(&head_with(&both, 99, b""), 10).map(|r| r.0), Some(411));
+        assert_eq!(rejection(&head_with(&[("Expect", "nope")], 99, b""), 10).map(|r| r.0), Some(400));
+        assert_eq!(rejection(&head_with(&[("Expect", "nope")], 5, b""), 10).map(|r| r.0), Some(417));
+    }
+
+    #[test]
+    fn test_awaiting_continue_only_while_the_body_is_incomplete() {
+        let expect = [("Expect", "100-Continue")];
+        assert!(head_with(&expect, 10, b"").awaiting_continue());
+        assert!(head_with(&expect, 10, b"012345678").awaiting_continue());
+        assert!(!head_with(&expect, 10, b"0123456789").awaiting_continue(), "body already complete");
+        assert!(!head_with(&expect, 0, b"").awaiting_continue(), "no body to wait for");
+        assert!(!head_with(&[], 10, b"").awaiting_continue(), "client did not ask");
+        assert!(!head_with(&[("Expect", "other")], 10, b"").awaiting_continue());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_request_head_deadline_beats_the_idle_timeout() {
+        let (_client, mut server) = socket_pair().await;
+        // A silent client would get READ_IDLE_TIMEOUT per read; the deadline ends it sooner.
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(3);
+        assert!(read_request_head(&mut server, deadline).await.is_none());
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_request_head_idle_timeout_still_applies_within_the_deadline() {
+        let (_client, mut server) = socket_pair().await;
+        let start = tokio::time::Instant::now();
+        assert!(read_request_head(&mut server, start + HEAD_READ_DEADLINE).await.is_none());
+        assert_eq!(start.elapsed(), READ_IDLE_TIMEOUT);
+    }
+
+    /// Pipe `chunks` to [`read_request_head`] over an in-memory pipe, `gap` of virtual time
+    /// apart, with the writer end held open as a live slow client's would be. Returns what the
+    /// reader returned and the virtual time it took. A pipe, not a socket: a chunk still in flight
+    /// in the kernel when a paused clock goes idle could lose a race against a timer.
+    async fn head_from_slow_client(chunks: &[&[u8]], gap: Duration) -> (Option<RequestHead>, Duration) {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let start = tokio::time::Instant::now();
+        let writer = async {
+            for (i, chunk) in chunks.iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(gap).await;
+                }
+                client.write_all(chunk).await.unwrap();
+            }
+        };
+        let reader = async {
+            let head = read_request_head(&mut server, start + HEAD_READ_DEADLINE).await;
+            (head, start.elapsed())
+        };
+        let (_, result) = tokio::join!(writer, reader);
+        result
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_request_head_wall_clock_deadline_cuts_off_a_head_trickled_within_the_idle_timeout() {
+        // Chunks 7 s apart never leave the reader idle for 10 s, but the blank line would only
+        // arrive at 28 s: the reader gives up at exactly 20 s.
+        let chunks: [&[u8]; 5] = [b"GET /health HTTP/1.1\r\n", b"X-A: 1\r\n", b"X-B: 2\r\n", b"X-C: 3\r\n", b"\r\n"];
+        let (head, took) = head_from_slow_client(&chunks, Duration::from_secs(7)).await;
+        assert!(head.is_none());
+        assert_eq!(took, Duration::from_secs(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_request_head_arriving_slowly_but_inside_the_deadline_is_accepted() {
+        let chunks: [&[u8]; 3] = [b"GET /health HTTP/1.1\r\n", b"Host: x\r\n", b"\r\n"];
+        let (head, took) = head_from_slow_client(&chunks, Duration::from_secs(7)).await;
+        assert_eq!(head.expect("head completes at 14 s").path, "/health");
+        assert_eq!(took, Duration::from_secs(14));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_request_head_idle_gap_over_the_read_timeout_ends_it_at_10s() {
+        let chunks: [&[u8]; 2] = [b"GET /health HTTP/1.1\r\n", b"\r\n"];
+        let (head, took) = head_from_slow_client(&chunks, Duration::from_secs(11)).await;
+        assert!(head.is_none());
+        assert_eq!(took, READ_IDLE_TIMEOUT);
+    }
+
+    /// Pipe a head declaring `body.len()` bytes, then `body` in `piece`-byte chunks `gap` of
+    /// virtual time apart, to the head and body readers. Returns the body result and the
+    /// virtual time it took.
+    async fn body_from_slow_client(body: &[u8], piece: usize, gap: Duration) -> (Option<Vec<u8>>, Duration) {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let start = tokio::time::Instant::now();
+        let writer = async {
+            let head = format!("POST /api/send HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len());
+            client.write_all(head.as_bytes()).await.unwrap();
+            for part in body.chunks(piece) {
+                tokio::time::sleep(gap).await;
+                client.write_all(part).await.unwrap();
+            }
+        };
+        let reader = async {
+            let head = read_request_head(&mut server, start + HEAD_READ_DEADLINE).await.expect("head");
+            let body = read_request_body(&mut server, &head, 1024).await;
+            (body, start.elapsed())
+        };
+        let (_, result) = tokio::join!(writer, reader);
+        result
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_request_body_has_no_total_deadline_only_a_per_read_idle_timeout() {
+        // Five pieces 7 s apart: the body is complete at 35 s, past the head's 20 s deadline.
+        let (body, took) = body_from_slow_client(&[b'x'; 25], 5, Duration::from_secs(7)).await;
+        assert_eq!(body, Some(vec![b'x'; 25]));
+        assert_eq!(took, Duration::from_secs(35));
+
+        // A gap over the idle timeout still ends it, at 10 s.
+        let (body, took) = body_from_slow_client(&[b'x'; 25], 5, Duration::from_secs(11)).await;
+        assert_eq!(body, None);
+        assert_eq!(took, READ_IDLE_TIMEOUT);
+    }
+
+    #[test]
+    fn test_read_and_drain_limits_have_their_documented_values() {
+        assert_eq!(READ_IDLE_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(HEAD_READ_DEADLINE, Duration::from_secs(20));
+        assert_eq!(DRAIN_MAX_BYTES, 64 * 1024);
+        assert_eq!(DRAIN_MAX_TIME, Duration::from_secs(1));
+    }
+
+    /// `respond_and_drain` on an in-memory pipe: returns the bytes of the pipe the helper left
+    /// unread, and what the client side received (everything up to EOF).
+    async fn drain_pipe(sent: usize) -> (usize, Vec<u8>) {
+        let (mut client, mut server) = tokio::io::duplex(1 << 20);
+        client.write_all(&vec![b'x'; sent]).await.unwrap();
+        respond_and_drain(&mut server, json_err(403, "no")).await;
+        // The helper stopped reading; whatever is left in the pipe is what it did not discard.
+        client.shutdown().await.unwrap();
+        let mut left = Vec::new();
+        server.read_to_end(&mut left).await.unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        (left.len(), received)
+    }
+
+    #[tokio::test]
+    async fn test_respond_and_drain_discards_up_to_the_byte_cap_and_delivers_the_response() {
+        let expected = json_err(403, "no").into_bytes();
+
+        let (left, received) = drain_pipe(10_000).await;
+        assert_eq!(left, 0, "a body under the cap is discarded whole");
+        assert_eq!(received, expected, "response arrives intact, then EOF");
+
+        let (left, received) = drain_pipe(DRAIN_MAX_BYTES).await;
+        assert_eq!(left, 0, "a body of exactly the cap is discarded whole");
+        assert_eq!(received, expected);
+
+        let (left, received) = drain_pipe(200 * 1024).await;
+        assert_eq!(left, 200 * 1024 - DRAIN_MAX_BYTES, "stops reading at exactly 64 KiB");
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_respond_and_drain_gives_up_on_a_silent_client_after_the_time_cap() {
+        let (mut client, mut server) = tokio::io::duplex(1 << 20);
+        client.write_all(b"partial body").await.unwrap(); // then silence, connection left open
+        let start = tokio::time::Instant::now();
+        respond_and_drain(&mut server, json_err(401, "no")).await;
+        assert_eq!(start.elapsed(), DRAIN_MAX_TIME);
+
+        // The client still got the response and the server's EOF while it was silent.
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, json_err(401, "no").into_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_respond_and_drain_returns_at_once_when_the_client_closes() {
+        let (mut client, mut server) = tokio::io::duplex(1 << 20);
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), respond_and_drain(&mut server, json_err(403, "no")))
+            .await
+            .expect("EOF from the client ends the drain without waiting for the time cap");
     }
 
     #[test]
