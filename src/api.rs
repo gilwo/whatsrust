@@ -44,15 +44,52 @@ pub(crate) struct HttpRequest {
 }
 
 impl HttpRequest {
-    fn query_get(&self, key: &str) -> Option<&str> {
-        self.query.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
-    }
-
     fn header_get(&self, key: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(key))
             .map(|(_, v)| v.as_str())
+    }
+
+    /// Drop the transport-level headers (already used by the gate and token check) and attach
+    /// `context`, leaving what a route handler needs.
+    fn into_rest(self, context: CallContext) -> RestRequest {
+        RestRequest {
+            method: self.method,
+            path: self.path,
+            query: self.query,
+            body: self.body,
+            context,
+        }
+    }
+}
+
+/// What a route handler may know about its caller beyond the request itself. Handlers take
+/// these facts from here rather than from the request, so a caller that is not a socket client
+/// can state them explicitly.
+pub(crate) struct CallContext {
+    /// Whether the caller may make the daemon read local files (`path` media uploads).
+    pub(crate) loopback_file_access: bool,
+}
+
+/// A REST request as the router sees it: no socket, no transport headers. The socket server
+/// builds one per request; any other caller can construct one directly.
+pub(crate) struct RestRequest {
+    /// HTTP method, e.g. `GET`.
+    pub(crate) method: String,
+    /// Request path without the query string.
+    pub(crate) path: String,
+    /// Decoded query parameters in request order.
+    pub(crate) query: Vec<(String, String)>,
+    /// Raw request body.
+    pub(crate) body: Vec<u8>,
+    /// Facts about the caller.
+    pub(crate) context: CallContext,
+}
+
+impl RestRequest {
+    fn query_get(&self, key: &str) -> Option<&str> {
+        self.query.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 }
 
@@ -104,33 +141,62 @@ fn decode_query_component(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
-    let status_text = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "Unknown",
-    };
-    let header = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let mut resp = header.into_bytes();
-    resp.extend_from_slice(body);
-    resp
+/// A structured REST response. [`ApiResponse::into_bytes`] is the one place that turns it into
+/// HTTP/1.1 bytes; SSE streams bypass it and write their own headers.
+#[derive(Debug)]
+pub(crate) struct ApiResponse {
+    /// HTTP status code.
+    pub(crate) status: u16,
+    /// `Content-Type` header value.
+    pub(crate) content_type: &'static str,
+    /// Extra response headers, written in order after `Content-Length`.
+    pub(crate) headers: Vec<(&'static str, String)>,
+    /// Response body.
+    pub(crate) body: Vec<u8>,
 }
 
-fn json_response(status: u16, body: &str) -> Vec<u8> {
-    http_response(status, "application/json", body.as_bytes())
+impl ApiResponse {
+    /// A response with no extra headers.
+    pub(crate) fn new(status: u16, content_type: &'static str, body: Vec<u8>) -> Self {
+        Self { status, content_type, headers: Vec::new(), body }
+    }
+
+    /// Serialize as an HTTP/1.1 response: status line, `Content-Type`, `Content-Length`, any
+    /// extra headers, `Connection: close`, a blank line, then the body.
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        let status_text = match self.status {
+            200 => "OK",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            504 => "Gateway Timeout",
+            _ => "Unknown",
+        };
+        let mut header = format!(
+            "HTTP/1.1 {} {status_text}\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
+            self.status,
+            self.content_type,
+            self.body.len()
+        );
+        for (name, value) in &self.headers {
+            header.push_str(&format!("{name}: {value}\r\n"));
+        }
+        header.push_str("Connection: close\r\n\r\n");
+        let mut resp = header.into_bytes();
+        resp.extend_from_slice(&self.body);
+        resp
+    }
 }
 
-fn json_ok(data: serde_json::Value) -> Vec<u8> {
+fn json_response(status: u16, body: &str) -> ApiResponse {
+    ApiResponse::new(status, "application/json", body.as_bytes().to_vec())
+}
+
+fn json_ok(data: serde_json::Value) -> ApiResponse {
     let mut map = match data {
         serde_json::Value::Object(m) => m,
         other => {
@@ -143,15 +209,15 @@ fn json_ok(data: serde_json::Value) -> Vec<u8> {
     json_response(200, &serde_json::Value::Object(map).to_string())
 }
 
-fn json_ok_id(id: &str) -> Vec<u8> {
+fn json_ok_id(id: &str) -> ApiResponse {
     json_response(200, &json!({"ok": true, "id": id}).to_string())
 }
 
-fn json_ok_simple() -> Vec<u8> {
+fn json_ok_simple() -> ApiResponse {
     json_response(200, r#"{"ok":true}"#)
 }
 
-fn json_err(status: u16, msg: &str) -> Vec<u8> {
+fn json_err(status: u16, msg: &str) -> ApiResponse {
     let code = match status {
         400 => "bad_request",
         401 => "unauthorized",
@@ -165,13 +231,13 @@ fn json_err(status: u16, msg: &str) -> Vec<u8> {
     json_response(status, &json!({"ok": false, "code": code, "error": msg}).to_string())
 }
 
-fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Vec<u8>> {
+fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ApiResponse> {
     serde_json::from_slice(body).map_err(|e| json_err(400, &format!("invalid JSON: {e}")))
 }
 
 /// 504 for a sync send that timed out while its job is still queued. Carries the `job_id`
 /// and a "do not retry" message so a client does not re-send and deliver a duplicate.
-fn send_timeout_response(t: &SendTimedOut) -> Vec<u8> {
+fn send_timeout_response(t: &SendTimedOut) -> ApiResponse {
     let body = json!({"ok": false, "code": "timeout", "error": t.to_string(), "job_id": t.job_id});
     json_response(504, &body.to_string())
 }
@@ -179,7 +245,7 @@ fn send_timeout_response(t: &SendTimedOut) -> Vec<u8> {
 /// Classify bridge errors into HTTP status codes for machine-friendly responses.
 /// A [`SendTimedOut`] anywhere in the error chain wins (found by downcast, so added
 /// `.context()` layers cannot hide it); every other error is classified by message.
-fn bridge_err(e: anyhow::Error) -> Vec<u8> {
+fn bridge_err(e: anyhow::Error) -> ApiResponse {
     if let Some(t) = e.chain().find_map(|c| c.downcast_ref::<SendTimedOut>()) {
         return send_timeout_response(t);
     }
@@ -397,7 +463,51 @@ const MAX_MEDIA_READ_BYTES: u64 = 50 * 1024 * 1024;
 // Request parsing
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest> {
+/// A parsed request line and headers, plus any body bytes that arrived in the same reads.
+pub(crate) struct RequestHead {
+    /// HTTP method as sent, e.g. `GET`.
+    pub(crate) method: String,
+    /// Request path without the query string.
+    pub(crate) path: String,
+    query: Vec<(String, String)>,
+    /// Request headers in arrival order, names as sent.
+    pub(crate) headers: Vec<(String, String)>,
+    /// Declared `Content-Length`; 0 when absent or unparseable.
+    content_length: usize,
+    /// Body bytes read past the blank line that ends the head.
+    leftover: Vec<u8>,
+}
+
+impl RequestHead {
+    /// Combine the head with its body into a complete request.
+    fn into_request(self, body: Vec<u8>) -> HttpRequest {
+        HttpRequest {
+            method: self.method,
+            path: self.path,
+            query: self.query,
+            headers: self.headers,
+            body,
+        }
+    }
+}
+
+/// Body size limit for a request to `path`: 70 MiB for media endpoints (base64 of 50 MiB),
+/// 1 MiB otherwise.
+fn max_body_bytes(path: &str) -> usize {
+    let is_media_route = path.starts_with("/api/image")
+        || path.starts_with("/api/video")
+        || path.starts_with("/api/audio")
+        || path.starts_with("/api/doc")
+        || path.starts_with("/api/sticker")
+        || path.starts_with("/api/view-once")
+        || path.starts_with("/api/status-image")
+        || path.starts_with("/api/status-video");
+    if is_media_route { 70 * 1024 * 1024 } else { 1024 * 1024 }
+}
+
+/// Read until the blank line that ends the request head (10 s per read) and parse it.
+/// `None` on timeout, EOF, I/O error, a head over 128 KiB, or a head that does not parse.
+pub(crate) async fn read_request_head(stream: &mut tokio::net::TcpStream) -> Option<RequestHead> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
 
@@ -456,60 +566,64 @@ pub(crate) async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<H
         }
     }
 
-    // Body size limit: 70 MiB for media endpoints (base64 of 50 MiB), 1 MiB otherwise.
-    // We check the route after parsing headers to apply the correct limit.
-    let is_media_route = path.starts_with("/api/image")
-        || path.starts_with("/api/video")
-        || path.starts_with("/api/audio")
-        || path.starts_with("/api/doc")
-        || path.starts_with("/api/sticker")
-        || path.starts_with("/api/view-once")
-        || path.starts_with("/api/status-image")
-        || path.starts_with("/api/status-video");
-    let max_body: usize = if is_media_route { 70 * 1024 * 1024 } else { 1024 * 1024 };
-    if content_length > max_body {
-        return None;
-    }
-
-    // Read body
-    let body_start = header_end + 4;
-    let body = if content_length > 0 {
-        let mut body_buf = if body_start < buf.len() {
-            buf[body_start..].to_vec()
-        } else {
-            Vec::new()
-        };
-        while body_buf.len() < content_length {
-            match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut tmp)).await {
-                Ok(Ok(0)) | Err(_) => break,
-                Ok(Ok(n)) => body_buf.extend_from_slice(&tmp[..n]),
-                Ok(Err(_)) => break,
-            }
-        }
-        // Reject truncated bodies — don't process partial requests
-        if body_buf.len() < content_length {
-            return None;
-        }
-        body_buf.truncate(content_length);
-        body_buf
-    } else {
-        Vec::new()
-    };
-
-    Some(HttpRequest {
+    Some(RequestHead {
         method,
         path,
         query,
         headers,
-        body,
+        content_length,
+        leftover: buf[header_end + 4..].to_vec(),
     })
+}
+
+/// Read the body that `head` declares (10 s per read), starting from the bytes that arrived
+/// with the head. `None` if the declared length exceeds `limit` (nothing is read then), or the
+/// stream ends, errors or stalls before the whole body arrives.
+pub(crate) async fn read_request_body(
+    stream: &mut tokio::net::TcpStream,
+    head: &RequestHead,
+    limit: usize,
+) -> Option<Vec<u8>> {
+    let content_length = head.content_length;
+    if content_length > limit {
+        return None;
+    }
+    if content_length == 0 {
+        return Some(Vec::new());
+    }
+
+    let mut tmp = [0u8; 4096];
+    let mut body = head.leftover.clone();
+    while body.len() < content_length {
+        match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut tmp)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
+            Ok(Err(_)) => break,
+        }
+    }
+    // Reject truncated bodies — don't process partial requests
+    if body.len() < content_length {
+        return None;
+    }
+    body.truncate(content_length);
+    Some(body)
+}
+
+/// Read one whole request: the head, then the body under the limit for its path.
+#[cfg(test)]
+pub(crate) async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest> {
+    let head = read_request_head(stream).await?;
+    let body = read_request_body(stream, &head, max_body_bytes(&head.path)).await?;
+    Some(head.into_request(body))
 }
 
 // ---------------------------------------------------------------------------
 // Route dispatch
 // ---------------------------------------------------------------------------
 
-async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback: bool) -> Vec<u8> {
+/// Route `req` to its handler and return the structured response. No socket is involved, so
+/// any caller that can build a [`RestRequest`] can use it.
+pub(crate) async fn handle_request(bridge: &WhatsAppBridge, req: &RestRequest) -> ApiResponse {
     match (req.method.as_str(), req.path.as_str()) {
         // Status & QR
         ("GET", "/api/status") | ("GET", "/health") | ("GET", "/") => handle_status(bridge).await,
@@ -528,17 +642,17 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         ("POST", "/api/react") => handle_react(bridge, &req.body).await,
         ("POST", "/api/unreact") => handle_unreact(bridge, &req.body).await,
         ("POST", "/api/revoke") => handle_revoke(bridge, &req.body).await,
-        ("POST", "/api/image") => handle_media(bridge, &req.body, is_loopback, MediaKind::Image).await,
-        ("POST", "/api/video") => handle_media(bridge, &req.body, is_loopback, MediaKind::Video).await,
-        ("POST", "/api/audio") => handle_media(bridge, &req.body, is_loopback, MediaKind::Audio).await,
-        ("POST", "/api/doc") => handle_media(bridge, &req.body, is_loopback, MediaKind::Doc).await,
-        ("POST", "/api/sticker") => handle_media(bridge, &req.body, is_loopback, MediaKind::Sticker).await,
+        ("POST", "/api/image") => handle_media(bridge, &req.body, &req.context, MediaKind::Image).await,
+        ("POST", "/api/video") => handle_media(bridge, &req.body, &req.context, MediaKind::Video).await,
+        ("POST", "/api/audio") => handle_media(bridge, &req.body, &req.context, MediaKind::Audio).await,
+        ("POST", "/api/doc") => handle_media(bridge, &req.body, &req.context, MediaKind::Doc).await,
+        ("POST", "/api/sticker") => handle_media(bridge, &req.body, &req.context, MediaKind::Sticker).await,
         ("POST", "/api/location") => handle_location(bridge, &req.body).await,
         ("POST", "/api/contact") => handle_contact(bridge, &req.body).await,
         ("POST", "/api/forward") => handle_forward(bridge, &req.body).await,
         ("POST", "/api/poll") => handle_poll(bridge, &req.body).await,
-        ("POST", "/api/view-once-image") => handle_media(bridge, &req.body, is_loopback, MediaKind::ViewOnceImage).await,
-        ("POST", "/api/view-once-video") => handle_media(bridge, &req.body, is_loopback, MediaKind::ViewOnceVideo).await,
+        ("POST", "/api/view-once-image") => handle_media(bridge, &req.body, &req.context, MediaKind::ViewOnceImage).await,
+        ("POST", "/api/view-once-video") => handle_media(bridge, &req.body, &req.context, MediaKind::ViewOnceVideo).await,
         ("POST", "/api/typing") => handle_jid_action(bridge, &req.body, JidAction::StartTyping).await,
         ("POST", "/api/stop-typing") => handle_jid_action(bridge, &req.body, JidAction::StopTyping).await,
         ("POST", "/api/recording") => handle_jid_action(bridge, &req.body, JidAction::StartRecording).await,
@@ -592,7 +706,7 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
 // Endpoint handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_status(bridge: &WhatsAppBridge) -> Vec<u8> {
+async fn handle_status(bridge: &WhatsAppBridge) -> ApiResponse {
     let state = bridge.state();
     let m = bridge.metrics();
     let queue = bridge.queue_depth().await;
@@ -618,7 +732,7 @@ async fn handle_status(bridge: &WhatsAppBridge) -> Vec<u8> {
     }))
 }
 
-fn handle_qr(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+fn handle_qr(bridge: &WhatsAppBridge, req: &RestRequest) -> ApiResponse {
     let qr_data = bridge.current_qr();
     match qr_data {
         Some(data) => {
@@ -628,10 +742,10 @@ fn handle_qr(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
                 None => return json_err(500, "failed to render QR code"),
             };
             match format {
-                "png" => http_response(200, "image/png", &qr.png(8)),
-                "svg" => http_response(200, "image/svg+xml", qr.svg().as_bytes()),
-                "terminal" => http_response(200, "text/plain", qr.terminal().as_bytes()),
-                "html" => http_response(200, "text/html", qr.html().as_bytes()),
+                "png" => ApiResponse::new(200, "image/png", qr.png(8)),
+                "svg" => ApiResponse::new(200, "image/svg+xml", qr.svg().into_bytes()),
+                "terminal" => ApiResponse::new(200, "text/plain", qr.terminal().into_bytes()),
+                "html" => ApiResponse::new(200, "text/html", qr.html().into_bytes()),
                 _ => json_ok(json!({
                     "qr_data": data,
                     "terminal": qr.terminal(),
@@ -642,7 +756,7 @@ fn handle_qr(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
     }
 }
 
-async fn handle_groups(bridge: &WhatsAppBridge) -> Vec<u8> {
+async fn handle_groups(bridge: &WhatsAppBridge) -> ApiResponse {
     match bridge.get_joined_groups().await {
         Ok(groups) => {
             let list: Vec<serde_json::Value> = groups
@@ -659,7 +773,7 @@ async fn handle_groups(bridge: &WhatsAppBridge) -> Vec<u8> {
     }
 }
 
-async fn handle_group_info(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+async fn handle_group_info(bridge: &WhatsAppBridge, req: &RestRequest) -> ApiResponse {
     let jid = match req.query_get("jid") {
         Some(j) => j,
         None => return json_err(400, "missing ?jid= parameter"),
@@ -698,7 +812,7 @@ struct SendReq {
     link_preview: Option<crate::outbound::LinkPreview>,
 }
 
-async fn handle_send(bridge: &WhatsAppBridge, body: &[u8], sync: bool) -> Vec<u8> {
+async fn handle_send(bridge: &WhatsAppBridge, body: &[u8], sync: bool) -> ApiResponse {
     let req: SendReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     if sync {
         // Reject features not supported in sync mode — prevents silent data loss
@@ -752,7 +866,7 @@ struct ReplyReq {
     mentions: Vec<String>,
 }
 
-async fn handle_reply(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_reply(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: ReplyReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     let reply_sender = req
         .sender_jid
@@ -777,7 +891,7 @@ struct EditReq {
     text: String,
 }
 
-async fn handle_edit(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_edit(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: EditReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.edit_message(&req.jid, &req.id, &req.text).await {
         Ok(()) => json_ok_simple(),
@@ -806,7 +920,7 @@ fn resolve_group_reaction_target(
     jid: &str,
     from_me: Option<bool>,
     sender_jid: Option<&str>,
-) -> Result<bool, Vec<u8>> {
+) -> Result<bool, ApiResponse> {
     if jid.ends_with("@g.us") {
         if sender_jid.is_none() {
             return Err(json_err(400, "sender_jid is required for group reactions"));
@@ -817,7 +931,7 @@ fn resolve_group_reaction_target(
     Ok(from_me.unwrap_or(sender_jid.is_none()))
 }
 
-async fn handle_react(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_react(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: ReactReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     if req.emoji.is_empty() {
         return json_err(400, "emoji must not be empty");
@@ -838,7 +952,7 @@ async fn handle_react(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     }
 }
 
-async fn handle_unreact(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_unreact(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: ReactionTargetReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     let from_me = match resolve_group_reaction_target(&req.jid, req.from_me, req.sender_jid.as_deref()) {
         Ok(v) => v,
@@ -861,7 +975,7 @@ struct RevokeReq {
     id: String,
 }
 
-async fn handle_revoke(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_revoke(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: RevokeReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.revoke_message(&req.jid, &req.id).await {
         Ok(()) => json_ok_simple(),
@@ -882,7 +996,7 @@ struct JidReq {
     jid: String,
 }
 
-async fn handle_jid_action(bridge: &WhatsAppBridge, body: &[u8], action: JidAction) -> Vec<u8> {
+async fn handle_jid_action(bridge: &WhatsAppBridge, body: &[u8], action: JidAction) -> ApiResponse {
     let req: JidReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     let result = match action {
         JidAction::StartTyping => bridge.start_typing(&req.jid).await,
@@ -919,7 +1033,7 @@ struct MessageActionReq {
     from_me: Option<bool>,
 }
 
-async fn handle_message_action(bridge: &WhatsAppBridge, body: &[u8], action: MessageAction) -> Vec<u8> {
+async fn handle_message_action(bridge: &WhatsAppBridge, body: &[u8], action: MessageAction) -> ApiResponse {
     let req: MessageActionReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     let from_me = req.from_me.unwrap_or(true);
     let result = match action {
@@ -941,7 +1055,7 @@ struct GroupCreateReq {
     participants: Vec<String>,
 }
 
-async fn handle_group_create(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_group_create(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: GroupCreateReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     let parts: Vec<&str> = req.participants.iter().map(|s| s.as_str()).collect();
     match bridge.create_group(&req.name, &parts).await {
@@ -956,7 +1070,7 @@ struct GroupSubjectReq {
     subject: String,
 }
 
-async fn handle_group_subject(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_group_subject(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: GroupSubjectReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.set_group_subject(&req.jid, &req.subject).await {
         Ok(()) => json_ok_simple(),
@@ -970,7 +1084,7 @@ struct GroupDescriptionReq {
     description: Option<String>,
 }
 
-async fn handle_group_description(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_group_description(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: GroupDescriptionReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.set_group_description(&req.jid, req.description.as_deref()).await {
         Ok(()) => json_ok_simple(),
@@ -978,7 +1092,7 @@ async fn handle_group_description(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u
     }
 }
 
-async fn handle_group_invite_link(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+async fn handle_group_invite_link(bridge: &WhatsAppBridge, req: &RestRequest) -> ApiResponse {
     let jid = match req.query_get("jid") {
         Some(j) => j,
         None => return json_err(400, "missing jid query parameter"),
@@ -997,7 +1111,7 @@ struct GroupParticipantsReq {
     participants: Vec<String>,
 }
 
-async fn handle_group_participants(bridge: &WhatsAppBridge, body: &[u8], action: ParticipantAction) -> Vec<u8> {
+async fn handle_group_participants(bridge: &WhatsAppBridge, body: &[u8], action: ParticipantAction) -> ApiResponse {
     let req: GroupParticipantsReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     let parts: Vec<&str> = req.participants.iter().map(|s| s.as_str()).collect();
     match action {
@@ -1039,7 +1153,7 @@ struct MediaReq {
     voice_note: Option<bool>,
 }
 
-async fn read_file_for_media(path: &str) -> Result<Vec<u8>, Vec<u8>> {
+async fn read_file_for_media(path: &str) -> Result<Vec<u8>, ApiResponse> {
     let meta = tokio::fs::metadata(path)
         .await
         .map_err(|e| json_err(400, &format!("cannot stat file {path}: {e}")))?;
@@ -1098,7 +1212,7 @@ fn mime_for_doc(path: &std::path::Path) -> &'static str {
 
 // --- History & Search ---
 
-async fn handle_history(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+async fn handle_history(bridge: &WhatsAppBridge, req: &RestRequest) -> ApiResponse {
     let jid = req.query_get("jid");
     let limit: i64 = req.query_get("limit").and_then(|v| v.parse().ok()).unwrap_or(50).max(1).min(200);
     let before: Option<i64> = req.query_get("before").and_then(|v| v.parse().ok());
@@ -1111,7 +1225,7 @@ async fn handle_history(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
     }
 }
 
-async fn handle_search(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+async fn handle_search(bridge: &WhatsAppBridge, req: &RestRequest) -> ApiResponse {
     let q = match req.query_get("q") {
         Some(q) if !q.is_empty() => q,
         _ => return json_err(400, "query parameter 'q' is required"),
@@ -1141,7 +1255,7 @@ struct HistoryFetchReq {
 }
 
 /// Validate the mode string; return a canonical mode or an error response.
-fn validate_fetch_mode(mode: &str, target_value: Option<i64>) -> Result<(), Vec<u8>> {
+fn validate_fetch_mode(mode: &str, target_value: Option<i64>) -> Result<(), ApiResponse> {
     match mode {
         "all" => Ok(()),
         "since" => {
@@ -1171,7 +1285,7 @@ fn enqueue_outcome_to_response(
     requested_target: Option<i64>,
     resume_anchor_ts: Option<i64>,
     more_remain: bool,
-) -> Vec<u8> {
+) -> ApiResponse {
     use crate::storage::EnqueueOutcome;
     match outcome {
         EnqueueOutcome::Accepted { job_id, accepted_target } => {
@@ -1223,7 +1337,7 @@ fn enqueue_outcome_to_response(
 }
 
 /// POST /api/history-fetch — trigger a backfill job for a chat.
-async fn handle_history_fetch_trigger(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_history_fetch_trigger(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: HistoryFetchReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
 
     // chat_jid is required
@@ -1326,7 +1440,7 @@ async fn handle_history_fetch_trigger(bridge: &WhatsAppBridge, body: &[u8]) -> V
 ///
 /// With ?job_id=N → get a single job by ID.
 /// With ?active=true → list only active jobs; otherwise list all.
-async fn handle_history_fetch_status(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+async fn handle_history_fetch_status(bridge: &WhatsAppBridge, req: &RestRequest) -> ApiResponse {
     if let Some(id_str) = req.query_get("job_id") {
         let id: i64 = match id_str.parse() {
             Ok(v) => v,
@@ -1361,7 +1475,7 @@ struct PurgeEmbeddingsReq {
 }
 
 /// POST /api/history-fetch/cancel — cancel a backfill job.
-async fn handle_history_fetch_cancel(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_history_fetch_cancel(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: HistoryFetchCancelReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     let job_id = match req.job_id {
         Some(id) => id,
@@ -1374,7 +1488,7 @@ async fn handle_history_fetch_cancel(bridge: &WhatsAppBridge, body: &[u8]) -> Ve
     }
 }
 
-async fn handle_purge_embeddings(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_purge_embeddings(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: PurgeEmbeddingsReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
 
     let model_id = match req.model_id.as_deref().filter(|s| !s.is_empty()) {
@@ -1394,7 +1508,7 @@ async fn handle_purge_embeddings(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8
 
 enum MediaKind { Image, Video, Audio, Doc, Sticker, ViewOnceImage, ViewOnceVideo }
 
-async fn handle_media(bridge: &WhatsAppBridge, body: &[u8], is_loopback: bool, kind: MediaKind) -> Vec<u8> {
+async fn handle_media(bridge: &WhatsAppBridge, body: &[u8], ctx: &CallContext, kind: MediaKind) -> ApiResponse {
     let req: MediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
 
     // Reject ambiguous requests with both path and base64 data
@@ -1421,7 +1535,7 @@ async fn handle_media(bridge: &WhatsAppBridge, body: &[u8], is_loopback: bool, k
         (bytes, mime, fname)
     } else if let Some(ref path_str) = req.path {
         // Path mode — loopback-only
-        if !is_loopback {
+        if !ctx.loopback_file_access {
             return json_err(403, "local-path media uploads are disabled for non-loopback API binds");
         }
         let bytes = match read_file_for_media(path_str).await { Ok(d) => d, Err(e) => return e };
@@ -1465,7 +1579,7 @@ struct LocationReq {
     lon: f64,
 }
 
-async fn handle_location(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_location(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: LocationReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.send_location(&req.jid, req.lat, req.lon, None, None).await {
         Ok(()) => json_ok_simple(),
@@ -1480,7 +1594,7 @@ struct ContactReq {
     phone: String,
 }
 
-async fn handle_contact(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_contact(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: ContactReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     // Sanitize: vCard fields must not contain newlines or control characters
     // which could inject additional vCard properties or corrupt the structure.
@@ -1505,7 +1619,7 @@ struct ForwardReq {
     msg_id: String,
 }
 
-async fn handle_forward(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_forward(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: ForwardReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.forward_message(&req.jid, &req.msg_id).await {
         Ok(id) => json_ok_id(&id),
@@ -1521,7 +1635,7 @@ struct PollReq {
     selectable_count: u32,
 }
 
-async fn handle_poll(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_poll(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: PollReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     let (question, options) = match crate::bridge::normalize_poll_spec(
         &req.question,
@@ -1571,7 +1685,7 @@ struct StatusRevokeReq {
     privacy: Option<String>,
 }
 
-async fn handle_status_text(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_status_text(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: StatusTextReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     if req.recipients.is_empty() {
         return json_err(400, "recipients must not be empty");
@@ -1582,7 +1696,7 @@ async fn handle_status_text(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     }
 }
 
-async fn handle_status_image(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_status_image(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: StatusMediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     if req.recipients.is_empty() {
         return json_err(400, "recipients must not be empty");
@@ -1598,7 +1712,7 @@ async fn handle_status_image(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     }
 }
 
-async fn handle_status_video(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_status_video(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: StatusMediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     if req.recipients.is_empty() {
         return json_err(400, "recipients must not be empty");
@@ -1615,7 +1729,7 @@ async fn handle_status_video(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     }
 }
 
-async fn handle_status_revoke(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_status_revoke(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
     let req: StatusRevokeReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     if req.recipients.is_empty() {
         return json_err(400, "recipients must not be empty");
@@ -1785,14 +1899,17 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
         }
     };
 
-    let is_loopback = is_loopback_bind(&bind);
+    // Allowlists (ADR 0044) and the SSE semaphore are built once at startup.
+    let cfg = Arc::new(ServeConfig {
+        is_loopback: is_loopback_bind(&bind),
+        api_token,
+        allowed_origins: parse_allowlist_env("WHATSRUST_ALLOWED_ORIGINS"),
+        allowed_hosts: parse_allowlist_env("WHATSRUST_ALLOWED_HOSTS"),
+        sse_sem: Arc::new(Semaphore::new(SSE_MAX_CONNECTIONS)),
+        sse_cancel: cancel.clone(),
+    });
     // Cap concurrent connections to prevent slowloris/flood exhaustion.
     let conn_sem = Arc::new(Semaphore::new(64));
-    // Separate semaphore for SSE so long-lived streams don't starve normal requests.
-    let sse_sem = Arc::new(Semaphore::new(SSE_MAX_CONNECTIONS));
-    // CSRF / DNS-rebinding allowlists (ADR 0044) — parsed once at startup.
-    let allowed_origins = Arc::new(parse_allowlist_env("WHATSRUST_ALLOWED_ORIGINS"));
-    let allowed_hosts = Arc::new(parse_allowlist_env("WHATSRUST_ALLOWED_HOSTS"));
 
     loop {
         tokio::select! {
@@ -1801,69 +1918,92 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
                 let permit = match conn_sem.clone().try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
-                        let _ = stream.write_all(&json_err(503, "too many connections")).await;
+                        let _ = stream.write_all(&json_err(503, "too many connections").into_bytes()).await;
                         continue;
                     }
                 };
                 let bridge = bridge.clone();
-                let api_token = api_token.clone();
-                let sse_sem = sse_sem.clone();
-                let sse_cancel = cancel.clone();
-                let allowed_origins = allowed_origins.clone();
-                let allowed_hosts = allowed_hosts.clone();
+                let cfg = cfg.clone();
                 tokio::spawn(async move {
                     let _permit = permit; // held until handler completes
-                    let req = match read_request(&mut stream).await {
-                        Some(r) => r,
-                        None => {
-                            let _ = stream.write_all(&json_err(400, "bad request")).await;
-                            return;
-                        }
-                    };
-
-                    // CSRF / DNS-rebinding / Content-Type gate (ADR 0044) — applied
-                    // before routing to EVERY route, including SSE and auth, so a
-                    // cross-site "simple" request never reaches a handler.
-                    if let Err((status, reason)) = gate_request(
-                        &req.method,
-                        &req.headers,
-                        is_loopback,
-                        &allowed_origins,
-                        &allowed_hosts,
-                    ) {
-                        debug!(method = %req.method, path = %req.path, reason = %reason, "request rejected by origin/host/content-type gate");
-                        let _ = stream.write_all(&json_err(status, &reason)).await;
-                        return;
-                    }
-
-                    if let Some(expected_token) = api_token.as_deref() {
-                        if !request_has_api_token(&req, expected_token) {
-                            let _ = stream.write_all(&json_err(401, "unauthorized")).await;
-                            return;
-                        }
-                    }
-
-                    // SSE endpoint — long-lived, uses dedicated semaphore
-                    if req.method == "GET" && req.path == "/api/events" {
-                        let sse_permit = match sse_sem.try_acquire_owned() {
-                            Ok(p) => p,
-                            Err(_) => {
-                                let _ = stream.write_all(&json_err(503, "too many SSE connections")).await;
-                                return;
-                            }
-                        };
-                        handle_sse(&bridge, &mut stream, &sse_cancel).await;
-                        drop(sse_permit);
-                        return;
-                    }
-
-                    let response = handle_request(&bridge, &req, is_loopback).await;
-                    let _ = stream.write_all(&response).await;
+                    serve_connection(stream, &bridge, &cfg).await;
                 });
             }
             _ = cancel.cancelled() => break,
         }
     }
+}
+
+/// Per-listener settings that [`serve_connection`] reads for every accepted connection.
+/// [`serve`] builds one from the environment; tests build one explicitly.
+struct ServeConfig {
+    /// Whether the listener is bound to a loopback address (gates `path` media uploads and
+    /// the default `Host` allowance).
+    is_loopback: bool,
+    /// Required API token, when configured.
+    api_token: Option<String>,
+    /// `Origin` allowlist for the request gate (ADR 0044).
+    allowed_origins: Vec<String>,
+    /// `Host` allowlist for the request gate (ADR 0044).
+    allowed_hosts: Vec<String>,
+    /// Caps concurrent SSE streams so long-lived connections don't starve normal requests.
+    sse_sem: Arc<Semaphore>,
+    /// Ends SSE streams on shutdown.
+    sse_cancel: CancellationToken,
+}
+
+/// Read one request from `stream`, run it through the gate and token check, and write the
+/// response (or hand the stream to the SSE handler). The stream closes when this returns.
+async fn serve_connection(mut stream: tokio::net::TcpStream, bridge: &WhatsAppBridge, cfg: &ServeConfig) {
+    let Some(head) = read_request_head(&mut stream).await else {
+        let _ = stream.write_all(&json_err(400, "bad request").into_bytes()).await;
+        return;
+    };
+    let Some(body) = read_request_body(&mut stream, &head, max_body_bytes(&head.path)).await else {
+        let _ = stream.write_all(&json_err(400, "bad request").into_bytes()).await;
+        return;
+    };
+    let req = head.into_request(body);
+
+    // CSRF / DNS-rebinding / Content-Type gate (ADR 0044) — applied
+    // before routing to EVERY route, including SSE and auth, so a
+    // cross-site "simple" request never reaches a handler.
+    if let Err((status, reason)) = gate_request(
+        &req.method,
+        &req.headers,
+        cfg.is_loopback,
+        &cfg.allowed_origins,
+        &cfg.allowed_hosts,
+    ) {
+        debug!(method = %req.method, path = %req.path, reason = %reason, "request rejected by origin/host/content-type gate");
+        let _ = stream.write_all(&json_err(status, &reason).into_bytes()).await;
+        return;
+    }
+
+    if let Some(expected_token) = cfg.api_token.as_deref() {
+        if !request_has_api_token(&req, expected_token) {
+            let _ = stream.write_all(&json_err(401, "unauthorized").into_bytes()).await;
+            return;
+        }
+    }
+
+    // SSE endpoint — long-lived, uses dedicated semaphore
+    if req.method == "GET" && req.path == "/api/events" {
+        let sse_permit = match cfg.sse_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let _ = stream.write_all(&json_err(503, "too many SSE connections").into_bytes()).await;
+                return;
+            }
+        };
+        handle_sse(bridge, &mut stream, &cfg.sse_cancel).await;
+        drop(sse_permit);
+        return;
+    }
+
+    let context = CallContext { loopback_file_access: cfg.is_loopback };
+    let response = handle_request(bridge, &req.into_rest(context)).await;
+    let _ = stream.write_all(&response.into_bytes()).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1972,6 +2112,9 @@ fn parse_cli_response(raw: &[u8]) -> anyhow::Result<(u16, Vec<u8>)> {
     let body = raw[header_end + 4..].to_vec();
     Ok((status, body))
 }
+
+#[cfg(test)]
+mod golden_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2126,6 +2269,69 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // ApiResponse serialization
+    // -------------------------------------------------------------------------
+
+    /// The serializer `ApiResponse::into_bytes` replaced, verbatim — the oracle for
+    /// "the wire format did not change".
+    fn legacy_http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
+        let status_text = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            504 => "Gateway Timeout",
+            _ => "Unknown",
+        };
+        let header = format!(
+            "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut resp = header.into_bytes();
+        resp.extend_from_slice(body);
+        resp
+    }
+
+    #[test]
+    fn test_api_response_into_bytes_matches_legacy_serializer() {
+        let statuses = [
+            200, 202, 400, 401, 403, 404, 405, 411, 415, 417, 418, 429, 500, 503, 504, 0, 999,
+        ];
+        let bodies: [&[u8]; 3] = [b"", br#"{"ok":true}"#, &[0, 159, 146, 150, 255, b'\r', b'\n']];
+        for status in statuses {
+            for content_type in ["application/json", "image/png", "text/plain"] {
+                for body in bodies {
+                    let got = ApiResponse::new(status, content_type, body.to_vec()).into_bytes();
+                    assert_eq!(
+                        got,
+                        legacy_http_response(status, content_type, body),
+                        "status {status}, {content_type}, {} body bytes",
+                        body.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_api_response_extra_headers_follow_content_length_in_order() {
+        let resp = ApiResponse {
+            status: 503,
+            content_type: "application/json",
+            headers: vec![("Retry-After", "10".to_string()), ("Allow", "POST".to_string())],
+            body: b"{}".to_vec(),
+        };
+        assert_eq!(
+            String::from_utf8(resp.into_bytes()).unwrap(),
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 2\r\nRetry-After: 10\r\nAllow: POST\r\nConnection: close\r\n\r\n{}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // M1.4: enqueue_outcome_to_response mapping tests
     // -------------------------------------------------------------------------
 
@@ -2149,7 +2355,7 @@ mod tests {
         // notify_one() is called by the handler (handle_history_fetch_trigger) instead.
         use crate::storage::EnqueueOutcome;
         let outcome = EnqueueOutcome::Accepted { job_id: 42, accepted_target: Some(100) };
-        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "count", Some(200), Some(1_700_000_000_000), true);
+        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "count", Some(200), Some(1_700_000_000_000), true).into_bytes();
         assert_eq!(http_status_of(&raw), 200);
         let body = parse_response_json(&raw);
         assert_eq!(body["job_id"], 42);
@@ -2164,7 +2370,7 @@ mod tests {
     fn test_outcome_already_active_returns_200_with_job_id() {
         use crate::storage::EnqueueOutcome;
         let outcome = EnqueueOutcome::AlreadyActive { job_id: 7 };
-        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "all", None, None, false);
+        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "all", None, None, false).into_bytes();
         assert_eq!(http_status_of(&raw), 200);
         let body = parse_response_json(&raw);
         assert_eq!(body["job_id"], 7);
@@ -2175,7 +2381,7 @@ mod tests {
     fn test_outcome_cooldown_returns_429() {
         use crate::storage::EnqueueOutcome;
         let outcome = EnqueueOutcome::Cooldown { retry_after_secs: 120 };
-        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "all", None, None, false);
+        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "all", None, None, false).into_bytes();
         assert_eq!(http_status_of(&raw), 429);
         let body = parse_response_json(&raw);
         assert_eq!(body["status"], "cooldown");
@@ -2186,7 +2392,7 @@ mod tests {
     fn test_outcome_queue_full_returns_429() {
         use crate::storage::EnqueueOutcome;
         let outcome = EnqueueOutcome::QueueFull { limit: 5 };
-        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "all", None, None, false);
+        let raw = enqueue_outcome_to_response(outcome, "chat@s.whatsapp.net", "all", None, None, false).into_bytes();
         assert_eq!(http_status_of(&raw), 429);
         let body = parse_response_json(&raw);
         assert_eq!(body["status"], "queue_full");
@@ -2299,7 +2505,10 @@ mod tests {
             .await
             .unwrap();
 
-        let req = read_request(&mut server_stream).await.expect("request should parse");
+        let req = read_request(&mut server_stream)
+            .await
+            .expect("request should parse")
+            .into_rest(CallContext { loopback_file_access: true });
         assert_eq!(req.query_get("q"), Some("foo&bar"));
         assert_eq!(req.query_get("jid"), Some("972@s.whatsapp.net"));
     }
@@ -2319,7 +2528,10 @@ mod tests {
             .await
             .unwrap();
 
-        let req = read_request(&mut server_stream).await.expect("request should parse");
+        let req = read_request(&mut server_stream)
+            .await
+            .expect("request should parse")
+            .into_rest(CallContext { loopback_file_access: true });
         assert_eq!(req.query_get("q"), Some("you are crazy"));
         assert_eq!(req.query_get("limit"), Some("5"));
     }
@@ -2339,9 +2551,160 @@ mod tests {
             .await
             .unwrap();
 
-        let req = read_request(&mut server_stream).await.expect("request should parse");
+        let req = read_request(&mut server_stream)
+            .await
+            .expect("request should parse")
+            .into_rest(CallContext { loopback_file_access: true });
         assert_eq!(req.query_get("jid"), Some("972542271337@s.whatsapp.net"));
         assert_eq!(req.query_get("limit"), Some("20"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Head / body split of the request reader
+    // -------------------------------------------------------------------------
+
+    /// A connected loopback pair: `(client, server_side)`.
+    async fn socket_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn test_request_head_keeps_body_bytes_that_arrived_with_it() {
+        let (mut client, mut server) = socket_pair().await;
+        // Head and the whole body leave in one write, so the head read picks the body up too.
+        client
+            .write_all(b"POST /api/send?sync=true HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world")
+            .await
+            .unwrap();
+
+        let head = read_request_head(&mut server).await.expect("head should parse");
+        assert_eq!(head.method, "POST");
+        assert_eq!(head.path, "/api/send");
+        assert_eq!(head.query, vec![("sync".to_string(), "true".to_string())]);
+        assert_eq!(head.headers.len(), 2);
+        assert_eq!(head.content_length, 11);
+        assert_eq!(head.leftover, b"hello world");
+
+        // The body is already complete, so it must come back without waiting for more bytes
+        // (the client sends nothing further and keeps the connection open).
+        let body = tokio::time::timeout(Duration::from_secs(2), read_request_body(&mut server, &head, 1024))
+            .await
+            .expect("body read must not wait for more bytes")
+            .expect("body should be complete");
+        assert_eq!(body, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_request_body_continues_across_later_reads() {
+        let (mut client, mut server) = socket_pair().await;
+        client
+            .write_all(b"POST /api/send HTTP/1.1\r\nContent-Length: 10\r\n\r\n012")
+            .await
+            .unwrap();
+        let head = read_request_head(&mut server).await.expect("head should parse");
+        assert_eq!(head.leftover, b"012", "only the first body bytes arrived with the head");
+
+        client.write_all(b"3456").await.unwrap();
+        client.write_all(b"789").await.unwrap();
+        let body = read_request_body(&mut server, &head, 1024).await.expect("body should be complete");
+        assert_eq!(body, b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn test_request_body_drops_bytes_beyond_content_length() {
+        let (mut client, mut server) = socket_pair().await;
+        client
+            .write_all(b"POST /api/send HTTP/1.1\r\nContent-Length: 4\r\n\r\nabcdEXTRA")
+            .await
+            .unwrap();
+        let head = read_request_head(&mut server).await.expect("head should parse");
+        let body = read_request_body(&mut server, &head, 1024).await.expect("body should be complete");
+        assert_eq!(body, b"abcd");
+    }
+
+    #[tokio::test]
+    async fn test_request_body_over_limit_is_rejected_without_reading() {
+        let (mut client, mut server) = socket_pair().await;
+        client.write_all(b"POST /api/send HTTP/1.1\r\nContent-Length: 10\r\n\r\n").await.unwrap();
+        let head = read_request_head(&mut server).await.expect("head should parse");
+
+        // Nothing more is sent: a reader that tried to fetch the body would wait out its 10 s timeout.
+        let over = tokio::time::timeout(Duration::from_secs(2), read_request_body(&mut server, &head, 9))
+            .await
+            .expect("over-limit rejection must not wait for the body");
+        assert!(over.is_none());
+
+        // The limit is inclusive: a body of exactly `limit` bytes is accepted.
+        client.write_all(b"0123456789").await.unwrap();
+        assert_eq!(read_request_body(&mut server, &head, 10).await.as_deref(), Some(&b"0123456789"[..]));
+    }
+
+    #[tokio::test]
+    async fn test_request_body_truncated_by_eof_is_rejected() {
+        let (mut client, mut server) = socket_pair().await;
+        client
+            .write_all(b"POST /api/send HTTP/1.1\r\nContent-Length: 10\r\n\r\n01234")
+            .await
+            .unwrap();
+        let head = read_request_head(&mut server).await.expect("head should parse");
+        client.shutdown().await.unwrap();
+        assert!(read_request_body(&mut server, &head, 1024).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_request_without_content_length_has_empty_body() {
+        let (mut client, mut server) = socket_pair().await;
+        client.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\nstray").await.unwrap();
+        let head = read_request_head(&mut server).await.expect("head should parse");
+        assert_eq!(head.content_length, 0);
+        assert_eq!(read_request_body(&mut server, &head, 1024).await, Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn test_read_request_wrapper_equals_head_then_body() {
+        let raw: &[u8] = b"POST /api/send?sync=true&x=a%20b HTTP/1.1\r\nHost: x\r\nX-Two: 2\r\nContent-Length: 5\r\n\r\nhello";
+
+        let (mut client, mut server) = socket_pair().await;
+        client.write_all(raw).await.unwrap();
+        let whole = read_request(&mut server).await.expect("wrapper should parse");
+
+        let (mut client, mut server) = socket_pair().await;
+        client.write_all(raw).await.unwrap();
+        let head = read_request_head(&mut server).await.expect("head should parse");
+        let body = read_request_body(&mut server, &head, max_body_bytes(&head.path)).await.expect("body");
+        let split = head.into_request(body);
+
+        assert_eq!(whole.method, split.method);
+        assert_eq!(whole.path, split.path);
+        assert_eq!(whole.query, split.query);
+        assert_eq!(whole.headers, split.headers);
+        assert_eq!(whole.body, split.body);
+        assert_eq!(whole.body, b"hello");
+    }
+
+    #[test]
+    fn test_max_body_bytes_media_prefixes_get_the_larger_limit() {
+        const DEFAULT: usize = 1024 * 1024;
+        const MEDIA: usize = 70 * 1024 * 1024;
+        for path in [
+            "/api/image",
+            "/api/video",
+            "/api/audio",
+            "/api/doc",
+            "/api/sticker",
+            "/api/view-once-image",
+            "/api/view-once-video",
+            "/api/status-image",
+            "/api/status-video",
+        ] {
+            assert_eq!(max_body_bytes(path), MEDIA, "{path}");
+        }
+        for path in ["/api/send", "/api/status", "/api/status-text", "/api/history-fetch", "/health", "/"] {
+            assert_eq!(max_body_bytes(path), DEFAULT, "{path}");
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -2512,7 +2875,7 @@ mod tests {
             decision,
             Err((403, "Origin 'https://evil.example' is not allowed".to_string()))
         );
-        // Structural guarantee (see serve()'s connection loop): it returns on this
+        // Structural guarantee (see serve_connection()): it returns on this
         // Err immediately, before ever calling handle_request/handle_send — so the
         // attack never reaches a handler that could act on it.
     }
@@ -2550,7 +2913,8 @@ mod tests {
         )
         .await;
 
-        let response = handle_request(&bridge, &req, true).await;
+        let req = req.into_rest(CallContext { loopback_file_access: true });
+        let response = handle_request(&bridge, &req).await.into_bytes();
         assert_eq!(http_status_of(&response), 503, "expected a bridge-state failure, not a gate rejection");
 
         let _ = std::fs::remove_file(&db_path);
@@ -2569,7 +2933,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let req = read_request(&mut stream).await.expect("request should parse");
             let decision = gate_request(&req.method, &req.headers, true, &[], &[]);
-            let _ = stream.write_all(&json_err(503, "test stub")).await;
+            let _ = stream.write_all(&json_err(503, "test stub").into_bytes()).await;
             decision
         });
         let _ = cli_get(port, "/api/status").await;
@@ -2586,7 +2950,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let req = read_request(&mut stream).await.expect("request should parse");
             let decision = gate_request(&req.method, &req.headers, true, &[], &[]);
-            let _ = stream.write_all(&json_err(503, "test stub")).await;
+            let _ = stream.write_all(&json_err(503, "test stub").into_bytes()).await;
             decision
         });
         let _ = cli_post(port, "/api/send", r#"{"jid":"1@s.whatsapp.net","text":"hi"}"#).await;
@@ -2614,7 +2978,7 @@ mod tests {
 
     #[test]
     fn test_bridge_err_send_timed_out_is_504_with_job_id_and_do_not_retry() {
-        let raw = bridge_err(anyhow::Error::new(SendTimedOut { job_id: 42 }));
+        let raw = bridge_err(anyhow::Error::new(SendTimedOut { job_id: 42 })).into_bytes();
         assert_send_timeout_response(&raw, 42);
     }
 
@@ -2623,7 +2987,7 @@ mod tests {
         let wrapped = anyhow::Error::new(SendTimedOut { job_id: 7 })
             .context("sending reply")
             .context("handling request");
-        let raw = bridge_err(wrapped);
+        let raw = bridge_err(wrapped).into_bytes();
         assert_send_timeout_response(&raw, 7);
     }
 
@@ -2639,7 +3003,7 @@ mod tests {
             ("boom", 500),
         ];
         for (msg, status) in cases {
-            let raw = bridge_err(anyhow::anyhow!(msg));
+            let raw = bridge_err(anyhow::anyhow!(msg)).into_bytes();
             assert_eq!(http_status_of(&raw), status, "{msg}");
             assert!(parse_response_json(&raw).get("job_id").is_none(), "{msg}: no job_id without a typed timeout");
         }
@@ -2656,7 +3020,7 @@ mod tests {
         )
         .await;
 
-        let response = handle_send(&bridge, br#"{"jid":"1@s.whatsapp.net","text":"hi"}"#, true).await;
+        let response = handle_send(&bridge, br#"{"jid":"1@s.whatsapp.net","text":"hi"}"#, true).await.into_bytes();
 
         let queued = bridge
             .store()
