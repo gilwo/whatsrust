@@ -464,7 +464,7 @@ check token: request_has_api_token(headers, WHATSRUST_MCP_TOKEN)?
   ↓ (401 if missing/wrong; token always required for MCP listener)
 acquire MCP semaphore (permit from lane)
   ↓ (503 -32000 if exhausted; tokio::time::timeout(5s, semaphore.acquire_owned()) with Retry-After: 10)
-Expect: 100-continue support declined (unsupported; respond 417 if present)
+Expect: 100-continue supported after gate, token and framing checks (interim "100 Continue" only if the body is incomplete); any other Expect value → 417
   ↓
 read_request_body(stream, content_length, limit=10 MiB, deadline) → Vec<u8>
   ↓ (413 from Content-Length at head phase if too large; body read deadline = arrival + 20s, scaled by length up to 60s cap)
@@ -534,7 +534,7 @@ Routing, gate, and token check run between head and body. This prevents bufferin
 
 **Lingering drain:** After writing a 401, 403, or other early rejection, the server drains incoming bytes (≤64 KiB or ≤1 s) then closes, to ensure the response is delivered before TCP RST.
 
-**`Expect: 100-continue`:** Not supported. If the header is present, respond 417 Expectation Failed. Rationale: MCP SDKs do not send it; supporting it adds complexity for no client benefit.
+**`Expect: 100-continue`:** Supported, but only after the gate, token and framing checks have passed, so a request that fails any of them gets its final error without a `100` and its body is never read. If the value is `100-continue` (case-insensitive) and the body is not yet complete (`leftover.len() < content_length`), the server writes the raw interim `HTTP/1.1 100 Continue\r\n\r\n` (not via `ApiResponse`) and then reads the body. If the body is complete or empty, no interim response is sent. Any other `Expect` value gets 417 Expectation Failed (`json_err` code `expectation_failed`). Rationale: clients such as curl wait for the interim response before sending a large body; answering it avoids a stall, and the early rejections above never reach it.
 
 **`read_request` wrapper:** The existing `read_request` function (used by mcp.rs tests) remains as a wrapper that calls `read_request_head` + `read_request_body` and returns the combined result.
 
@@ -597,7 +597,7 @@ Routing, gate, and token check run between head and body. This prevents bufferin
 | Token missing/wrong | 401 | - | `{"ok":false,"code":"unauthorized","error":"..."}` | REST-shaped (before routing); assumed: clients try OAuth discovery (`.well-known`), see 404, abort or use pre-configured |
 | Wrong path (not `/mcp`) | 404 | - | `{"ok":false,"code":"not_found","error":"..."}` | REST-shaped (routed before token check); includes `/.well-known/*` and `/mcp/` |
 | Wrong method on `/mcp` (GET/DELETE/PUT/HEAD/OPTIONS) | 405 | -32600 | JSON-RPC error + `Allow: POST` header | After routing |
-| Expect: 100-continue present | 417 | - | `{"ok":false,"code":"expectation_failed","error":"..."}` | Unsupported |
+| `Expect` value other than `100-continue` | 417 | - | `{"ok":false,"code":"expectation_failed","error":"..."}` | After gate, token and framing checks. `100-continue` itself is supported: interim `100 Continue` when the body is incomplete |
 | Body too large (from `Content-Length`) | 413 | -32600 | JSON-RPC error | Head phase; JSON-RPC error body |
 | Chunked body (`Transfer-Encoding`) | 411 | -32600 | JSON-RPC error | Head phase; `json_err` code `length_required` |
 | Malformed JSON | 400 | -32700 | JSON-RPC error | Parse error |
@@ -963,14 +963,14 @@ Phase 0a changes no byte the REST server writes: same status lines (including to
 - `RestRequest` struct: `{method, path, query: Vec<(String,String)>, body, context}` with `CallContext {loopback_file_access}`. `handle_request` takes a `RestRequest`; `serve_connection` builds it after the gate and token check. No handler reads request headers, so the conversion drops nothing a handler uses.
 - Tests for the above.
 
-**REST-visible changes moved to a separate labelled step (not in Phase 0a):**
-- Gate and token run before the body read (changes error ordering).
-- Lingering drain after early rejection (≤64 KiB or ≤1 s).
+**REST-visible changes moved to a separate labelled step (not in Phase 0a). Implemented:**
+- Gate and token run before the body read (changes error ordering). `serve_connection` now runs head, gate (403/415), token (401), framing checks, then SSE or body read, then route.
+- Framing checks run after auth and before the body: any `Transfer-Encoding` header, with or without `Content-Length`, gets 411 `length_required` (not only chunked); `Content-Length` over the path's limit keeps today's 400 "bad request" (not 413), now decided from the head after auth; an `Expect` value other than `100-continue` gets 417 `expectation_failed`.
+- `Expect: 100-continue` is supported: after the checks above, the server writes the interim `100 Continue` only if the body is incomplete, then reads the body.
+- Lingering drain after early rejection (≤64 KiB or ≤1 s): every response written before the body is fully read goes through one helper (write, shut down the write half, discard incoming bytes, drop). The connection-cap 503 in the accept loop is not drained.
 - Reason phrases added for 202, 405, 411, 415, 417.
-- 415 `json_err` code change (`internal_error` → `unsupported_media_type`).
-- 411 on chunked bodies.
-- `Expect: 417` (unsupported).
-- Deadline parameters on `read_request_head` / `read_request_body`.
+- `json_err` codes: 405 `method_not_allowed`, 411 `length_required`, 415 `unsupported_media_type` (was `internal_error`), 417 `expectation_failed`.
+- Deadlines on the REST listener: `read_request_head(stream, deadline)` takes an absolute deadline, 20 s from accept, on top of the unchanged 10 s per-read idle timeout. `read_request_body` keeps only the 10 s per-read idle timeout and has no total deadline, because after this reorder only authenticated clients reach it and remote 70 MiB media uploads can legitimately be slow. The MCP listener adds its own body cap.
 
 That step updates the golden fixtures on purpose, so every changed byte shows up in review.
 

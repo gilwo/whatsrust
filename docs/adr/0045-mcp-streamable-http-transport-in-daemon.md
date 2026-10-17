@@ -50,7 +50,7 @@ The MCP listener binds on `WHATSRUST_MCP_BIND:WHATSRUST_MCP_PORT` (unset or 0 = 
 
 One absolute deadline from arrival. Permit wait, body read, and tool wait count against it. Enqueue-and-wait routes receive remaining budget. No outer timer stacking. Timeout response carries job_id when job exists (enqueue runs as spawned task publishing job_id through shared cell). Real stall source: single DB Mutex<Connection> held across long ops (e.g. purge_embeddings). Timeout message: "Operation timed out after Ns; it may still complete; check before retrying."
 
-Body limit: 10 MiB for MCP listener (base64-encoded media up to ~7.5 MB raw). Media endpoints (`/api/image`) remain 70 MiB. Stdio and MCP have different media limits (acceptable; documented). `Transfer-Encoding: chunked` → 411. `Expect: 100-continue` → 417 (unsupported). Design doc §6.
+Body limit: 10 MiB for MCP listener (base64-encoded media up to ~7.5 MB raw). Media endpoints (`/api/image`) remain 70 MiB. Stdio and MCP have different media limits (acceptable; documented). `Transfer-Encoding: chunked` → 411. `Expect: 100-continue` → 417 (amended 2026-10-17, see below). Design doc §6.
 
 ### 4. Token Policy, Read-Only Switch, Separate Bind
 
@@ -118,7 +118,7 @@ Design doc §13.
 
 ### 10. Implementation Phases
 
-- Phase 0a: Pure refactors (head/body split, ApiResponse, RestRequest, CallContext, HTTP helpers). Byte-for-byte REST golden test. Ship independently. REST-visible changes (415 code, 411 on chunked, gate-before-body ordering, lingering drain, Expect: 417) moved to labelled behaviour-change step.
+- Phase 0a: Pure refactors (head/body split, ApiResponse, RestRequest, CallContext, HTTP helpers). Byte-for-byte REST golden test. Ship independently. REST-visible changes (415 code, 411 on chunked, gate-before-body ordering, lingering drain, Expect: 417 (amended 2026-10-17, see below)) moved to labelled behaviour-change step.
 - Phase 0b: Config enforcement (token policy, bind both listeners in main() before bridge start, ADR 0044 amendment). Ship separately with release note. ADR 0047 amendment ships in its own phase (not Phase 0b).
 - Phase 1: Shared registry (access_class, integral float normalisation, ADR 0046 amendment, mcp.rs:644 test change).
 - Phase 2: `/mcp` skeleton (opt-in, separate bind, routing, era detection, read-only switch).
@@ -169,3 +169,7 @@ Design doc §15.
 
 Design doc: `docs/plans/2026-10-15-mcp-http-transport-design.md` (revised 2026-10-16)  
 MCP spec: https://modelcontextprotocol.io/specification/2026-07-28/
+
+## Amendment (2026-10-17)
+
+`Expect: 100-continue` is now supported. The server sends `100 Continue` after the gate, token and framing checks pass, and only if the body is not already complete. Rejected requests receive their final error response with no `100`. Other `Expect` values still yield `417 Expectation Failed`. This replaces the original decision to refuse all `Expect` headers with `417`. See design doc §6.

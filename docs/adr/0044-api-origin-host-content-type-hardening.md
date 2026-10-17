@@ -98,9 +98,9 @@ tightening; such a deployment should set the new allowlist.
 
 **Not done:** CORS headers / `OPTIONS` handling (deliberately — would reopen the hole this ADR
 closes); limiting body read before the
-gate runs (the existing per-route body-size cap in `read_request` is unchanged; the gate runs
-after the body is already buffered, which is a minor, pre-existing DoS consideration unrelated
-to CSRF/rebinding and out of scope here).
+gate runs (amended 2026-10-17, see below: the gate now runs before the body is read; the existing per-route body-size cap in `read_request` is unchanged; the original implementation had the gate run
+after the body was already buffered, which was a minor, pre-existing DoS consideration unrelated
+to CSRF/rebinding and out of scope for the original decision).
 
 **Adversarial review (2026-10-14):** a review that tried to bypass the gate found no critical or
 high issues. Header-parsing tricks, `Host` spellings, `Content-Type` look-alikes, browser flows
@@ -109,3 +109,9 @@ compared case-insensitively, duplicate `Origin` headers are rejected, and the Ho
 even when an allowlisted Origin is present (it previously ran only when `Origin` was absent).
 Known, accepted: a header name with whitespace before the colon (`Host : x`) gets 403 rather than
 the RFC's 400; it's still rejected.
+
+## Amendment (2026-10-17)
+
+The gate and token checks now run before the body is read (request pipeline: head → gate → token → framing → body). This closes the DoS consideration mentioned in the original "Not done" section. Large uploads are now buffered only after authentication passes.
+
+The `415 Unsupported Media Type` response is now `HTTP/1.1 415 Unsupported Media Type` (reason phrase and JSON `code: "unsupported_media_type"`). The original implementation returned `415 Unknown` with `code: "internal_error"`.

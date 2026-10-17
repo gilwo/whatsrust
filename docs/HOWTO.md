@@ -112,7 +112,10 @@ stderr and the daemon continues with the real environment only.
    listed in `WHATSRUST_ALLOWED_HOSTS` (comma-separated, default empty — e.g. for a
    reverse proxy) — this defeats DNS rebinding. Every `POST` must send
    `Content-Type: application/json`; a raw `curl -X POST ... -d '...'` needs
-   `-H 'Content-Type: application/json'` added or it gets 415. A token
+   `-H 'Content-Type: application/json'` added or it gets `415 Unsupported Media Type`
+   (`code: "unsupported_media_type"`). The body is read only after the gate and token checks.
+   `Transfer-Encoding` (e.g. chunked) is not supported (411; send `Content-Length`).
+   `Expect: 100-continue` is honoured after authentication. A token
    (`WHATSRUST_API_TOKEN`) is still recommended even when loopback-only.
 6. Backfill (historical fetch) has three ban-critical knobs that are
    validated at startup and will **refuse to start** the daemon if violated
@@ -581,9 +584,9 @@ do, via the Makefile.
 
 **Steps:**
 ```bash
-make test        # cargo test — default suite (404 lib + 400 bin tests, verified 2026-10-17)
+make test        # cargo test — default suite (427 lib + 423 bin tests, verified 2026-10-17)
 make test-all     # cargo test --features fake-embedder — also runs the
-                   # fake-embedder sidecar round-trip tests (413 lib + 409 bin;
+                   # fake-embedder sidecar round-trip tests (436 lib + 432 bin;
                    # 9 extra tests per target vs `make test`, gated behind the
                    # non-default `fake-embedder` Cargo feature so a plain
                    # `cargo build`/`cargo test` never touches that sidecar
@@ -611,16 +614,16 @@ make fmt          # cargo fmt — reformats the codebase in place. Not run as
 - `make help` — lists all targets with one-line descriptions, default target.
 - `make build` — `Finished \`dev\` profile [unoptimized + debuginfo] target(s)`, exit 0.
 - `make lint` — `whatsrust (bin "whatsrust") generated 38 warnings`, exit 0 (non-fatal).
-- `make test` — `test result: ok. 404 passed; 0 failed ...` (lib) and
-  `test result: ok. 400 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-17).
-- `make test-all` — `test result: ok. 413 passed; 0 failed ...` (lib, includes
-  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 409 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-17).
+- `make test` — `test result: ok. 427 passed; 0 failed ...` (lib) and
+  `test result: ok. 423 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-17).
+- `make test-all` — `test result: ok. 436 passed; 0 failed ...` (lib, includes
+  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 432 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-17).
 
 `CONTRIBUTING.md` asks contributors to run `cargo test` and `cargo clippy`
 before submitting a PR — `make test` and `make lint` are equivalent to that,
 plus `make test-all` for full coverage of the embedder sidecar path.
 
-**REST golden tests:** The test suite includes byte-for-byte golden tests of the REST API's wire output (`src/api/golden_tests.rs`). These tests pin every byte the server writes for 121 full requests plus 29 helper-level fixtures. A failing golden case means the REST wire output changed. If the change is deliberate (e.g. fixing a status code or reason phrase), paste the printed literal into the fixture and call the change out in the commit message. Otherwise it is a regression.
+**REST golden tests:** The test suite includes byte-for-byte golden tests of the REST API's wire output (`src/api/golden_tests.rs`). These tests pin every byte the server writes for a comprehensive set of full request/response cycles plus helper-level fixtures (status lines, headers, JSON bodies, error responses). A failing golden case means the REST wire output changed. If the change is deliberate (e.g. fixing a status code or reason phrase), paste the printed literal into the fixture and call the change out in the commit message. Otherwise it is a regression.
 
 ---
 
