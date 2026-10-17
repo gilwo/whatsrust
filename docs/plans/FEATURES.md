@@ -2,7 +2,7 @@
 
 **Type:** Live document — kept up to date as features land. Update the **Status** of an
 item when work starts/completes; add a dated note in its row's detail.
-**Last updated:** 2026-10-16
+**Last updated:** 2026-10-17
 
 This is the single tracking surface for in-flight and planned work on this experimental
 fork. The *why* for each design lives in the ADRs (`docs/adr/`); the *what/how* blueprints
@@ -127,6 +127,34 @@ embeddings.
 - [ ] Investigation + design + ADR
 - [ ] Implementation
 
+### F7 — Richer read tools (names, counts, contacts, groups, pagination) ⚪ Planned (needs viability check)
+Enhance read-only surfaces (search, history, status) with contact/sender names, message counts,
+contact and group listing/search, and pagination for search results.
+- **Cross-feature impact:** New/extended MCP tools (ADR 0046 strict schemas apply); F3 registry (access class: Read); F5 read-only profiles benefit.
+- **Investigation scope (2026-10-17):**
+  1. **Contact/sender names in search results.** Display contact name (1:1) or group name + sender's contact name (groups) in search/history results.
+     - **Current state:** `InboundRow` (storage.rs:945) has `sender_jid` (phone@s.whatsapp.net or LID), not display names. `device.push_name` (storage.rs:61) stores only OUR device's name. `GroupInfo` (bridge.rs:298) has `subject` but no participant names.
+     - **What's needed:** Persist push names received in inbound messages, OR fetch on-demand via wa-rs `UserInfo` (wacore/iq/usync.rs:323, has `status` field for about text, but no push_name getter). Group context adds the group subject; sender name resolution is the same problem.
+     - **Verdict:** Viable with work — persist names from inbound `Event::Message` (likely carries push_name in protobuf, needs wa-rs source check), or fetch via contacts API.
+  2. **Message counts (overall, per-chat, unread); attachment counts.**
+     - **Current state:** `messages` table (storage.rs:205) supports `COUNT(*)` for overall and `WHERE chat_jid=?` for per-chat. Attachments countable via `media_refs` (storage.rs:226) or `content_kind` filter. Unread state: bridge receives `Event::ChatRead`/`Mute`/`Archive` (bridge.rs:3717) from app-state sync, but does NOT persist it locally.
+     - **What's needed:** Counts are local queries (ready). Unread needs a chat-state table (mute/archive/unread bool, last-read timestamp?) and an insert/update path from the app-state events.
+     - **Verdict:** Viable now for counts; viable with work for unread (persist app-state chat status).
+  3. **List contacts; search contact names and descriptions (about text).**
+     - **Current state:** NO contacts table. Only JIDs seen in `messages` exist. No names or status/about stored.
+     - **What's needed:** Define the contact list (app-state contacts sync vs seen-JIDs heuristic). Persist `UserInfo` (wacore/iq/usync.rs:323: `status` = about text). wa-rs `Contacts` feature (contacts.rs:67) has `is_on_whatsapp()` check; unclear if a "get all contacts" API exists (may need app-state sync investigation).
+     - **Verdict:** Viable with work — define contact-list source, persist UserInfo, build search index.
+  4. **Search groups and group descriptions; resolve member names.**
+     - **Current state:** `GroupCache` (bridge.rs:97) stores `GroupInfo` with `subject` (line 299), NO description. wa-rs `GroupMetadata` (groups.rs:95) HAS `description: Option<String>` (line 109), fetched via `get_metadata()` (bridge.rs:1242). Member names: same issue as #1.
+     - **What's needed:** Add `description` field to `GroupInfo`, populate from wa-rs. Persist groups in SQLite (currently 5-min in-memory cache). Member name resolution identical to #1.
+     - **Verdict:** Viable with work — extend GroupInfo, persist groups, resolve member names (same as #1).
+  5. **Pagination for search results (in addition to history, which already has it).**
+     - **Current state:** `/api/history` (api.rs:1285) and MCP `whatsrust_history` (mcp.rs:150) both support `before` timestamp pagination. `/api/search` (api.rs:1298) and MCP `whatsrust_search` (mcp.rs:155) do NOT expose `before` in their schemas, BUT the underlying `bridge.search()` (bridge.rs:1607) and `store.search_inbound()` (storage.rs:1415) already accept `before_ts: Option<i64>`.
+     - **What's needed:** Add `before` parameter to `/api/search` query string and MCP `whatsrust_search` tool schema (ADR 0046: `additionalProperties: false`, so a schema change is required).
+     - **Verdict:** Viable now — implementation ready, needs schema update (REST + MCP).
+- [ ] Investigation + design
+- [ ] Implementation
+
 ---
 
 ## Quick Wins (project health — tracked, NOT in active focus)
@@ -146,6 +174,7 @@ now** to preserve focus on F1/F2. Pick up opportunistically or schedule delibera
 | Q-DOCS | `docs/INDEX.md` / onboarding guide | 34 .md files; discoverability gap (partly addressed by CLAUDE.md doc matrix) | S–M | Med | 🟡 Partial (CLAUDE.md matrix added 2026-06-17) |
 | Q-TRACE | Structured `#[instrument]` spans on `handle_event` / `execute_job` | Debugging "message didn't send / backfill stuck" means grepping flat logs | M | Med | ⚪ |
 | Q-SPLIT | Split 900-line `extract_content_inner` / 700-line `handle_event` | Maintainability; both are large | L | Low | ⏸️ Deferred (stack-overflow history — risky; post-F1) |
+| Q-WARS | wa-rs dependency upgrade check | Pinned at `oxidezap/whatsapp-rust` rev `9e8c70e2` (2026-07-01); upstream HEAD `7c4021d4` seen 2026-10-18 (newer than the pin). Check for new upstream commits/tags, assess breaking changes, run tests + live smoke test per CLAUDE.md "To upgrade wa-rs". Untracked `wa-rs-upgrade-impact-analysis.txt` (2026-06-29, v0.6.0→main) is dated (pre-dates current pin) and advisory only. | M | Med | ⚪ |
 
 ---
 
