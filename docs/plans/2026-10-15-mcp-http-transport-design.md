@@ -936,16 +936,16 @@ All configuration reuses existing env vars plus four new variables:
 - `WHATSRUST_MCP_READ_ONLY` (default off). When set, only read-access tools exposed. Server-side enforcement; stdio unaffected.
 
 **Token policy checked in `main()` before `WhatsAppBridge::start` (bind both listeners here before bridge start):** If any rule is violated, the daemon exits non-zero with an exact fix message (ADR 0022 pattern):
-1. MCP listener enabled (`WHATSRUST_MCP_PORT` > 0) AND `WHATSRUST_MCP_TOKEN` unset → exit with fix.
-2. MCP listener enabled AND REST listener enabled AND `WHATSRUST_MCP_TOKEN` equals `WHATSRUST_API_TOKEN` → exit with fix.
-3. MCP listener enabled AND `WHATSRUST_MCP_TOKEN` length < 22 → exit with fix: "WHATSRUST_MCP_TOKEN must be at least 22 characters (currently: N); generate with `openssl rand -base64 32`. Refusing to start."
-4. REST listener enabled (`WHATSRUST_PORT` > 0) AND allowlist non-empty AND `WHATSRUST_API_TOKEN` unset → exit with fix.
-5. REST listener enabled AND non-loopback bind (`WHATSRUST_ALLOW_REMOTE=1`) AND `WHATSRUST_API_TOKEN` unset → exit with fix.
-6. MCP listener enabled AND non-loopback bind (`WHATSRUST_MCP_ALLOW_REMOTE=1`) AND `WHATSRUST_MCP_TOKEN` unset → exit with fix.
-7. MCP port equals REST port (both > 0) → exit with fix: "WHATSRUST_MCP_PORT must differ from WHATSRUST_PORT. Refusing to start."
-8. An explicitly enabled listener (port > 0) that fails to bind → exit non-zero with fix.
+1. MCP listener enabled (`WHATSRUST_MCP_PORT` > 0) AND `WHATSRUST_MCP_TOKEN` unset → exit with fix. **Moved to Phase 2:** the MCP listener does not exist before Phase 2.
+2. MCP listener enabled AND REST listener enabled AND `WHATSRUST_MCP_TOKEN` equals `WHATSRUST_API_TOKEN` → exit with fix. **Moved to Phase 2:** the MCP listener does not exist before Phase 2.
+3. MCP listener enabled AND `WHATSRUST_MCP_TOKEN` length < 22 → exit with fix: "WHATSRUST_MCP_TOKEN must be at least 22 characters (currently: N); generate with `openssl rand -base64 32`. Refusing to start." **Moved to Phase 2:** the MCP listener does not exist before Phase 2.
+4. REST listener enabled (`WHATSRUST_PORT` > 0) AND allowlist non-empty AND `WHATSRUST_API_TOKEN` unset → exit with fix. **Implemented in Phase 0b.**
+5. REST listener enabled AND non-loopback bind (`WHATSRUST_ALLOW_REMOTE=1`) AND `WHATSRUST_API_TOKEN` unset → exit with fix. **Implemented in Phase 0b**, together with its companion case: REST listener enabled AND non-loopback `WHATSRUST_BIND` without `WHATSRUST_ALLOW_REMOTE=1` → exit with fix (before Phase 0b, `serve()` logged this and left the daemon running without an API).
+6. MCP listener enabled AND non-loopback bind (`WHATSRUST_MCP_ALLOW_REMOTE=1`) AND `WHATSRUST_MCP_TOKEN` unset → exit with fix. **Moved to Phase 2:** the MCP listener does not exist before Phase 2.
+7. MCP port equals REST port (both > 0) → exit with fix: "WHATSRUST_MCP_PORT must differ from WHATSRUST_PORT. Refusing to start." **Moved to Phase 2:** the MCP listener does not exist before Phase 2.
+8. An explicitly enabled listener (port > 0) that fails to bind → exit non-zero with fix. **REST half implemented in Phase 0b. MCP half moved to Phase 2:** the MCP listener does not exist before Phase 2.
 
-**Bind semantics:** Both listeners are bound in `main()` before `WhatsAppBridge::start`. An explicitly enabled listener that fails to bind → exit with fix. Headless (both disabled: REST port 0 and MCP port 0/unset) keeps working (existing behaviour).
+**Bind semantics:** The REST listener is bound in `main()` before `WhatsAppBridge::start` in Phase 0b. The MCP listener will be bound there in Phase 2. An explicitly enabled listener that fails to bind → exit with fix. Headless (both disabled: REST port 0 and MCP port 0/unset) keeps working (existing behaviour).
 
 **Unparseable port value:** Exit with fix: "WHATSRUST_MCP_PORT is not a valid port number. Refusing to start." Rationale: fail-closed; an unparseable value likely means a config error, not "off".
 
@@ -978,12 +978,13 @@ That step updates the golden fixtures on purpose, so every changed byte shows up
 
 ### Phase 0b: Config Enforcement (Ship Separately with Release Note)
 
-- **Token policy enforcement in `main()` before `WhatsAppBridge::start` (placed beside `validate_backfill_safety` at ~main.rs:358):** Exit non-zero with exact fix message (ADR 0022 pattern) if any rule is violated. Rules listed in §13. Each rule gated on its listener being enabled (port > 0). Bind both listeners in `main()` before `WhatsAppBridge::start`; an explicitly enabled listener that fails to bind → exit with fix.
+- **Scope: REST listener only.** Implemented in 0b: rules 4 and 5 (§13), the non-loopback-without-`WHATSRUST_ALLOW_REMOTE` case of rule 5, and the REST half of rule 8. Moved to Phase 2: rules 1, 2, 3, 6, 7 and the MCP half of rule 8, because the MCP listener does not exist before Phase 2. No `WHATSRUST_MCP_*` variable is read in 0b.
+- **Token policy enforcement in `main()` before `WhatsAppBridge::start` (placed beside `validate_backfill_safety` at ~main.rs:358):** Exit non-zero with exact fix message (ADR 0022 pattern) if any implemented rule is violated. The rules are one pure function over plain values (`validate_api_startup`) that the daemon and `serve()` both call; headless (REST port 0) skips every check and does not bind. `main()` binds the REST listener after the instance lock and before `WhatsAppBridge::start`; a bind failure → exit with fix (address, port, OS error). The accept loop is `serve_with_listener(bridge, listener, cancel)`. `serve(bridge, port, cancel)` stays for library callers: it binds itself and, on an invalid config or a failed bind, logs and returns.
 - **ADR 0044 amendment (task):** Document the rule "allowlists set → REST token required". Clarifies that proxies opt in via allowlists, which triggers the token requirement (ADR 0044 originally stated proxies opt in without a token).
 - **Release note:** Documents the breaking change: token policy violations now exit the daemon at startup. Migration steps in HOWTO: how to set tokens, recommended strength, example commands. States that `.env` loads only in daemon mode (main.rs:239-258); the CLI and `whatsrust mcp` read `WHATSRUST_API_TOKEN` from the process environment.
-- Tests for token policy enforcement (missing token, short token, token equality, port equality, allowlist + no token, non-loopback + no token, bind failure).
+- Tests for the 0b rules (allowlist + no token, non-loopback without `WHATSRUST_ALLOW_REMOTE`, non-loopback + `WHATSRUST_ALLOW_REMOTE` + no token, headless, whitespace-only token, bind failure). The missing, short and equal MCP token tests and the port-equality test move to Phase 2 with their rules.
 
-**Exit criteria:** Token policy violations exit the daemon. Bind failures exit. Release note and HOWTO updated. ADR 0044 amended.
+**Exit criteria:** REST token policy violations (rules 4 and 5) exit the daemon. REST bind failures exit. Release note and HOWTO updated. ADR 0044 amended. The MCP rules are Phase 2 exit criteria.
 
 **ADR 0047 amendment ships in a separate phase (not Phase 0b):** The enqueue runs as a spawned task publishing `job_id` through a shared cell. A timeout response carries `job_id` when a job exists, "outcome unknown, check before retrying" otherwise. This is a deeper runtime change and ships after config enforcement.
 
@@ -1004,9 +1005,10 @@ That step updates the golden fixtures on purpose, so every changed byte shows up
 
 ### Phase 2: MCP Listener Skeleton (Opt-In, Routing, Era Detection)
 
+- **Config rules moved from Phase 0b:** implement rules 1, 2, 3, 6, 7 and the MCP half of rule 8 (§13) here, because the MCP listener does not exist before Phase 2. Follow the 0b pattern: a pure validator, called from `main()` before `WhatsAppBridge::start`, and an MCP listener bound in `main()` and handed to `serve_mcp`. Rule 2 and rule 7 compare against the REST settings that 0b already validates.
 - Factor `serve()` into shared infrastructure: `bind_and_listen(bind, port)`, `accept_loop(listener, bridge, is_loopback, token, allowed_origins, allowed_hosts, cancel)`, `read_request_head`, `read_request_body`, `gate_request`, `request_has_api_token`.
 - Add `serve_mcp(bridge, mcp_bind, mcp_port, mcp_token, read_only, cancel)`: new listener on `WHATSRUST_MCP_BIND:WHATSRUST_MCP_PORT` with its own lane semaphores. Routes only `/mcp` (POST only; GET/DELETE/PUT/HEAD/OPTIONS → 405 with JSON-RPC error body + `Allow: POST`; other paths including `/.well-known/*` and `/mcp/` → 404).
-- Spawn both listeners from `main.rs` (already bound in Phase 0b). If neither was enabled (port > 0), exit (no HTTP server). If only one was enabled, continue with that listener.
+- Spawn both listeners from `main.rs` (REST already bound in Phase 0b; MCP bound here in Phase 2). If neither was enabled (port > 0), exit (no HTTP server). If only one was enabled, continue with that listener.
 - Parse JSON-RPC body. Array (batch) → 400 `-32600` with JSON-RPC error body ("Batching is not supported").
 - Implement `detect_era(headers, body)` (header-primary, per precedence in §5).
 - Stub handlers: `server/discover`, `tools/list`, `tools/call` return "not implemented" (501).

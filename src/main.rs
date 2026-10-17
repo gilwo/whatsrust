@@ -367,6 +367,13 @@ async fn async_main() -> Result<()> {
             std::process::exit(1);
         }
     }
+    // --- Fail-closed REST listener config validation (F3 Phase 0b) — MUST run before bridge construction ---
+    // Headless (port 0) skips every check. The same rules guard `api::serve` for library callers,
+    // which logs and returns instead of exiting.
+    if let Err(msg) = api::validate_api_startup_from_env(api_port) {
+        eprintln!("{msg}");
+        std::process::exit(1);
+    }
     // Single-FIFO backfill worker is the standing design (ADR 0026); multi-worker concurrency is a potential future enhancement.
     if backfill_max_concurrent > 1 {
         warn!(
@@ -418,17 +425,32 @@ async fn async_main() -> Result<()> {
         }
     };
 
+    // Bind the REST listener before the bridge opens the DB: an enabled listener that cannot bind
+    // exits with the fix instead of leaving a daemon without an API. After the instance lock, so a
+    // second instance still reports the lock rather than "port in use".
+    let api_listener = if api_port > 0 {
+        match api::bind_api_listener(&api::api_bind_host(), api_port).await {
+            Ok(listener) => Some(listener),
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     let bridge = Arc::new(WhatsAppBridge::start(config, inbound_tx, cancel.clone()));
 
     info!("bridge started, state: {:?}", bridge.state());
     info!("waiting for WhatsApp connection (scan QR code or enter pair code)...");
 
-    // Spawn API server
-    if api_port > 0 {
+    // Spawn API server on the listener bound above
+    if let Some(listener) = api_listener {
         let api_bridge = bridge.clone();
         let api_cancel = cancel.clone();
         tokio::spawn(async move {
-            api::serve(api_bridge, api_port, api_cancel).await;
+            api::serve_with_listener(api_bridge, listener, api_cancel).await;
         });
     }
 
@@ -2016,9 +2038,9 @@ fn print_cli_help() {
     println!("  WHATSRUST_PORT   API port (default: 7270, fallback: HEALTH_PORT)");
     println!("  WHATSRUST_BIND   API bind address (default: 127.0.0.1)");
     println!("  WHATSRUST_ALLOW_REMOTE=1  Permit non-loopback API binds");
-    println!("  WHATSRUST_API_TOKEN  Optional API bearer token; required for remote binds");
-    println!("  WHATSRUST_ALLOWED_ORIGINS  Comma-separated allowed Origin values (default: none; see ADR 0044)");
-    println!("  WHATSRUST_ALLOWED_HOSTS   Comma-separated allowed Host values beyond loopback (default: none; see ADR 0044)");
+    println!("  WHATSRUST_API_TOKEN  Optional API bearer token; required for remote binds and proxy allowlists");
+    println!("  WHATSRUST_ALLOWED_ORIGINS  Comma-separated allowed Origin values (default: none; requires WHATSRUST_API_TOKEN; see ADR 0044)");
+    println!("  WHATSRUST_ALLOWED_HOSTS   Comma-separated allowed Host values beyond loopback (default: none; requires WHATSRUST_API_TOKEN; see ADR 0044)");
     println!("  WHATSRUST_SEND_BURST     Max burst size before rate limit (default: 5)");
     println!("  WHATSRUST_SKIP_HISTORY_SYNC=1  Skip history sync (leaner pairing, but 1:1 DMs fail with 463; default: off)");
     println!("  WHATSRUST_DEVICE_NAME  Name shown in Linked Devices (default: whatsrust); used only when pairing");

@@ -110,9 +110,10 @@ stderr and the daemon continues with the real environment only.
    it's in `WHATSRUST_ALLOWED_ORIGINS` (comma-separated, default empty). With no
    `Origin`, the `Host` header must be `127.0.0.1`/`localhost`/`::1` (any port) or
    listed in `WHATSRUST_ALLOWED_HOSTS` (comma-separated, default empty — e.g. for a
-   reverse proxy) — this defeats DNS rebinding. Every `POST` must send
-   `Content-Type: application/json`; a raw `curl -X POST ... -d '...'` needs
-   `-H 'Content-Type: application/json'` added or it gets `415 Unsupported Media Type`
+   reverse proxy) — this defeats DNS rebinding. **Either allowlist requires
+   `WHATSRUST_API_TOKEN`, or the daemon refuses to start** (amended 2026-10-18, ADR 0044).
+   Every `POST` must send `Content-Type: application/json`; a raw `curl -X POST ... -d '...'`
+   needs `-H 'Content-Type: application/json'` added or it gets `415 Unsupported Media Type`
    (`code: "unsupported_media_type"`). The body is read only after the gate and token checks.
    `Transfer-Encoding` (e.g. chunked) is not supported (411; send `Content-Length`).
    `Expect: 100-continue` is honoured after authentication. A token
@@ -135,6 +136,25 @@ own `--help` "ENVIRONMENT" section and in `.env.example`. Cross-check with:
 ```bash
 ./target/debug/whatsrust --help | sed -n '/ENVIRONMENT:/,/JID FORMAT:/p'
 ```
+
+---
+
+## 2a. Upgrade notes
+
+### 2026-10-18: API startup validation
+
+The daemon now refuses to start (exits non-zero with the fix) for invalid API configs:
+
+| **Config** | **Fix** |
+|---|---|
+| `WHATSRUST_BIND` is non-loopback and `WHATSRUST_ALLOW_REMOTE` is not set | Set `WHATSRUST_ALLOW_REMOTE=1` and `WHATSRUST_API_TOKEN`, or use loopback (unset `WHATSRUST_BIND` or set `WHATSRUST_BIND=127.0.0.1`) |
+| `WHATSRUST_BIND` is non-loopback, `WHATSRUST_ALLOW_REMOTE=1`, and no `WHATSRUST_API_TOKEN` | Set `WHATSRUST_API_TOKEN` (e.g. `openssl rand -base64 32`) |
+| `WHATSRUST_ALLOWED_HOSTS` or `WHATSRUST_ALLOWED_ORIGINS` is non-empty and no `WHATSRUST_API_TOKEN`, even on loopback | Set `WHATSRUST_API_TOKEN`, or unset the allowlist |
+| REST port in use, or `WHATSRUST_BIND` is not an address of this machine | Stop the other process, or set `WHATSRUST_PORT` to a free port (0 turns the API off) |
+
+**CLI and `whatsrust mcp` environment note:** Both read `WHATSRUST_API_TOKEN` from the process environment. If you set a token in `.env`, also `export WHATSRUST_API_TOKEN=<value>` for CLI and MCP use — `.env` is loaded only by the daemon.
+
+**Startup migration note:** The REST port is now bound before the bridge starts, so before the DB opens and migrates. During a long migration, CLI and stdio-MCP requests wait in the kernel backlog instead of failing fast with "connection refused". The CLI gives up after 45 s.
 
 ---
 
@@ -584,9 +604,9 @@ do, via the Makefile.
 
 **Steps:**
 ```bash
-make test        # cargo test — default suite (427 lib + 423 bin tests, verified 2026-10-17)
+make test        # cargo test — default suite (441 lib + 437 bin tests, verified 2026-10-18)
 make test-all     # cargo test --features fake-embedder — also runs the
-                   # fake-embedder sidecar round-trip tests (436 lib + 432 bin;
+                   # fake-embedder sidecar round-trip tests (450 lib + 446 bin;
                    # 9 extra tests per target vs `make test`, gated behind the
                    # non-default `fake-embedder` Cargo feature so a plain
                    # `cargo build`/`cargo test` never touches that sidecar
@@ -614,10 +634,10 @@ make fmt          # cargo fmt — reformats the codebase in place. Not run as
 - `make help` — lists all targets with one-line descriptions, default target.
 - `make build` — `Finished \`dev\` profile [unoptimized + debuginfo] target(s)`, exit 0.
 - `make lint` — `whatsrust (bin "whatsrust") generated 38 warnings`, exit 0 (non-fatal).
-- `make test` — `test result: ok. 427 passed; 0 failed ...` (lib) and
-  `test result: ok. 423 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-17).
-- `make test-all` — `test result: ok. 436 passed; 0 failed ...` (lib, includes
-  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 432 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-17).
+- `make test` — `test result: ok. 441 passed; 0 failed ...` (lib) and
+  `test result: ok. 437 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-18).
+- `make test-all` — `test result: ok. 450 passed; 0 failed ...` (lib, includes
+  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 446 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-18).
 
 `CONTRIBUTING.md` asks contributors to run `cargo test` and `cargo clippy`
 before submitting a PR — `make test` and `make lint` are equivalent to that,

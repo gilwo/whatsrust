@@ -48,7 +48,7 @@ can connect over HTTP (remote/multiplexed) in addition to spawn-as-child stdio.
 - [x] Design pass + ADR
 - [x] Phase 0a: Pure refactors (head/body split, ApiResponse, RestRequest, CallContext) — done 2026-10-17 (behaviour-neutral; byte-for-byte REST golden test)
 - [x] Behaviour-change step after 0a: gate + token before body read, lingering drain, new reason phrases, 415 code, 411 chunked, Expect: 100-continue supported after auth (other expectations 417), read deadlines — done 2026-10-17
-- [ ] Phase 0b: Config enforcement (token policy, bind both listeners in main())
+- [x] Phase 0b: Config enforcement (REST rules; MCP-listener rules moved to Phase 2) — done 2026-10-18
 - [ ] Phase 1: Shared registry (access_class, integral float normalisation, ADR 0046 amendment)
 - [ ] Phase 2: `/mcp` skeleton (opt-in, separate bind, routing, era detection, read-only switch)
 - [ ] Phase 3: Legacy request handling (lanes, golden test, official SDK test, proxy snippet tested)
