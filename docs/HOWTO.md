@@ -613,9 +613,9 @@ do, via the Makefile.
 
 **Steps:**
 ```bash
-make test        # cargo test — default suite (470 lib + 437 bin tests, verified 2026-10-18)
+make test        # cargo test — default suite (540 lib + 536 bin tests, verified 2026-10-18)
 make test-all     # cargo test --features fake-embedder — also runs the
-                   # fake-embedder sidecar round-trip tests (479 lib + 446 bin;
+                   # fake-embedder sidecar round-trip tests (549 lib + 545 bin;
                    # 9 extra tests per target vs `make test`, gated behind the
                    # non-default `fake-embedder` Cargo feature so a plain
                    # `cargo build`/`cargo test` never touches that sidecar
@@ -643,10 +643,10 @@ make fmt          # cargo fmt — reformats the codebase in place. Not run as
 - `make help` — lists all targets with one-line descriptions, default target.
 - `make build` — `Finished \`dev\` profile [unoptimized + debuginfo] target(s)`, exit 0.
 - `make lint` — `whatsrust (bin "whatsrust") generated 48 warnings`, exit 0 (non-fatal).
-- `make test` — `test result: ok. 470 passed; 0 failed ...` (lib) and
-  `test result: ok. 437 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-18).
-- `make test-all` — `test result: ok. 479 passed; 0 failed ...` (lib, includes
-  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 446 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-18).
+- `make test` — `test result: ok. 540 passed; 0 failed ...` (lib) and
+  `test result: ok. 536 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-18).
+- `make test-all` — `test result: ok. 549 passed; 0 failed ...` (lib, includes
+  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 545 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-18).
 
 `CONTRIBUTING.md` asks contributors to run `cargo test` and `cargo clippy`
 before submitting a PR — `make test` and `make lint` are equivalent to that,

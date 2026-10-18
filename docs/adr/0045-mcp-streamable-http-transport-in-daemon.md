@@ -173,3 +173,7 @@ MCP spec: https://modelcontextprotocol.io/specification/2026-07-28/
 ## Amendment (2026-10-17)
 
 `Expect: 100-continue` is now supported. The server sends `100 Continue` after the gate, token and framing checks pass, and only if the body is not already complete. Rejected requests receive their final error response with no `100`. Other `Expect` values still yield `417 Expectation Failed`. This replaces the original decision to refuse all `Expect` headers with `417`. See design doc §6.
+
+## Amendment (2026-10-18)
+
+The body deadline and tool budget are split. The body may arrive up to accept + min(60 s, 20 s + 4 s per MiB of Content-Length) (a 10 MiB body gets the 60 s cap), plus the 10 s per-read idle timeout. The 40 s tool budget starts when the body is complete, not at arrival. This supersedes "One absolute deadline from arrival" in the Decision (pipeline steps 6-7 and the paragraph after them) and in Consequences: the head keeps its arrival + 20 s deadline, but the body and the tool wait no longer share one budget from arrival. Reason: a 60 s body read cannot fit inside a 40 s budget measured from arrival, and slow uplinks with large media must still work. Consequence: worst-case response time ≈ body time + 40 s (≈100 s for a slow 10 MiB upload), so third-party clients need a timeout of at least 50 s plus their upload time. Phase 2 implements the legacy handshake and `tools/list` ahead of `tools/call` (not all stubs as originally planned).

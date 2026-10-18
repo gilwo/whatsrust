@@ -13,6 +13,7 @@ src/
   api.rs             REST API (59 endpoints), SSE streaming, CLI HTTP client
   mcp.rs             MCP stdio server (34 tools, JSON-RPC)
   mcp_registry.rs    Shared MCP tool registry (metadata, annotations, validation, REST mapping)
+  mcp_http.rs        Opt-in MCP Streamable HTTP listener (POST /mcp)
   storage.rs         rusqlite Signal Protocol store + typed job queue + v8 unified messages table (FTS5 search, embed_status) + embeddings (multi-model BLOB vectors) + backfill queue/cursor
   backfill.rs        Historical backfill worker: two-phase on-demand fetch (HistoryCorrelator), FIFO pagination, contained-C targets, pacer, 3-level abort
   embedder.rs        Embedder trait (sidecar contract), StdioEmbedder (JSON-RPC stdio), FakeEmbedder (test seam), cosine_similarity
