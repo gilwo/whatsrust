@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::bridge::SYNC_CLIENT_TIMEOUT;
-use crate::mcp_registry::{validated_args, ArgsError, REGISTRY};
+use crate::mcp_registry::{rest_tool_result, tool_error, validated_args, ArgsError, REGISTRY};
 
 /// Run the MCP server on stdin/stdout. Blocks until EOF.
 pub fn run_mcp_server(port: u16) {
@@ -108,11 +108,6 @@ fn handle_rpc(req: &JsonRpcRequest, port: u16) -> JsonRpcResponse {
     }
 }
 
-/// MCP tool result carrying an error message (`isError: true`).
-fn tool_error(message: &str) -> Value {
-    json!({ "content": [{ "type": "text", "text": message }], "isError": true })
-}
-
 /// The request target for a tool's REST call: `path`, then `?k=v&k=v` when there are query
 /// pairs, with every key and value URL-encoded.
 fn rest_target(path: &str, query: &[(String, String)]) -> String {
@@ -149,13 +144,13 @@ fn call_tool(name: &str, args: Value, port: u16) -> Result<Value, String> {
     };
 
     Ok(match result {
-        Ok(body) => json!({ "content": [{ "type": "text", "text": body }] }),
+        Ok((status, body)) => rest_tool_result(status, &body),
         Err(e) => tool_error(&e),
     })
 }
 
-/// Blocking HTTP GET to the daemon.
-fn http_get(port: u16, path: &str) -> Result<String, String> {
+/// Blocking HTTP GET to the daemon. `Ok` is the response's status and body text.
+fn http_get(port: u16, path: &str) -> Result<(u16, String), String> {
     use std::io::Read;
     use std::net::TcpStream;
 
@@ -179,13 +174,13 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
 
 /// Blocking HTTP POST to the daemon. Waits up to [`SYNC_CLIENT_TIMEOUT`] (longer than the
 /// daemon's own sync-send wait) so the daemon's 504 + job_id normally arrives first.
-fn http_post(port: u16, path: &str, body: &Value) -> Result<String, String> {
+fn http_post(port: u16, path: &str, body: &Value) -> Result<(u16, String), String> {
     http_post_with_timeout(port, path, body, SYNC_CLIENT_TIMEOUT)
 }
 
 /// [`http_post`] with an explicit read timeout. A read failure (including that timeout) leaves
 /// the outcome unknown, so its error text says the daemon may still process the request.
-fn http_post_with_timeout(port: u16, path: &str, body: &Value, read_timeout: Duration) -> Result<String, String> {
+fn http_post_with_timeout(port: u16, path: &str, body: &Value, read_timeout: Duration) -> Result<(u16, String), String> {
     use std::io::Read;
     use std::net::TcpStream;
 
@@ -212,7 +207,8 @@ fn http_post_with_timeout(port: u16, path: &str, body: &Value, read_timeout: Dur
     extract_http_body(&buf)
 }
 
-fn extract_http_body(raw: &[u8]) -> Result<String, String> {
+/// Split a raw HTTP response into its status code and UTF-8 body text.
+fn extract_http_body(raw: &[u8]) -> Result<(u16, String), String> {
     let header_end = raw.windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or("invalid HTTP response")?;
@@ -226,11 +222,7 @@ fn extract_http_body(raw: &[u8]) -> Result<String, String> {
         .unwrap_or(0);
     let body = String::from_utf8(raw[header_end + 4..].to_vec())
         .map_err(|e| format!("invalid UTF-8: {e}"))?;
-    if status >= 400 {
-        Err(body)
-    } else {
-        Ok(body)
-    }
+    Ok((status, body))
 }
 
 #[cfg(test)]
@@ -925,6 +917,197 @@ mod tests {
             let declared = declared_properties(name).expect("properties object");
             assert!(!declared.contains_key("path"), "{name}: must not declare `path`");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Golden parity (design doc §12): one tool call gives the same tool result through the stdio
+    // proxy path (`call_tool` -> REST over TCP) and the MCP HTTP listener (in-process), each on
+    // its own fresh test bridge, so the two transports cannot drift apart.
+    // -------------------------------------------------------------------------
+
+    /// Tools whose REST handler enqueues a job and then waits `SYNC_SEND_WAIT` (30 s) for an
+    /// outbound worker, which a test bridge does not have. Each is called with arguments the
+    /// REST handler rejects before it enqueues anything (still a real REST answer on both paths).
+    const WAITS_FOR_A_WORKER: [&str; 7] = [
+        "whatsrust_send", "whatsrust_reply", "whatsrust_poll", "whatsrust_status_text",
+        "whatsrust_status_image", "whatsrust_status_video", "whatsrust_status_revoke",
+    ];
+
+    /// Arguments that pass `validated_args` but that the REST handler of a [`WAITS_FOR_A_WORKER`]
+    /// tool answers with a 400 before enqueueing.
+    fn rejected_before_enqueue(tool: &str) -> Value {
+        let group = "120363000000000000@g.us";
+        match tool {
+            // Array items are not inspected by `validated_args`; the REST body parser refuses a number.
+            "whatsrust_send" => json!({"jid": group, "text": "hi", "mentions": [1]}),
+            "whatsrust_reply" => json!({"jid": group, "id": "3EB0AAAA", "sender": " ", "text": "yes"}),
+            "whatsrust_poll" => json!({"jid": group, "question": "Lunch?", "options": ["pizza"], "selectable_count": 1}),
+            "whatsrust_status_text" => json!({"recipients": [], "text": "hello"}),
+            "whatsrust_status_image" | "whatsrust_status_video" => json!({"recipients": [], "data": "AAAA"}),
+            "whatsrust_status_revoke" => json!({"recipients": [], "message_id": "3EB0BBBB"}),
+            other => panic!("{other} is not a tool that waits for a worker"),
+        }
+    }
+
+    /// The calls to compare: every wire case (all 34 tools, with the query-encoding variants),
+    /// the [`WAITS_FOR_A_WORKER`] tools once each with rejected arguments, and a few error
+    /// paths (argument validation, REST 400, REST 503).
+    fn parity_cases() -> Vec<(&'static str, Value)> {
+        let mut cases: Vec<(&'static str, Value)> = Vec::new();
+        let mut waiting_done = std::collections::BTreeSet::new();
+        for case in wire_cases() {
+            if WAITS_FOR_A_WORKER.contains(&case.tool) {
+                if waiting_done.insert(case.tool) {
+                    cases.push((case.tool, rejected_before_enqueue(case.tool)));
+                }
+            } else {
+                cases.push((case.tool, case.args));
+            }
+        }
+        cases.extend([
+            ("whatsrust_send", json!({"jid": 5, "text": "hi"})),
+            ("whatsrust_image", json!({"jid": "1@s.whatsapp.net", "data": "AAAA", "path": "/etc/passwd"})),
+            ("whatsrust_history", json!({"jid": "1@g.us", "limit": "5"})),
+            ("whatsrust_react", json!({"jid": "120363000000000000@g.us", "id": "3EB0AAAA", "emoji": "x", "from_me": false})),
+            ("whatsrust_typing", json!({"jid": "123456789@s.whatsapp.net"})),
+        ]);
+        cases
+    }
+
+    /// Replace what legitimately differs between two runs by placeholders: the uptime, job ids
+    /// (`job_id`, and `id` in a job row; `id` would also be a WhatsApp message id) and the
+    /// job timestamps. The body is parsed, so only JSON keys change. No temp paths or
+    /// durations other than the uptime appear in these responses.
+    fn normalise_volatile(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map.iter_mut() {
+                    if matches!(key.as_str(), "uptime_secs" | "job_id" | "id" | "created_at" | "updated_at") {
+                        *child = json!("<volatile>");
+                    } else {
+                        normalise_volatile(child);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(normalise_volatile),
+            _ => {}
+        }
+    }
+
+    /// A tool result in comparable form: an absent `isError` is `false`, and the text, when it
+    /// is JSON, has its volatile values replaced.
+    fn normalise_result(result: &Value) -> Value {
+        let text = result["content"][0]["text"].as_str().expect("one text block");
+        let text = match serde_json::from_str::<Value>(text) {
+            Ok(mut body) => {
+                normalise_volatile(&mut body);
+                body
+            }
+            Err(_) => json!(text),
+        };
+        json!({
+            "blocks": result["content"].as_array().map(Vec::len),
+            "type": result["content"][0]["type"],
+            "text": text,
+            "isError": result.get("isError").and_then(Value::as_bool).unwrap_or(false),
+            "keys": result.as_object().map(|o| o.keys().filter(|k| *k != "isError").cloned().collect::<Vec<_>>()),
+        })
+    }
+
+    /// A fresh, disconnected test bridge and its database path.
+    async fn parity_bridge(tag: &str) -> (std::sync::Arc<crate::bridge::WhatsAppBridge>, std::path::PathBuf) {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let db_path = std::env::temp_dir().join(format!("whatsrust-parity-{tag}-{ts}.db"));
+        let bridge = crate::bridge::build_test_bridge_with_embedder(
+            &db_path,
+            crate::embedder::FakeEmbedder::new("test-model", 8),
+        )
+        .await;
+        (std::sync::Arc::new(bridge), db_path)
+    }
+
+    /// `tools/call` over HTTP against the MCP listener at `port`; returns the JSON-RPC `result`.
+    async fn mcp_listener_call(port: u16, token: &str, name: &str, args: &Value) -> Value {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}).to_string();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer {token}\r\n\
+             MCP-Protocol-Version: 2025-06-18\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("a response head");
+        let head = String::from_utf8_lossy(&raw[..split]);
+        assert!(head.starts_with("HTTP/1.1 200 "), "{name}: {head}");
+        let reply: Value = serde_json::from_slice(&raw[split + 4..]).expect("a JSON-RPC response");
+        assert!(reply.get("error").is_none(), "{name} {args}: a JSON-RPC error: {reply}");
+        reply["result"].clone()
+    }
+
+    #[tokio::test]
+    async fn test_golden_parity_between_the_stdio_proxy_and_the_mcp_listener_for_all_34_tools() {
+        const MCP_TOKEN: &str = "parity-token-0123456789";
+        // The stdio client reads these two from the environment; a test must not set them, so
+        // the REST server below sits on the defaults it falls back to (127.0.0.1, no token).
+        let (stdio_bridge, stdio_db) = parity_bridge("stdio").await;
+        let (mcp_bridge, mcp_db) = parity_bridge("mcp").await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest_port = rest.local_addr().unwrap().port();
+        let rest_server = tokio::spawn(crate::api::serve_loopback_for_test(stdio_bridge, rest, cancel.clone()));
+        let mcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mcp_port = mcp.local_addr().unwrap().port();
+        let mcp_server = tokio::spawn(crate::mcp_http::serve_for_test(mcp_bridge, mcp, MCP_TOKEN, cancel.clone()));
+
+        let cases = parity_cases();
+        let covered: std::collections::BTreeSet<&str> = cases.iter().map(|(tool, _)| *tool).collect();
+        let expected: std::collections::BTreeSet<&str> = ALL_TOOL_NAMES.iter().copied().collect();
+        assert_eq!(covered, expected, "every one of the 34 tools needs a parity case");
+
+        let started = std::time::Instant::now();
+        for (tool, args) in cases {
+            let label = format!("{tool} {args}");
+            let (name, stdio_args) = (tool.to_string(), args.clone());
+            // `call_tool` is the blocking stdio client, so it runs off the runtime that serves REST.
+            let stdio = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::task::spawn_blocking(move || call_tool(&name, stdio_args, rest_port)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{label}: the stdio call did not finish in 10 s"))
+            .expect("the stdio client thread")
+            .unwrap_or_else(|message| panic!("{label}: stdio gave a JSON-RPC error: {message}"));
+            let http = tokio::time::timeout(Duration::from_secs(10), mcp_listener_call(mcp_port, MCP_TOKEN, tool, &args))
+                .await
+                .unwrap_or_else(|_| panic!("{label}: the MCP call did not finish in 10 s"));
+
+            assert_eq!(normalise_result(&stdio), normalise_result(&http), "{label}\n stdio: {stdio}\n http:  {http}");
+        }
+        assert!(started.elapsed() < Duration::from_secs(25), "the parity run took {:?}", started.elapsed());
+
+        cancel.cancel();
+        let _ = tokio::join!(rest_server, mcp_server);
+        for db in [stdio_db, mcp_db] {
+            let _ = std::fs::remove_file(db);
+        }
+    }
+
+    #[test]
+    fn test_normalise_result_treats_an_absent_is_error_as_false_and_masks_volatile_values() {
+        let plain = json!({"content": [{"type": "text", "text": r#"{"ok":true,"uptime_secs":12,"job_id":3,"jobs":[{"id":1,"created_at":10,"updated_at":11}]}"#}]});
+        let flagged = json!({"content": [{"type": "text", "text": r#"{"ok":true,"uptime_secs":99,"job_id":4,"jobs":[{"id":2,"created_at":20,"updated_at":21}]}"#}], "isError": false});
+        assert_eq!(normalise_result(&plain), normalise_result(&flagged));
+
+        let failed = json!({"content": [{"type": "text", "text": "x"}], "isError": true});
+        let succeeded = json!({"content": [{"type": "text", "text": "x"}]});
+        assert_ne!(normalise_result(&failed), normalise_result(&succeeded));
+        let other = json!({"content": [{"type": "text", "text": r#"{"ok":false}"#}]});
+        assert_ne!(normalise_result(&plain), normalise_result(&other));
     }
 
     // -------------------------------------------------------------------------
