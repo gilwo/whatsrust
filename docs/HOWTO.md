@@ -613,9 +613,9 @@ do, via the Makefile.
 
 **Steps:**
 ```bash
-make test        # cargo test — default suite (540 lib + 536 bin tests, verified 2026-10-18)
+make test        # cargo test — default suite (563 lib + 557 bin tests, 1 ignored per target, verified 2026-10-18)
 make test-all     # cargo test --features fake-embedder — also runs the
-                   # fake-embedder sidecar round-trip tests (549 lib + 545 bin;
+                   # fake-embedder sidecar round-trip tests (572 lib + 566 bin;
                    # 9 extra tests per target vs `make test`, gated behind the
                    # non-default `fake-embedder` Cargo feature so a plain
                    # `cargo build`/`cargo test` never touches that sidecar
@@ -643,14 +643,16 @@ make fmt          # cargo fmt — reformats the codebase in place. Not run as
 - `make help` — lists all targets with one-line descriptions, default target.
 - `make build` — `Finished \`dev\` profile [unoptimized + debuginfo] target(s)`, exit 0.
 - `make lint` — `whatsrust (bin "whatsrust") generated 48 warnings`, exit 0 (non-fatal).
-- `make test` — `test result: ok. 540 passed; 0 failed ...` (lib) and
-  `test result: ok. 536 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-18).
-- `make test-all` — `test result: ok. 549 passed; 0 failed ...` (lib, includes
-  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 545 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-18).
+- `make test` — `test result: ok. 563 passed; 0 failed; 1 ignored ...` (lib) and
+  `test result: ok. 557 passed; 0 failed; 1 ignored ...` (bin), exit 0 (verified 2026-10-18).
+- `make test-all` — `test result: ok. 572 passed; 0 failed; 1 ignored ...` (lib, includes
+  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 566 passed; 0 failed; 1 ignored ...` (bin), exit 0 (verified 2026-10-18).
 
 `CONTRIBUTING.md` asks contributors to run `cargo test` and `cargo clippy`
 before submitting a PR — `make test` and `make lint` are equivalent to that,
 plus `make test-all` for full coverage of the embedder sidecar path.
+
+**Ignored test (`sdk_smoke_python`):** The test suite includes one ignored test per target that runs the official Python MCP SDK (mcp<2, Streamable HTTP client) against a test MCP listener. Run it with `cargo test sdk_smoke_python -- --ignored --nocapture`. This test needs `uv` (the Python package manager) and downloads `mcp<2` from PyPI. It does not contact WhatsApp. The test passes its own test token to the script through `WHATSRUST_MCP_TOKEN`. To run the script against your own daemon, set `WHATSRUST_MCP_TOKEN` yourself; never pass the token as a command-line argument (it shows in `ps`). This test verifies that the MCP listener works with the official SDK, not just hand-rolled requests.
 
 **REST golden tests:** The test suite includes byte-for-byte golden tests of the REST API's wire output (`src/api/golden_tests.rs`). These tests pin every byte the server writes for a comprehensive set of full request/response cycles plus helper-level fixtures (status lines, headers, JSON bodies, error responses). A failing golden case means the REST wire output changed. If the change is deliberate (e.g. fixing a status code or reason phrase), paste the printed literal into the fixture and call the change out in the commit message. Otherwise it is a regression.
 

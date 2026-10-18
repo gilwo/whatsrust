@@ -174,6 +174,26 @@ MCP spec: https://modelcontextprotocol.io/specification/2026-07-28/
 
 `Expect: 100-continue` is now supported. The server sends `100 Continue` after the gate, token and framing checks pass, and only if the body is not already complete. Rejected requests receive their final error response with no `100`. Other `Expect` values still yield `417 Expectation Failed`. This replaces the original decision to refuse all `Expect` headers with `417`. See design doc §6.
 
-## Amendment (2026-10-18)
+## Amendment (2026-10-18, Phase 2)
 
 The body deadline and tool budget are split. The body may arrive up to accept + min(60 s, 20 s + 4 s per MiB of Content-Length) (a 10 MiB body gets the 60 s cap), plus the 10 s per-read idle timeout. The 40 s tool budget starts when the body is complete, not at arrival. This supersedes "One absolute deadline from arrival" in the Decision (pipeline steps 6-7 and the paragraph after them) and in Consequences: the head keeps its arrival + 20 s deadline, but the body and the tool wait no longer share one budget from arrival. Reason: a 60 s body read cannot fit inside a 40 s budget measured from arrival, and slow uplinks with large media must still work. Consequence: worst-case response time ≈ body time + 40 s (≈100 s for a slow 10 MiB upload), so third-party clients need a timeout of at least 50 s plus their upload time. Phase 2 implements the legacy handshake and `tools/list` ahead of `tools/call` (not all stubs as originally planned).
+
+## Amendment (2026-10-18, Phase 3)
+
+### Lane Acquisition Split by Stage
+
+Lane acquisition is split into two stages, superseding the Decision's "Acquire lane permit" step and "Lane selected by access_class and body size" rule. 
+
+**As built:** The large-body permit (`Content-Length > 1 MiB`) is taken before the body is read (head phase), for any method. Only `tools/call` takes a read or write permit, chosen after argument validation and the per-route body cap check (inside `call_tool`). Other methods (`initialize`, `ping`, `tools/list`, `notifications/*`) take no permit.
+
+**Rationale:** The read vs write distinction requires the tool name, which is inside the body. The large-body permit guards memory before the body is buffered, so it stays in the head phase. A large-body request that is also a `tools/call` moves the large-body permit into its task (so the task holds one permit, not two); otherwise the permit is dropped once the request is answered.
+
+### Tool-Budget Timeout and job_id
+
+Until the ADR 0047 job_id-cell phase ships, a tool-budget timeout (`TOOL_BUDGET = 40 s` from body completion) carries no `job_id` in its `isError` result. This qualifies "Timeout response carries job_id when job exists" in the Decision.
+
+**Rationale:** With the tool budget starting at body completion, the bridge's own 30 s sync-send wait (`SYNC_SEND_WAIT`) always fits inside the 40 s budget. The bridge wait returns 504 with `job_id` and "do not retry" (ADR 0047), which surfaces as `isError: true` with that text. The generic timeout (no `job_id`) only happens when a call stalls before or outside the bridge wait, such as when the DB `Mutex<Connection>` is held by a long `purge_embeddings`. This is rare; the ADR 0047 job_id-cell phase will make the generic timeout even rarer.
+
+### Proxy-Snippet Gate Moved to Phase 5
+
+The nginx/Caddy proxy-snippet test (an exit criterion in the original Decision's Phase 3) is moved to Phase 5. The official Python MCP SDK smoke test (`scripts/mcp_sdk_smoke.py`, verified 2026-10-18: mcp 1.30.0, negotiated 2025-11-25, 34 tools, `whatsrust_status` ok, unknown tool → -32602; requests: POST initialize 200, POST notifications/initialized 202, POST tools/list 200, 2× POST tools/call 200; no GET and no DELETE) is the separate Phase 3 SDK gate and passed. The proxy gate deferred to Phase 5 because it requires `brew install nginx caddy` and self-signed TLS setup (owner consent needed before installing those).
