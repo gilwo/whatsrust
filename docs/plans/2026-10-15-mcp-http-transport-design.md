@@ -347,24 +347,14 @@ Error classification:
 
 ### REST Response → MCP Tool Result
 
-```rust
-fn map_rest_to_tool_result(resp: ApiResponse, era: McpEra) -> CallToolResult {
-    let text = String::from_utf8_lossy(&resp.body).into_owned();
-    let is_error = resp.status >= 400;
-    let mut result = CallToolResult {
-        content: vec![Content::Text { text }],
-        is_error,
-    };
-    if era == McpEra::Modern {
-        result.result_type = Some("complete".to_string());  // required for modern per schema
-    }
-    result
-}
-```
+The shared helper `mcp_registry::rest_tool_result(status, body_text) -> Value` maps a REST response to an MCP tool result:
 
-2xx and 3xx → `isError: false`. 4xx/5xx → `isError: true` with the error body as text. Unknown tools return `-32602` protocol error. Non-object `arguments` returns `-32602`. Undeclared keys, wrong-type values, and missing required fields return `isError: true` (from `validated_args`, before REST is reached).
+- **Success (status < 400):** `{"content": [{"type": "text", "text": body_text}]}` with NO `isError` key (an absent key is the success signal).
+- **Error (status >= 400):** `{"content": [{"type": "text", "text": body_text}], "isError": true}`.
+- **Body text:** Read as lossy UTF-8 (`String::from_utf8_lossy`) on the HTTP path; stdio over TCP is strict UTF-8.
+- **Legacy results:** No `resultType` field (stdio and HTTP legacy-era). Modern results will add `resultType: "complete"` in Phase 4.
 
-Modern era: result carries `resultType: "complete"` (required per 2026-07-28 schema for all results). Legacy era: no `resultType` field.
+Unknown tools return `-32602` protocol error. Non-object `arguments` returns `-32602`. Undeclared keys, wrong-type values, and missing required fields return `isError: true` (from `validated_args`, before REST is reached). Per-route body cap violations return the REST `bad_request` response as an `isError` result (same body shape as stdio over TCP).
 
 ADR 0047 sync-send timeouts (30 s bridge wait, 504 response with `job_id`) surface as `isError: true` with the 504 body text including the job_id and "do not retry" message.
 
@@ -476,15 +466,17 @@ gate_request(method, headers, is_loopback_bind, allowed_origins, allowed_hosts) 
   ↓ (403/415 if gate fails, before token check)
 check token: request_has_api_token(headers, WHATSRUST_MCP_TOKEN)?
   ↓ (401 if missing/wrong; token always required for MCP listener)
-acquire MCP semaphore (permit from lane)
-  ↓ (503 -32000 if exhausted; tokio::time::timeout(5s, semaphore.acquire_owned()) with Retry-After: 10)
+framing: Transfer-Encoding → 411; Content-Length > 10 MiB → 413; other Expect → 417 (all from the head)
+  ↓
+Content-Length > 1 MiB? → acquire large-body permit (for any method; held until the request is answered, or moved into the tools/call task)
+  ↓ (503 -32000 if exhausted; tokio::time::timeout(5s, lane.acquire_owned()) with Retry-After: 10)
 Expect: 100-continue supported after gate, token and framing checks (interim "100 Continue" only if the body is incomplete); any other Expect value → 417
   ↓
 read_request_body(stream, content_length, limit=10 MiB, deadline) → Vec<u8>
   ↓ (413 from Content-Length at head phase if too large; body read deadline = arrival + min(60s, 20s + 4s per MiB of Content-Length))
 lingering drain on early rejection (≤64 KiB or ≤1s)
   ↓
-parse JSON-RPC body → JsonRpcRequest
+parse JSON-RPC body → JsonRpcRequest (body complete = tool budget start)
   ↓ (400 -32700 if malformed JSON; 400 -32600 with JSON-RPC error body for array/batch)
 detect_era(headers, body) → Modern | Legacy
   ↓ ┌────────────────────────┬────────────────────────┐
@@ -497,38 +489,36 @@ detect_era(headers, body) → Modern | Legacy
     │ → 400 -32020           │                        │
     └────────────────────────┴────────────────────────┘
   ↓
-  notifications/*: accept with 202, no body (regardless of era headers; JSON-RPC id present → 202 + no body, no error)
-  ↓
-dispatch_mcp_method(method, params, bridge, CallContext) → JSON-RPC result or error
+  notifications/*: accept with 202, no body (regardless of era headers; JSON-RPC id present → 202 + no body, no error; takes no permit)
+  initialize, ping, tools/list: handle (take no permit)
   ↓
   For tools/call:
+    find tool in registry → unknown tool → 200 -32602
+    ↓
     if WHATSRUST_MCP_READ_ONLY set: check tool.access_class == Read, else -32600 "write access denied in read-only mode"
-    find tool in registry → RestMapping
     ↓
-    apply validated_args(name, args) → Result<Value, String>
-      (normalises integral floats; rejects undeclared keys with isError; non-object arguments / unknown tool → -32602)
+    apply validated_args(name, args) → Result<(tool, args), ArgsError>
+      - non-object arguments / unknown tool → -32602 Invalid params
+      - undeclared keys, wrong-type values, missing required fields → isError result (nothing run)
     ↓
-    build RestRequest from mapping (method, path, query pairs, body)
+    build RestRequest from tool.rest_mapping (method, path, query pairs, JSON body; POST without body mapping sends {})
     ↓
-    per-route body cap check (from inline prefix test, not route table):
-      media routes: 70 MiB base64 body, 50 MiB decoded
-      other routes: 1 MiB
-      (10 MiB envelope wins for media routes, so they are capped at 10 MiB here)
+    per-route body cap check: body.len() > max_body_bytes(path)? → isError with REST bad_request body (same as stdio over TCP)
     ↓
-    spawn task: dispatch_rest_request(RestRequest, bridge) → ApiResponse
-      (gate and token NOT re-run; CallContext.loopback_file_access = false)
+    acquire permit from read or write lane (lane = tool.access_class; large-body permit already held → move it into task; otherwise take read/write permit here)
+      ↓ (503 -32000 if exhausted after 5 s wait)
+    spawn task: (cfg.runner)(RestRequest) → ApiResponse (in production: handle_request(&bridge, &req))
+      (gate and token NOT re-run; context.loopback_file_access = false; permit held inside task)
     ↓
-    wait for task with 40s deadline from body completion
-      - enqueue-and-wait routes receive remaining budget; enqueue runs as spawned task publishing job_id through shared cell
-      - on timeout: task continues, permit held until task ends
-      - timeout response carries job_id whenever job exists, "outcome unknown, check before retrying" otherwise
+    wait for task with 40s deadline from body_complete
+      - timeout → task continues, permit held until task ends
+      - timeout response: isError "Operation timed out after 40s; it may still complete; check before retrying."
     ↓
-    task completes: map ApiResponse to CallToolResult:
-      2xx/3xx → isError: false, content: [text]
-      4xx/5xx → isError: true, content: [error text]
-      504 timeout (ADR 0047) → isError: true, body includes job_id + "do not retry"
+    task completes: map ApiResponse to tool result (rest_tool_result(status, body_text)):
+      status < 400 → {"content": [...], NO isError key}
+      status >= 400 → {"content": [...], "isError": true}
     ↓
-    release permit
+    release permit (when task ends)
   ↓
 json_rpc_response(200, result)
   ↓
@@ -570,9 +560,10 @@ Routing, gate, and token check run between head and body. This prevents bufferin
 - **MCP listener lanes (8 total permits):**
   - **Read lane:** 3 permits reserved for `Read` access class tools (status, groups, group_info, history, search, fetch_status). Ensures diagnostic tools stay available.
   - **Write/network lane:** 4 permits for `Write` access class tools (send, chat-management, status-post, network-touching). Caps parallel sync sends at 4.
-  - **Large-body lane:** 1 permit for bodies >1 MiB (e.g. media tools). Cuts peak memory: 1 × ~10 MiB (large) + 4 × ~1 MiB (write/network) + 3 × ~1 MiB (read) = ~17 MiB, down from 8 × ~10 MiB = ~80 MiB worst-case.
-  - Tool dispatch selects lane by `access_class` and body size. `tokio::time::timeout(5s, lane_semaphore.acquire_owned())`. Exhausted → 503 `-32000` "server is at capacity" with `Retry-After: 10`.
-- **Permit lifecycle:** Acquired after gate/token/routing, before body read. Held through dispatch. Released after the tool task completes (not when the timeout fires). A timed-out tool continues running; its permit is held until the task ends.
+  - **Large-body lane:** 1 permit for requests with `Content-Length > 1 MiB` (any method). Cuts peak memory: 1 × ~10 MiB (large) + 4 × ~1 MiB (write/network) + 3 × ~1 MiB (read) = ~17 MiB, down from 8 × ~10 MiB = ~80 MiB worst-case.
+  - **Lane selection (split by stage):** The large-body permit is taken before the body is read (head phase) when `Content-Length > 1 MiB`, for any method. Only `tools/call` takes a read or write permit, chosen after argument validation and the per-route cap check (inside `call_tool`); lane = `tool.access_class`. Other methods (`initialize`, `ping`, `tools/list`, `notifications/*`) take no permit.
+  - `tokio::time::timeout(5s, lane.acquire_owned())`. Exhausted → 503 `-32000` "server is at capacity" with `Retry-After: 10`.
+- **Permit lifecycle:** Large-body permit taken before body read, either dropped once the request is answered (non-`tools/call` methods) or moved into the `tools/call` task (a large-body tool call takes only one permit, not two). Read/write permit taken inside `call_tool` after validation. Released when the task completes (not when the timeout fires). A timed-out tool continues running; its permit is held until the task ends.
 - **Peak memory bound:** 1 large (10 MiB) + 7 small (7 MiB) = ~17 MiB for MCP listener. Conservatively, each request holds ~2× body size (TCP buffer + parsed JSON). REST listener (64 permits, 1 MiB cap for non-media) adds ~128 MiB. Process-wide FDs are noted (outer cap 32 for MCP accept loop).
 - Excess MCP connections → 503 Service Unavailable with `Retry-After: 10`.
 
@@ -585,7 +576,7 @@ Routing, gate, and token check run between head and body. This prevents bufferin
 **Tool budget (40 s from body completion):** The tool budget starts when the body is complete, not at arrival. Enqueue-and-wait routes receive the remaining budget (deadline minus now). No outer timer stacks on top of the 30 s bridge wait. Rationale:
 - A 60 s body read cannot fit inside a 40 s budget measured from arrival.
 - Structured response lands before the client's 45 s timeout (`SYNC_CLIENT_TIMEOUT`) for fast uplinks.
-- The enqueue runs as a spawned task that publishes `job_id` through a shared cell, so a timeout response carries `job_id` whenever a job exists, and "outcome unknown, check before retrying" otherwise.
+- With the budget starting at body completion, the bridge's own 30 s sync-send wait always fits in the 40 s budget. The bridge wait returns 504 with `job_id` (ADR 0047), which surfaces as `isError: true`. The generic timeout (no `job_id`) only happens when the call stalls before or outside the bridge wait (rare; e.g. DB mutex held by a long purge). The ADR 0047 job_id-cell phase (separate, later) will provide `job_id` via a shared cell for the rare cases the generic timeout hits mid-enqueue.
 
 **Timeout value:** `TOOL_BUDGET = 40 s` from body completion. Rationale:
 - `SYNC_SEND_WAIT = 30 s` (bridge wait for outbound job).
@@ -625,9 +616,10 @@ Routing, gate, and token check run between head and body. This prevents bufferin
 | Non-object arguments | 200 | -32602 | JSON-RPC error | Invalid params |
 | Undeclared keys in arguments | 200 | - | `{result:{content:[...],isError:true}}` | Tool execution error (from validated_args) |
 | Write access in read-only mode | 200 | -32600 | JSON-RPC error | "write access denied in read-only mode" |
-| `tools/call` stub (Phase 2 only) | 501 | -32603 | JSON-RPC error | "not implemented yet; use the stdio server"; reason phrase "Not Implemented" |
-| Tool execution error (REST 4xx/5xx) | 200 | - | `{result:{content:[...],isError:true}}` | Tool execution error, not protocol error |
-| At capacity (semaphore exhausted) | 503 | -32000 | JSON-RPC error + `Retry-After: 10` header | Implementation-defined code (−32000…−32019); after gate/token/routing; `tokio::time::timeout(5s, semaphore.acquire_owned())` |
+| Per-route body cap exceeded | 200 | - | `{result:{content:[...],isError:true}}` | Tool execution error; `isError` result with the REST `bad_request` body text (same as stdio over TCP) |
+| Tool budget timeout (40 s from body completion) | 200 | - | `{result:{content:[...],isError:true}}` | "Operation timed out after 40s; it may still complete; check before retrying."; task keeps running |
+| At capacity (permit exhausted, head phase) | 503 | -32000 | JSON-RPC error + `Retry-After: 10` header | Large-body permit exhausted (before body read); `tokio::time::timeout(5s, lane.acquire_owned())` |
+| At capacity (permit exhausted, tools/call) | 503 | -32000 | JSON-RPC error + `Retry-After: 10` header | Read/write permit exhausted (after validation); `tokio::time::timeout(5s, lane.acquire_owned())` |
 
 **Rationale for legacy 200 + `-32601`:** Many legacy clients read 404 as "endpoint or session gone" and abandon the connection. 200 with an error body is safer and matches what stdio does.
 
@@ -914,11 +906,11 @@ Phase 3 exit criteria include an official SDK or Inspector test (legacy clients)
 
 - Unit tests: era detection, header validation, version negotiation, mapping functions, integer rule (integral floats normalised), JSON-RPC id rules (id present = request; id absent = notification; notifications/* with id → 202 + no body; non-notification without id → error).
 - Integration tests: modern `server/discover` + `tools/list` + `tools/call`; legacy `initialize` + `tools/list` + `tools/call`; notifications → 202 (with or without id); unknown method; malformed JSON; unknown tool; REST error mapping (4xx, 5xx, 504 timeout); gate rejection; token rejection; wrong path/method; oversize body (413 from Content-Length).
-- **Golden test:** For all 34 tools, execute through a real `serve()` on both the stdio-proxy path (stdio calls REST over TCP) and the MCP listener (in-process dispatch). Compare normalised `CallToolResult` responses. Normalisation: absent `isError` treated as `false`, absent `resultType` (stdio/legacy) vs present (modern), UTF-8 strict (stdio) vs lossy (HTTP), timeout text exact match not required (duration may differ). This verifies that query splitting, the stdio/HTTP dispatch difference, and integer normalisation all produce equivalent results.
+- **Golden parity test (`src/mcp.rs`, `test_golden_parity_between_the_stdio_proxy_and_the_mcp_listener_for_all_34_tools`):** For all 34 tools (every wire case), execute through stdio `call_tool` → REST over TCP (`api::serve_loopback_for_test`) and through the MCP listener in-process (`mcp_http::serve_for_test`), each on its own disconnected test bridge. Normalisation: absent `isError` = `false`, JSON keys `uptime_secs`, `job_id`, `id`, `created_at`, `updated_at` replaced with `"<volatile>"`. Seven tools (`send`, `reply`, `poll`, `status_text`, `status_image`, `status_video`, `status_revoke`) would wait the 30 s `SYNC_SEND_WAIT` on a test bridge (no outbound worker), so they are called with arguments the REST handler rejects before enqueueing (still a real end-to-end REST answer). Normalisation helpers: `normalise_volatile` (recursive), `normalise_result`, `rest_tool_result`. This verifies that the two transports produce identical tool results once volatile fields are normalised.
 - **2025-06-18 handshake test:** Scripted test that sends `initialize` with `MCP-Protocol-Version: 2025-06-18` header and body `protocolVersion: "2025-06-18"`. Assert the server responds with 200 + `InitializeResult` echoing `2025-06-18` (MUST echo when supported), then call `tools/list` and `tools/call` with the header. Verifies the server handles 2025-06-18 clients.
 - Concurrency test: 10 parallel calls, verify no deadlock and permit release.
 - Auth/gate tests: missing token, wrong token, disallowed Origin, missing Host, token equality (daemon exits).
-- **Official SDK or MCP Inspector (Phase 3 exit criterion):** Run the endpoint against an official MCP SDK client or the MCP Inspector (not only curl and Claude Code). Verify handshake, tool list, tool call. Before Phase 4 ships, test with a modern-first SDK.
+- **Official SDK smoke test (`scripts/mcp_sdk_smoke.py` and the ignored test `sdk_smoke_python` in `cargo test`):** The official Python MCP SDK (mcp<2, Streamable HTTP client) runs against a test listener (`uv run --quiet --with 'mcp<2' python scripts/mcp_sdk_smoke.py http://127.0.0.1:PORT` or `cargo test sdk_smoke_python -- --ignored --nocapture`; needs `uv`, downloads `mcp<2`; no WhatsApp contact; token from `WHATSRUST_MCP_TOKEN` env var, never argv). Verifies: initialize, negotiated protocolVersion, tools/list (34 or 6 for read-only), `whatsrust_status` tool call ok, unknown tool → -32602. Logs every HTTP request (method, path, status). Run before Phase 3 exit.
 - Stdio regression: run stdio server, call tools, assert annotations included, validation errors have correct codes (`-32602` for non-object args, unknown tool), undeclared keys rejected, wrong-type values rejected, integral floats normalised.
 
 ## 12.1. Instructions and Tool Descriptions (Untrusted Message Text)
@@ -1039,27 +1031,29 @@ That step updates the golden fixtures on purpose, so every changed byte shows up
 - Implemented real handlers for `initialize` (stateless, no session ID, counter-offer or echo), `ping` → `{}`, `tools/list` (from registry with read-only filter). Implemented `tools/call` unknown-tool check (200 -32602), read-only mode check (200 -32600), then 501 -32603 stub "not implemented yet; use the stdio server" (Phase 3 implements it).
 - Notifications accepted with 202 regardless of era headers; JSON-RPC id present → 202 + no body, no error.
 - Non-loopback MCP bind logs loud warning when `WHATSRUST_MCP_ALLOW_REMOTE` is set (native TLS is a planned follow-up).
-- Test counts: 540 lib + 536 bin (`make test`), 549 lib + 545 bin (`make test-all`), 36 lib / 48 bin clippy (`make lint`).
+- Test counts: 563 lib + 557 bin (1 ignored each) (`make test`), 572 lib + 566 bin (1 ignored each) (`make test-all`), 36 lib / 48 bin clippy (`make lint`).
 
 **Exit criteria:** MCP listener routed, opt-in works (port > 0), separate bind works, era detected, gate/token applied. GET/DELETE/PUT/HEAD/OPTIONS → 405. Wrong path → 404. `/.well-known/*` → 404 (routed before token). Oversize body (Content-Length > 10 MiB) → 413 at head phase. Read-only switch checks access_class. All criteria met.
 
 ### Phase 3: Legacy Request Handling (Legacy-Only Staging)
 
-- **Implement permit lanes:** 3 read + 4 write/network + 1 large-body (8 total). Lane selection by access_class and body size. Exit criterion before `tools/call` ships.
-- **Golden test:** All 34 tools through stdio-proxy and MCP listener, compare normalised results. Exit criterion before `tools/call` ships.
-- Implement `handle_initialize` (stateless, no session ID, counter-offer version with `2025-11-25` or echo when supported). **Done in Phase 2.**
-- Implement `handle_tools_list` for legacy (no header validation, no `resultType` / `ttlMs` / `cacheScope` fields). **Done in Phase 2.**
-- Implement `handle_tools_call` dispatch: if `WHATSRUST_MCP_READ_ONLY` set, check access_class == Read (else `-32600`); find tool, call `validated_args`, spawn task, execute in-process via `dispatch_rest_request`, wait with 40 s deadline from body completion, map response. Per-route body cap enforcement (from inline prefix test, not route table). Release permit after task ends.
-- Handle `notifications/*` → 202 (accepted unconditionally, no header validation; JSON-RPC id present → 202 + no body, no error). **Done in Phase 2.**
-- Handle `ping` → 200 + `{"result": {}}`. **Done in Phase 2.**
-- Unknown method → 200 + `-32601` (legacy clients; avoids "endpoint gone" interpretation). **Done in Phase 2.**
-- **Modern traffic → 400 `-32022` with `supported: ["2025-11-25", "2025-06-18"]` (legacy-only list for Phase 3 staging).** This triggers the spec's `initialize` fallback in modern clients. **Done in Phase 2.**
-- Task model: tool execution spawned as task, 40 s deadline from body completion, permit held until task ends. Timeout message: "Operation timed out after Ns; it may still complete; check before retrying."
-- Integration test: legacy `initialize` + `tools/list` + `tools/call` for `whatsrust_status` and `whatsrust_send`. 2025-06-18 handshake test (MUST echo when supported).
-- **Official SDK or Inspector test:** Run the MCP listener against an official MCP SDK client or the MCP Inspector. Verify legacy handshake, tool list, and tool call work.
-- **Proxy snippet testing:** Test the documented nginx and Caddy snippets against real servers. Verify: TLS, `client_max_body_size` / `max_size`, Host rewrite to 127.0.0.1, POST forwarding. No `limit_req` in the snippet.
+**Implemented (2026-10-18).**
 
-**Exit criteria:** Legacy clients can connect, initialize, and call tools. Lanes implemented (exit before `tools/call` ships). Golden test passes (exit before `tools/call` ships). Official SDK test passes. Proxy snippet tested and documented. 2025-06-18 handshake test passes.
+**What shipped:**
+- `tools/call` runs in-process. Order: unknown tool → 200 -32602; read-only + Write tool → 200 -32600; `validated_args` (InvalidParams → 200 -32602; Tool → 200 `isError`, nothing run); build `RestRequest` from `tool.rest_mapping` (decoded query pairs, JSON body, POST without body mapping sends `{}`, `CallContext { loopback_file_access: false }`); per-route cap `body.len() > max_body_bytes(path)` → `isError` with REST `bad_request` body (same as stdio over TCP); take a lane permit; spawn via `Runner` (`bridge_runner(bridge)` in production; tests substitute); wait body completion + 40 s (`TOOL_BUDGET`); timeout → `isError` "Operation timed out after 40s; it may still complete; check before retrying." (task keeps running); failed task (JoinError) → `isError` "internal error while running the tool".
+- One shared result helper for both transports (`mcp_registry::rest_tool_result`): status >= 400 → `{"content":[...],"isError":true}`; otherwise `{"content":[...]}` with NO `isError` key. No `resultType` in legacy results.
+- **Lanes (split by stage):** read 3, write 4, large-body 1; 5 s acquire wait → 503 -32000 "server is at capacity; retry later" + `Retry-After: 10`. Content-Length > 1 MiB → large-body permit taken after head checks and before `100 Continue`/body read, for any method; that request takes no other permit. Otherwise only `tools/call` takes a permit (read lane for `AccessClass::Read`, write lane for `Write`) after argument validation and cap check. `initialize`, `ping`, `tools/list`, `notifications/*` take none. Large-body permit wait counts against body deadline (runs from accept).
+- **Golden parity test** (`src/mcp.rs`): every wire case (all 34 tools) plus error paths, through stdio → REST over TCP and through MCP listener in-process, each on its own disconnected test bridge; normalisation (absent `isError` = false, volatile JSON keys replaced); 7 tools called with pre-enqueue-rejected arguments (still real REST answers) to avoid 30 s wait.
+- **Official SDK gate:** `scripts/mcp_sdk_smoke.py` (official Python MCP SDK Streamable HTTP client; token from `WHATSRUST_MCP_TOKEN`; run by ignored test `sdk_smoke_python`; needs `uv`; downloads `mcp<2`). Result 2026-10-18: mcp 1.30.0, negotiated 2025-11-25, 34 tools, `whatsrust_status` ok, unknown tool → -32602; requests: POST initialize 200, POST notifications/initialized 202, POST tools/list 200, 2× POST tools/call 200; no GET and no DELETE (SDK opens GET stream and sends DELETE only when server issues `Mcp-Session-Id`, which this stateless server never does).
+- `serve_mcp(bridge, listener, cancel)`; `main.rs` passes the bridge. The bin crate's `#[allow(dead_code)]` on `mod mcp_registry;` is gone (one narrow allow on `McpRegistry::tool_definitions`, used only by stdio).
+- Tests: `make test` 563 lib + 557 bin (1 ignored each); `make test-all` 572 + 566 (1 ignored each); `make lint` 36 lib / 48 bin, unchanged. Verified 2026-10-18.
+
+**Owner decisions:**
+1. **ADR 0047 job_id cell separate phase:** Until that phase ships, a tool-budget timeout carries no `job_id` (only the bridge 504 does). With the budget starting at body completion, the bridge's own 30 s wait always fits; the generic timeout only happens when the call stalls outside the bridge wait (e.g. DB mutex held by purge). This is rare; the ADR 0047 job_id-cell phase will make it rarer.
+2. **Lanes split by stage:** Large-body permit before body read (guards memory); read/write permit inside `tools/call` after validation (needs tool name from body). This supersedes the original Decision's single-stage "Acquire lane permit" and "Lane selected by access_class and body size".
+3. **Proxy gate → Phase 5:** The nginx/Caddy proxy-snippet test moved to Phase 5 (needs `brew install nginx caddy` + self-signed TLS; ask owner before installing). The separate official-SDK gate stays in Phase 3 and passed.
+
+**Exit criteria:** Met: lanes implemented, golden test passes, official SDK test passes, 2025-06-18 handshake test passes. Moved to Phase 5: proxy snippet tested and documented.
 
 ### Phase 4: Modern Request Handling (Dual-Era)
 
@@ -1080,6 +1074,7 @@ That step updates the golden fixtures on purpose, so every changed byte shows up
 - Add metrics (`/api/status` counters: `mcp_http_requests_total`, `mcp_http_tools_called_total`, `mcp_http_errors_total`, `mcp_http_rejects_total`).
 - Error-case tests (unknown tool, malformed JSON, gate, token, oversized body (413 from Content-Length), 504 timeout, undeclared keys, batching rejection, 405/411/413 with JSON-RPC error bodies, notifications accepted unconditionally).
 - Concurrency test: 10 parallel calls, verify no deadlock and permit release (permits held until tasks end).
+- **Proxy snippet testing (moved from Phase 3):** Test the documented nginx and Caddy snippets against real servers (`brew install nginx caddy` + self-signed TLS; ask owner before installing). Verify: TLS, `client_max_body_size` / `max_size`, Host rewrite to 127.0.0.1, POST forwarding. No `limit_req` in the snippet.
 - Update `.env.example` (document `WHATSRUST_MCP_PORT`, `WHATSRUST_MCP_TOKEN`, token rules, token must differ from REST token).
 - Update `README.md` (F3 feature, separate listener, off by default, separate token required, TLS recommended, target clients: Claude Code, MCP Inspector, official SDK clients).
 - Update `docs/HOWTO.md`:
