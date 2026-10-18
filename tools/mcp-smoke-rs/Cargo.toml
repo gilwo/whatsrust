@@ -1,0 +1,11 @@
+[package]
+name = "mcp-smoke-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Streamable HTTP smoke client (rmcp) for the whatsrust MCP listener"
+publish = false
+
+[dependencies]
+anyhow = "1"
+rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
