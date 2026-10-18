@@ -1,7 +1,7 @@
 //! Shared MCP tool registry: the single source of truth for tool metadata (name, description,
 //! input schema, annotations, access class), argument validation and the tool -> REST mapping.
-//! The stdio server (`mcp.rs`) uses it today and the HTTP MCP listener will use the same
-//! registry, so the two transports cannot drift apart.
+//! The stdio server (`mcp.rs`) and the HTTP MCP listener (`mcp_http.rs`) use the same registry,
+//! so the two transports cannot drift apart.
 
 use std::sync::LazyLock;
 
@@ -164,9 +164,7 @@ pub(crate) struct McpToolMeta {
     /// `properties`.
     pub(crate) input_schema: Value,
     pub(crate) annotations: ToolAnnotations,
-    /// Not read outside tests yet: the HTTP listener's read-only switch (a later phase) filters
-    /// on it. Drop the `allow` once that reads it.
-    #[allow(dead_code)]
+    /// Read by the HTTP listener's read-only switch ([`McpToolMeta::allowed`]).
     pub(crate) access_class: AccessClass,
     pub(crate) rest_mapping: RestMapping,
 }
@@ -196,6 +194,12 @@ impl McpToolMeta {
         Self::new(name, description, input_schema, annotations, AccessClass::Write, rest_mapping)
     }
 
+    /// Whether the tool may be listed and called: always, except that a read-only listener
+    /// (`read_only`) allows only [`AccessClass::Read`] tools.
+    pub(crate) fn allowed(&self, read_only: bool) -> bool {
+        !read_only || self.access_class == AccessClass::Read
+    }
+
     /// The schema's `properties` object (every registered schema has one).
     pub(crate) fn properties(&self) -> &Map<String, Value> {
         self.input_schema
@@ -222,8 +226,15 @@ pub(crate) struct McpRegistry {
 impl McpRegistry {
     /// The `tools/list` entries: `name`, `description`, `inputSchema` and `annotations`.
     pub(crate) fn tool_definitions(&self) -> Vec<Value> {
+        self.tool_definitions_for(false)
+    }
+
+    /// The `tools/list` entries a listener exposes: every tool, or with `read_only` only the
+    /// tools [`McpToolMeta::allowed`] lets through.
+    pub(crate) fn tool_definitions_for(&self, read_only: bool) -> Vec<Value> {
         self.tools
             .iter()
+            .filter(|t| t.allowed(read_only))
             .map(|t| {
                 json!({
                     "name": t.name,
@@ -750,6 +761,29 @@ mod tests {
         );
         let writes = REGISTRY.tools.iter().filter(|t| t.access_class == AccessClass::Write).count();
         assert_eq!(writes, 28);
+    }
+
+    #[test]
+    fn test_allowed_and_read_only_tool_definitions() {
+        for t in &REGISTRY.tools {
+            assert!(t.allowed(false), "{}: everything is allowed without the read-only switch", t.name);
+            assert_eq!(t.allowed(true), t.access_class == AccessClass::Read, "{}", t.name);
+        }
+        assert_eq!(REGISTRY.tool_definitions_for(false), REGISTRY.tool_definitions());
+
+        let names: Vec<String> = REGISTRY
+            .tool_definitions_for(true)
+            .iter()
+            .map(|d| d["name"].as_str().unwrap().to_string())
+            .collect();
+        // Registry order, and exactly the six Read tools.
+        assert_eq!(
+            names,
+            [
+                "whatsrust_status", "whatsrust_groups", "whatsrust_group_info",
+                "whatsrust_history", "whatsrust_search", "whatsrust_fetch_status",
+            ]
+        );
     }
 
     #[test]

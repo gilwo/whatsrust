@@ -169,10 +169,12 @@ impl ApiResponse {
             404 => "Not Found",
             405 => "Method Not Allowed",
             411 => "Length Required",
+            413 => "Content Too Large",
             415 => "Unsupported Media Type",
             417 => "Expectation Failed",
             429 => "Too Many Requests",
             500 => "Internal Server Error",
+            501 => "Not Implemented",
             503 => "Service Unavailable",
             504 => "Gateway Timeout",
             _ => "Unknown",
@@ -218,7 +220,7 @@ fn json_ok_simple() -> ApiResponse {
     json_response(200, r#"{"ok":true}"#)
 }
 
-fn json_err(status: u16, msg: &str) -> ApiResponse {
+pub(crate) fn json_err(status: u16, msg: &str) -> ApiResponse {
     let code = match status {
         400 => "bad_request",
         401 => "unauthorized",
@@ -267,7 +269,7 @@ fn bridge_err(e: anyhow::Error) -> ApiResponse {
     json_err(status, &msg)
 }
 
-fn bool_env_var(name: &str) -> bool {
+pub(crate) fn bool_env_var(name: &str) -> bool {
     matches!(
         std::env::var(name).ok().as_deref(),
         Some("1" | "true" | "TRUE" | "yes" | "YES")
@@ -279,7 +281,7 @@ pub fn api_bind_host() -> String {
     std::env::var("WHATSRUST_BIND").unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
-fn is_loopback_bind(bind: &str) -> bool {
+pub(crate) fn is_loopback_bind(bind: &str) -> bool {
     bind.eq_ignore_ascii_case("localhost")
         || bind
             .parse::<IpAddr>()
@@ -295,11 +297,17 @@ fn cli_connect_host(bind: &str) -> String {
     }
 }
 
-fn configured_api_token() -> Option<String> {
-    std::env::var("WHATSRUST_API_TOKEN")
+/// The token in the environment variable `name`: trimmed, and `None` when the variable is unset,
+/// empty or only whitespace.
+pub(crate) fn token_from_env(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+pub(crate) fn configured_api_token() -> Option<String> {
+    token_from_env("WHATSRUST_API_TOKEN")
 }
 
 /// Constant-time token comparison to prevent timing side-channel leaks.
@@ -316,7 +324,7 @@ fn ct_eq(a: &str, b: &str) -> bool {
 
 /// Whether `headers` carry `expected_token` as `X-API-Token` or as an `Authorization: Bearer`
 /// token. Reads headers only, so it runs before any body byte is read.
-fn request_has_api_token(headers: &[(String, String)], expected_token: &str) -> bool {
+pub(crate) fn request_has_api_token(headers: &[(String, String)], expected_token: &str) -> bool {
     if let Some(tok) = find_header(headers, "x-api-token") {
         if ct_eq(tok, expected_token) {
             return true;
@@ -359,7 +367,7 @@ fn find_all_headers<'a>(headers: &'a [(String, String)], name: &str) -> Vec<&'a 
 
 /// Parse a comma-separated allowlist env var into trimmed, non-empty entries.
 /// Default (unset or empty) is an empty allowlist.
-fn parse_allowlist_env(name: &str) -> Vec<String> {
+pub(crate) fn parse_allowlist_env(name: &str) -> Vec<String> {
     std::env::var(name)
         .ok()
         .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
@@ -470,12 +478,13 @@ const MAX_MEDIA_READ_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Longest a single read of the head or the body may wait for the client.
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Wall-clock budget for receiving a whole request head, counted from accept. Only the head has
-/// a total deadline: the body is bounded per read by [`READ_IDLE_TIMEOUT`] alone, because after
-/// the auth checks only authenticated clients reach it and a large upload can be slow.
-const HEAD_READ_DEADLINE: Duration = Duration::from_secs(20);
+/// Wall-clock budget for receiving a whole request head, counted from accept. On the REST
+/// listener only the head has a total deadline: the body is bounded per read by
+/// [`READ_IDLE_TIMEOUT`] alone, because after the auth checks only authenticated clients reach it
+/// and a large upload can be slow. The MCP listener adds its own body deadline.
+pub(crate) const HEAD_READ_DEADLINE: Duration = Duration::from_secs(20);
 /// Interim response for `Expect: 100-continue`, written before the body is read.
-const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+pub(crate) const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
 /// The instant by which the head of a request accepted now must be complete.
 fn head_deadline() -> tokio::time::Instant {
@@ -529,22 +538,35 @@ impl RequestHead {
     /// - `Content-Length` over `limit`: 400, as for any unreadable request;
     /// - an `Expect` value other than `100-continue`: 417.
     fn framing_error(&self, limit: usize) -> Option<ApiResponse> {
-        // Trimmed so `Transfer-Encoding : chunked` (a padded name) is refused too.
-        if self.headers.iter().any(|(name, _)| name.trim().eq_ignore_ascii_case("transfer-encoding")) {
+        if self.has_transfer_encoding() {
             return Some(json_err(411, "Transfer-Encoding is not supported; send Content-Length"));
         }
         if self.content_length > limit {
             return Some(bad_request());
         }
-        let unsupported_expect = find_all_headers(&self.headers, "expect")
-            .iter()
-            .any(|v| !v.eq_ignore_ascii_case("100-continue"));
-        unsupported_expect.then(|| json_err(417, "unsupported Expect"))
+        self.has_unsupported_expect().then(|| json_err(417, "unsupported Expect"))
+    }
+
+    /// The declared `Content-Length`; 0 when absent or unparseable.
+    pub(crate) fn content_length(&self) -> usize {
+        self.content_length
+    }
+
+    /// Whether any `Transfer-Encoding` header is present (the reader cannot decode chunked
+    /// bodies, and refusing every value leaves no `Content-Length` / `Transfer-Encoding`
+    /// ambiguity). The name is trimmed so `Transfer-Encoding : chunked` is caught too.
+    pub(crate) fn has_transfer_encoding(&self) -> bool {
+        self.headers.iter().any(|(name, _)| name.trim().eq_ignore_ascii_case("transfer-encoding"))
+    }
+
+    /// Whether any `Expect` header has a value other than `100-continue`.
+    pub(crate) fn has_unsupported_expect(&self) -> bool {
+        find_all_headers(&self.headers, "expect").iter().any(|v| !v.eq_ignore_ascii_case("100-continue"))
     }
 
     /// Whether the client sent `Expect: 100-continue` and has not sent the whole body yet, so
     /// it is waiting for a `100 Continue` before it does.
-    fn awaiting_continue(&self) -> bool {
+    pub(crate) fn awaiting_continue(&self) -> bool {
         let expects_continue = find_header(&self.headers, "expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
         expects_continue && self.leftover.len() < self.content_length
     }
@@ -552,7 +574,7 @@ impl RequestHead {
 
 /// The response for a request that cannot be read: a malformed, oversize or stalled head, an
 /// oversize `Content-Length`, or a body that never fully arrives.
-fn bad_request() -> ApiResponse {
+pub(crate) fn bad_request() -> ApiResponse {
     json_err(400, "bad request")
 }
 
@@ -2147,7 +2169,7 @@ const DRAIN_MAX_TIME: Duration = Duration::from_secs(1);
 /// a reset: shut down the write half, read and discard what the client is still sending (until
 /// EOF, [`DRAIN_MAX_BYTES`] or [`DRAIN_MAX_TIME`]), and drop the stream. Closing a socket with
 /// unread data makes the OS reset the connection, and the client can lose the response.
-async fn respond_and_drain<S>(mut stream: S, response: ApiResponse)
+pub(crate) async fn respond_and_drain<S>(mut stream: S, response: ApiResponse)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -2542,9 +2564,11 @@ mod tests {
             (400, "Bad Request"),
             (405, "Method Not Allowed"),
             (411, "Length Required"),
+            (413, "Content Too Large"),
             (415, "Unsupported Media Type"),
             (417, "Expectation Failed"),
             (418, "Unknown"),
+            (501, "Not Implemented"),
             (0, "Unknown"),
         ];
         for (status, phrase) in cases {
