@@ -225,6 +225,7 @@ pub(crate) struct McpRegistry {
 
 impl McpRegistry {
     /// The `tools/list` entries: `name`, `description`, `inputSchema` and `annotations`.
+    #[allow(dead_code)] // the stdio server calls it; the daemon binary compiles this module without `mcp.rs`
     pub(crate) fn tool_definitions(&self) -> Vec<Value> {
         self.tool_definitions_for(false)
     }
@@ -452,6 +453,28 @@ impl McpRegistry {
 
 /// The registry of all MCP tools.
 pub(crate) static REGISTRY: LazyLock<McpRegistry> = LazyLock::new(McpRegistry::build);
+
+/// An MCP `tools/call` result: one text block, plus `"isError": true` when `is_error` (the key
+/// is absent otherwise). Both transports build every tool result through here, so their shapes
+/// cannot drift apart. Legacy results carry no `resultType`.
+pub(crate) fn tool_result(text: &str, is_error: bool) -> Value {
+    let mut result = json!({ "content": [{ "type": "text", "text": text }] });
+    if is_error {
+        result["isError"] = json!(true);
+    }
+    result
+}
+
+/// An error tool result (`isError: true`) carrying `message`.
+pub(crate) fn tool_error(message: &str) -> Value {
+    tool_result(message, true)
+}
+
+/// The tool result for a REST response: a status of 400 or more is an error result, and the
+/// body text is the content either way.
+pub(crate) fn rest_tool_result(status: u16, body: &str) -> Value {
+    tool_result(body, status >= 400)
+}
 
 /// Why a tool call's arguments were rejected, and how the transport reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1041,6 +1064,30 @@ mod tests {
         assert_eq!(validated("whatsrust_location", ok.clone()), Ok(ok));
         let ok = json!({"jid": "1@g.us", "lat": -31.25, "lon": 34});
         assert_eq!(validated("whatsrust_location", ok.clone()), Ok(ok));
+    }
+
+    // -------------------------------------------------------------------------
+    // Tool results: the one shape both transports return
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_tool_result_shape_and_is_error_key() {
+        assert_eq!(tool_result("hi", false), json!({"content": [{"type": "text", "text": "hi"}]}));
+        assert_eq!(tool_result("hi", false).to_string(), r#"{"content":[{"text":"hi","type":"text"}]}"#);
+        assert_eq!(tool_result("bad", true), json!({"content": [{"type": "text", "text": "bad"}], "isError": true}));
+        assert_eq!(super::tool_error("bad"), tool_result("bad", true));
+        // No `resultType`: a legacy result carries only `content` (and `isError` for errors).
+        assert!(tool_result("hi", false).get("resultType").is_none());
+    }
+
+    #[test]
+    fn test_rest_tool_result_is_an_error_from_status_400_up() {
+        for status in [200u16, 202, 204, 301, 399] {
+            assert_eq!(rest_tool_result(status, "{}"), tool_result("{}", false), "status {status}");
+        }
+        for status in [400u16, 404, 429, 500, 503, 504] {
+            assert_eq!(rest_tool_result(status, "{}"), tool_result("{}", true), "status {status}");
+        }
     }
 
     #[test]

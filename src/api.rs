@@ -580,7 +580,7 @@ pub(crate) fn bad_request() -> ApiResponse {
 
 /// Body size limit for a request to `path`: 70 MiB for media endpoints (base64 of 50 MiB),
 /// 1 MiB otherwise.
-fn max_body_bytes(path: &str) -> usize {
+pub(crate) fn max_body_bytes(path: &str) -> usize {
     let is_media_route = path.starts_with("/api/image")
         || path.starts_with("/api/video")
         || path.starts_with("/api/audio")
@@ -2250,6 +2250,32 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, bridge: &WhatsAppBr
     let context = CallContext { loopback_file_access: cfg.is_loopback };
     let response = handle_request(bridge, &head.into_rest(body, context)).await;
     let _ = stream.write_all(&response.into_bytes()).await;
+}
+
+/// Serve REST on `listener` until `cancel`: loopback, no token, no allowlists, each connection
+/// through [`serve_connection`] with an explicit [`ServeConfig`], so a test in another module
+/// can put a real REST server behind a port without touching the environment.
+#[cfg(test)]
+#[allow(dead_code)] // only the lib crate's stdio/HTTP parity test (mcp.rs) calls it; the bin's test build compiles this module too
+pub(crate) async fn serve_loopback_for_test(bridge: Arc<WhatsAppBridge>, listener: TcpListener, cancel: CancellationToken) {
+    let cfg = Arc::new(ServeConfig {
+        is_loopback: true,
+        api_token: None,
+        allowed_origins: Vec::new(),
+        allowed_hosts: Vec::new(),
+        sse_sem: Arc::new(Semaphore::new(SSE_MAX_CONNECTIONS)),
+        sse_cancel: cancel.clone(),
+    });
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let Ok((stream, _)) = result else { continue };
+                let (bridge, cfg) = (bridge.clone(), cfg.clone());
+                tokio::spawn(async move { serve_connection(stream, &bridge, &cfg).await });
+            }
+            _ = cancel.cancelled() => break,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

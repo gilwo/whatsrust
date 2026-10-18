@@ -24,9 +24,6 @@ mod embed_drain;
 mod embedder;
 mod instance_lock;
 mod mcp_http;
-// Phase 3 (`tools/call` over HTTP) uses the rest of the registry (`validated_args`, the REST
-// mapping) and removes this allow; until then only the stdio server in the lib crate does.
-#[allow(dead_code)]
 mod mcp_registry;
 mod media_utils;
 mod outbound;
@@ -559,11 +556,12 @@ async fn async_main() -> Result<()> {
         });
     }
 
-    // Spawn the MCP server on the listener bound above (it does not need the bridge yet)
+    // Spawn the MCP server on the listener bound above
     if let Some(listener) = mcp_listener {
+        let mcp_bridge = bridge.clone();
         let mcp_cancel = cancel.clone();
         tokio::spawn(async move {
-            mcp_http::serve_mcp(listener, mcp_cancel).await;
+            mcp_http::serve_mcp(mcp_bridge, listener, mcp_cancel).await;
         });
     }
 

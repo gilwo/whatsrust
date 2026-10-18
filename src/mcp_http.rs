@@ -1,25 +1,29 @@
 //! The opt-in MCP Streamable HTTP listener. It serves only `POST /mcp`, statelessly (no
 //! `Mcp-Session-Id` is ever issued), on its own port with its own token, bind address and
-//! connection cap. This phase implements the legacy-era handshake (`initialize`, `ping`,
-//! `tools/list`) and accepts notifications; `tools/call` is a stub until Phase 3.
+//! connection cap. It implements the legacy-era handshake (`initialize`, `ping`, `tools/list`),
+//! accepts notifications, and runs `tools/call` in-process against the bridge's REST router
+//! under per-stage concurrency lanes and a tool budget.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
-use tokio::time::{timeout_at, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::{timeout, timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::api::{
-    bad_request, bool_env_var, gate_request, is_loopback_bind, json_err, parse_allowlist_env, read_request_body,
-    read_request_head, request_has_api_token, respond_and_drain, token_from_env, ApiResponse, RequestHead,
-    CONTINUE_RESPONSE, HEAD_READ_DEADLINE,
+    bad_request, bool_env_var, gate_request, handle_request, is_loopback_bind, json_err, max_body_bytes,
+    parse_allowlist_env, read_request_body, read_request_head, request_has_api_token, respond_and_drain,
+    token_from_env, ApiResponse, CallContext, RequestHead, RestRequest, CONTINUE_RESPONSE, HEAD_READ_DEADLINE,
 };
-use crate::mcp_registry::REGISTRY;
+use crate::bridge::WhatsAppBridge;
+use crate::mcp_registry::{rest_tool_result, tool_error, validated_args, AccessClass, ArgsError, REGISTRY};
 
 /// Most connections the listener serves at once; the rest get 503.
 const MAX_CONNECTIONS: usize = 32;
@@ -33,6 +37,23 @@ const BODY_MAX_BUDGET: Duration = Duration::from_secs(60);
 const BODY_MS_PER_MIB: u64 = 4_000;
 /// Fewest characters a `WHATSRUST_MCP_TOKEN` may have (128 bits as base64).
 const MIN_TOKEN_CHARS: usize = 22;
+/// A `Content-Length` over this takes the one large-body permit, whatever the JSON-RPC method.
+const LARGE_BODY_BYTES: usize = 1024 * 1024;
+/// Permits of the read lane: `tools/call` of a `Read` tool.
+const READ_LANE_PERMITS: usize = 3;
+/// Permits of the write lane: `tools/call` of a `Write` tool (caps parallel sync sends).
+const WRITE_LANE_PERMITS: usize = 4;
+/// Permits of the large-body lane.
+const LARGE_BODY_PERMITS: usize = 1;
+/// Longest a request waits for a lane permit before it gets the 503.
+const LANE_WAIT: Duration = Duration::from_secs(5);
+/// Longest a tool call is waited for, from the moment its request body is complete.
+const TOOL_BUDGET: Duration = Duration::from_secs(40);
+/// Result text when [`TOOL_BUDGET`] ran out first. The call keeps running; keep the seconds in
+/// step with [`TOOL_BUDGET`].
+const TIMEOUT_TEXT: &str = "Operation timed out after 40s; it may still complete; check before retrying.";
+/// Result text when the tool task ended without a response (cancelled or panicked).
+const TOOL_FAILED_TEXT: &str = "internal error while running the tool";
 /// The one path the listener serves.
 const MCP_PATH: &str = "/mcp";
 
@@ -54,9 +75,10 @@ const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
-const INTERNAL_ERROR: i64 = -32603;
 const HEADER_MISMATCH: i64 = -32020;
 const UNSUPPORTED_VERSION: i64 = -32022;
+/// Implementation-defined code for "no lane permit within [`LANE_WAIT`]".
+const AT_CAPACITY: i64 = -32000;
 
 // ---------------------------------------------------------------------------
 // Settings and startup rules
@@ -361,6 +383,52 @@ fn detect_era(headers: &[(String, String)], body: &Value, method: &str) -> Resul
 // Request handling
 // ---------------------------------------------------------------------------
 
+/// The future of one in-process REST call.
+type RestFuture = Pin<Box<dyn Future<Output = ApiResponse> + Send>>;
+
+/// Runs one REST request in-process and returns its response. The daemon's runner is
+/// [`bridge_runner`]; a test can substitute its own to control when a call finishes.
+type Runner = Arc<dyn Fn(RestRequest) -> RestFuture + Send + Sync>;
+
+/// The runner that routes a request through the bridge's REST router.
+fn bridge_runner(bridge: Arc<WhatsAppBridge>) -> Runner {
+    Arc::new(move |req| {
+        let bridge = bridge.clone();
+        Box::pin(async move { handle_request(&bridge, &req).await })
+    })
+}
+
+/// The listener's concurrency lanes, one semaphore per stage (design doc §6). The large-body
+/// permit is taken from the request head, before the body is read; a `tools/call` that does not
+/// hold it takes a read or write permit once its arguments are validated.
+struct Lanes {
+    /// `tools/call` of a `Read` tool.
+    read: Arc<Semaphore>,
+    /// `tools/call` of a `Write` tool.
+    write: Arc<Semaphore>,
+    /// Any request with a `Content-Length` over [`LARGE_BODY_BYTES`].
+    large_body: Arc<Semaphore>,
+    /// Longest wait for a permit.
+    wait: Duration,
+}
+
+impl Lanes {
+    fn new() -> Self {
+        Self {
+            read: Arc::new(Semaphore::new(READ_LANE_PERMITS)),
+            write: Arc::new(Semaphore::new(WRITE_LANE_PERMITS)),
+            large_body: Arc::new(Semaphore::new(LARGE_BODY_PERMITS)),
+            wait: LANE_WAIT,
+        }
+    }
+
+    /// A permit from `lane`, or `None` when none became free within [`Lanes::wait`].
+    async fn acquire(&self, lane: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+        // The error case is a closed semaphore, which nothing here ever does.
+        timeout(self.wait, lane.clone().acquire_owned()).await.ok()?.ok()
+    }
+}
+
 /// Per-listener settings that [`serve_connection`] reads for every accepted connection.
 /// [`serve_mcp`] builds one from the environment; tests build one explicitly.
 struct McpConfig {
@@ -374,6 +442,10 @@ struct McpConfig {
     allowed_origins: Vec<String>,
     /// `Host` allowlist for the request gate.
     allowed_hosts: Vec<String>,
+    /// Concurrency lanes for this listener.
+    lanes: Lanes,
+    /// Executes a tool's REST request.
+    runner: Runner,
 }
 
 /// How long after accept a body of `content_length` bytes may take to arrive: 20 s plus 4 s per
@@ -423,7 +495,8 @@ fn reject_from_head(head: &RequestHead, cfg: &McpConfig) -> Option<ApiResponse> 
 /// Read one request from `stream`, run its head through [`reject_from_head`] before reading
 /// the body, answer it, and close. `accepted` is when the connection was accepted: the head
 /// must be in 20 s after it and the body [`body_budget`] after it. A response written before
-/// the body is fully read goes through [`respond_and_drain`].
+/// the body is fully read goes through [`respond_and_drain`]. A body over [`LARGE_BODY_BYTES`]
+/// first takes the large-body permit, which the request holds until it is answered.
 async fn serve_connection<S>(mut stream: S, cfg: &McpConfig, accepted: Instant)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -435,6 +508,15 @@ where
         return respond_and_drain(stream, response).await;
     }
 
+    let large_permit = if head.content_length() > LARGE_BODY_BYTES {
+        match cfg.lanes.acquire(&cfg.lanes.large_body).await {
+            Some(permit) => Some(permit),
+            None => return respond_and_drain(stream, at_capacity(&Value::Null)).await,
+        }
+    } else {
+        None
+    };
+
     // Only a request that passed every check above gets its 100 Continue.
     if head.awaiting_continue() && stream.write_all(CONTINUE_RESPONSE).await.is_err() {
         return;
@@ -445,8 +527,9 @@ where
         return respond_and_drain(stream, bad_request()).await;
     };
 
-    // Phase 3 starts the 40 s tool budget here, now that the body is complete.
-    let response = handle_body(&head.headers, &body, cfg);
+    // The tool budget runs from the moment the body is complete.
+    let body_complete = Instant::now();
+    let response = handle_body(&head.headers, body, cfg, large_permit, body_complete).await;
     let _ = stream.write_all(&response.into_bytes()).await;
 }
 
@@ -459,10 +542,21 @@ fn echo_id(request: &Value) -> Value {
 }
 
 /// Turn a complete request body into the response: parse, validate the JSON-RPC envelope,
-/// accept notifications, detect the era and dispatch.
-fn handle_body(headers: &[(String, String)], body: &[u8], cfg: &McpConfig) -> ApiResponse {
+/// accept notifications, detect the era and dispatch. `large_permit` is the large-body permit
+/// when the request holds one (a `tools/call` moves it into its task, anything else drops it on
+/// return); `body_complete` is when the body finished arriving, where the tool budget starts.
+async fn handle_body(
+    headers: &[(String, String)],
+    body: Vec<u8>,
+    cfg: &McpConfig,
+    large_permit: Option<OwnedSemaphorePermit>,
+    body_complete: Instant,
+) -> ApiResponse {
     let null = Value::Null;
-    let request: Value = match serde_json::from_slice(body) {
+    let parsed = serde_json::from_slice(&body);
+    // The parsed request replaces the raw bytes, so a large envelope is not held twice.
+    drop(body);
+    let mut request: Value = match parsed {
         Ok(value) => value,
         Err(_) => return rpc_error(RpcError::new(400, PARSE_ERROR, "Parse error"), &null, &[]),
     };
@@ -478,7 +572,7 @@ fn handle_body(headers: &[(String, String)], body: &[u8], cfg: &McpConfig) -> Ap
     }
 
     let method = match (request.get("jsonrpc"), request.get("method")) {
-        (Some(Value::String(version)), Some(Value::String(method))) if version == "2.0" => method.as_str(),
+        (Some(Value::String(version)), Some(Value::String(method))) if version == "2.0" => method.clone(),
         _ => {
             let err = RpcError::new(
                 400,
@@ -500,8 +594,12 @@ fn handle_body(headers: &[(String, String)], body: &[u8], cfg: &McpConfig) -> Ap
         return rpc_error(err, &null, &[]);
     }
 
-    match detect_era(headers, &request, method) {
-        Ok(Era::Legacy) => dispatch_legacy(&id, method, request.get("params").unwrap_or(&null), cfg),
+    match detect_era(headers, &request, &method) {
+        Ok(Era::Legacy) => {
+            // `params` moves out of the request, so a large `arguments` is not copied.
+            let params = request.get_mut("params").map(Value::take).unwrap_or(Value::Null);
+            dispatch_legacy(&id, &method, params, cfg, large_permit, body_complete).await
+        }
         // Phase 4 replaces this arm with the modern dispatch; `detect_era` returns `Modern`
         // only once `SUPPORTED_VERSIONS` lists it.
         Ok(Era::Modern) => rpc_error(unsupported_version(MODERN_VERSION), &id, &[]),
@@ -516,7 +614,15 @@ fn negotiated_version(requested: &str) -> &'static str {
 }
 
 /// Answer a legacy-era request (HTTP 200 unless stated). Stateless: no session is created.
-fn dispatch_legacy(id: &Value, method: &str, params: &Value, cfg: &McpConfig) -> ApiResponse {
+/// `large_permit` and `body_complete` are for `tools/call` only (see [`handle_body`]).
+async fn dispatch_legacy(
+    id: &Value,
+    method: &str,
+    params: Value,
+    cfg: &McpConfig,
+    large_permit: Option<OwnedSemaphorePermit>,
+    body_complete: Instant,
+) -> ApiResponse {
     match method {
         "initialize" => {
             let Some(requested) = params.get("protocolVersion").and_then(Value::as_str) else {
@@ -534,14 +640,56 @@ fn dispatch_legacy(id: &Value, method: &str, params: &Value, cfg: &McpConfig) ->
         "ping" => rpc_ok(id, json!({})),
         // `params.cursor` is ignored: the whole list is one page.
         "tools/list" => rpc_ok(id, json!({ "tools": REGISTRY.tool_definitions_for(cfg.read_only) })),
-        "tools/call" => call_tool(id, params, cfg),
+        "tools/call" => call_tool(id, params, cfg, large_permit, body_complete).await,
         _ => rpc_error(RpcError::new(200, METHOD_NOT_FOUND, format!("Method not found: {method}")), id, &[]),
     }
 }
 
-/// `tools/call`: check the tool exists and may be called, then answer 501 until Phase 3 runs
-/// it against the daemon.
-fn call_tool(id: &Value, params: &Value, cfg: &McpConfig) -> ApiResponse {
+/// The JSON-RPC `-32000` 503 for a request that found no free lane permit within
+/// [`Lanes::wait`], echoing `id` (`null` when the body was not read).
+fn at_capacity(id: &Value) -> ApiResponse {
+    let err = RpcError::new(503, AT_CAPACITY, "server is at capacity; retry later");
+    rpc_error(err, id, &[("Retry-After", "10")])
+}
+
+/// The tool result for a REST response, the same on both transports (`isError` for 4xx/5xx).
+/// The body is read as lossy UTF-8.
+fn rest_response_result(response: &ApiResponse) -> Value {
+    rest_tool_result(response.status, &String::from_utf8_lossy(&response.body))
+}
+
+/// Run `fut` as its own task and wait for it until `deadline`, returning the tool result. The
+/// deadline only stops the waiting: on timeout the task keeps running, and `permit` lives inside
+/// it, so the lane is freed when the task ends and not when the wait does.
+async fn run_with_budget<F>(fut: F, permit: OwnedSemaphorePermit, deadline: Instant) -> Value
+where
+    F: Future<Output = ApiResponse> + Send + 'static,
+{
+    let task = tokio::spawn(async move {
+        let _permit = permit;
+        fut.await
+    });
+    match timeout_at(deadline, task).await {
+        Ok(Ok(response)) => rest_response_result(&response),
+        Ok(Err(_)) => tool_error(TOOL_FAILED_TEXT),
+        Err(_) => tool_error(TIMEOUT_TEXT),
+    }
+}
+
+/// `tools/call`, in this order: the tool must exist (`-32602`) and, in read-only mode, be a
+/// `Read` tool (`-32600`); its arguments must validate (non-object `arguments` is `-32602`,
+/// everything else an `isError` result, and nothing is run); the REST request built from them
+/// must fit its route's body cap (`isError` with the REST `bad_request` body); then it takes a
+/// lane permit (the large-body permit when the request holds one, else the read or write lane)
+/// and runs in-process under [`TOOL_BUDGET`] counted from `body_complete`. The `isError` results
+/// travel as HTTP 200.
+async fn call_tool(
+    id: &Value,
+    mut params: Value,
+    cfg: &McpConfig,
+    large_permit: Option<OwnedSemaphorePermit>,
+    body_complete: Instant,
+) -> ApiResponse {
     let name = params.get("name").and_then(Value::as_str);
     let Some(tool) = name.and_then(|name| REGISTRY.find_tool(name)) else {
         let shown = name.unwrap_or("(name is missing or not a string)");
@@ -550,23 +698,70 @@ fn call_tool(id: &Value, params: &Value, cfg: &McpConfig) -> ApiResponse {
     if !tool.allowed(cfg.read_only) {
         return rpc_error(RpcError::new(200, INVALID_REQUEST, "write access denied in read-only mode"), id, &[]);
     }
-    let err = RpcError::new(
-        501,
-        INTERNAL_ERROR,
-        "tools/call over HTTP is not implemented yet; use the stdio server (`whatsrust mcp`)",
-    );
-    rpc_error(err, id, &[])
+
+    // `arguments` moves out of `params`; absent means `null`, which `validated_args` reads as `{}`.
+    let args = params.get_mut("arguments").map(Value::take).unwrap_or(Value::Null);
+    let (tool, args) = match validated_args(tool.name, args) {
+        Ok(validated) => validated,
+        Err(ArgsError::InvalidParams(message)) => {
+            return rpc_error(RpcError::new(200, INVALID_PARAMS, message), id, &[]);
+        }
+        Err(ArgsError::Tool(message)) => return rpc_ok(id, tool_error(&message)),
+    };
+
+    let mapping = &tool.rest_mapping;
+    let query = (mapping.query)(&args);
+    // A POST with no body mapping sends `{}`, like the stdio server; a GET sends nothing.
+    let body = match (mapping.body)(args) {
+        Some(body) => serde_json::to_vec(&body),
+        None if mapping.method == "POST" => Ok(b"{}".to_vec()),
+        None => Ok(Vec::new()),
+    };
+    let Ok(body) = body else {
+        return rpc_ok(id, tool_error("internal error while building the request"));
+    };
+    // Over TCP the REST listener enforces this cap, so the in-process call must too.
+    if body.len() > max_body_bytes(mapping.path) {
+        return rpc_ok(id, rest_response_result(&bad_request()));
+    }
+
+    let permit = match large_permit {
+        Some(permit) => permit,
+        None => {
+            let lane = match tool.access_class {
+                AccessClass::Read => &cfg.lanes.read,
+                AccessClass::Write => &cfg.lanes.write,
+            };
+            match cfg.lanes.acquire(lane).await {
+                Some(permit) => permit,
+                None => return at_capacity(id),
+            }
+        }
+    };
+
+    let request = RestRequest {
+        method: mapping.method.to_string(),
+        path: mapping.path.to_string(),
+        query,
+        body,
+        context: CallContext { loopback_file_access: false },
+    };
+    let result = run_with_budget((cfg.runner)(request), permit, body_complete + TOOL_BUDGET).await;
+    let outcome = if result.get("isError").is_some() { "error" } else { "ok" };
+    debug!(tool = tool.name, outcome, duration_ms = body_complete.elapsed().as_millis() as u64, "MCP tools/call");
+    rpc_ok(id, result)
 }
 
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
-/// Serve MCP on an already-bound `listener` until cancelled. The caller has validated the
-/// settings ([`validate_mcp_startup_from_env`]) and bound `listener` to `WHATSRUST_MCP_BIND`;
-/// token, read-only switch and allowlists come from the environment. Without a token it logs
-/// and returns: the MCP listener never serves unauthenticated.
-pub async fn serve_mcp(listener: TcpListener, cancel: CancellationToken) {
+/// Serve MCP on an already-bound `listener` until cancelled, running tool calls against
+/// `bridge`. The caller has validated the settings ([`validate_mcp_startup_from_env`]) and
+/// bound `listener` to `WHATSRUST_MCP_BIND`; token, read-only switch and allowlists come from
+/// the environment. Without a token it logs and returns: the MCP listener never serves
+/// unauthenticated.
+pub async fn serve_mcp(bridge: Arc<WhatsAppBridge>, listener: TcpListener, cancel: CancellationToken) {
     let s = McpSettings::from_env();
     let Some(token) = s.token else {
         error!("WHATSRUST_MCP_TOKEN is not set; not serving MCP");
@@ -578,6 +773,8 @@ pub async fn serve_mcp(listener: TcpListener, cancel: CancellationToken) {
         read_only: s.read_only,
         allowed_origins: s.allowed_origins,
         allowed_hosts: s.allowed_hosts,
+        lanes: Lanes::new(),
+        runner: bridge_runner(bridge),
     });
     accept_loop(listener, cfg, cancel).await;
 }
@@ -609,6 +806,23 @@ async fn accept_loop(listener: TcpListener, cfg: Arc<McpConfig>, cancel: Cancell
             _ = cancel.cancelled() => break,
         }
     }
+}
+
+/// Serve MCP on `listener` until `cancel`, with an explicit config instead of the environment:
+/// loopback, read-write, `token` required, no allowlists, the production lane sizes. For tests
+/// in other modules that run the real listener against a test bridge.
+#[cfg(test)]
+pub(crate) async fn serve_for_test(bridge: Arc<WhatsAppBridge>, listener: TcpListener, token: &str, cancel: CancellationToken) {
+    let cfg = Arc::new(McpConfig {
+        is_loopback: true,
+        token: token.to_string(),
+        read_only: false,
+        allowed_origins: Vec::new(),
+        allowed_hosts: Vec::new(),
+        lanes: Lanes::new(),
+        runner: bridge_runner(bridge),
+    });
+    accept_loop(listener, cfg, cancel).await;
 }
 
 #[cfg(test)]
@@ -1040,7 +1254,13 @@ mod tests {
         "whatsrust_fetch_status",
     ];
 
-    /// Loopback bind with [`TOKEN`] required and no allowlists.
+    /// A runner for tests that never reach dispatch: it answers 500 at once.
+    fn no_backend() -> Runner {
+        Arc::new(|_| Box::pin(async { json_err(500, "no backend in this test") }))
+    }
+
+    /// Loopback bind with [`TOKEN`] required, no allowlists and the production lane sizes. Its
+    /// runner is [`no_backend`]; a test that runs tools replaces it.
     fn test_config(read_only: bool) -> McpConfig {
         McpConfig {
             is_loopback: true,
@@ -1048,6 +1268,8 @@ mod tests {
             read_only,
             allowed_origins: Vec::new(),
             allowed_hosts: Vec::new(),
+            lanes: Lanes::new(),
+            runner: no_backend(),
         }
     }
 
@@ -1601,20 +1823,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tools_call_on_a_known_tool_is_a_501_stub() {
-        for (read_only, tool) in [(false, "whatsrust_status"), (false, "whatsrust_send"), (true, "whatsrust_status"), (true, "whatsrust_search")] {
-            let reply = rpc(read_only, Some("2025-06-18"), &call("tools/call", json!({"name": tool, "arguments": {}}))).await;
-            assert_rpc_error(
-                &reply,
-                501,
-                -32603,
-                "tools/call over HTTP is not implemented yet; use the stdio server (`whatsrust mcp`)",
-                json!(1),
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn test_tools_call_for_a_write_tool_in_read_only_mode_is_denied() {
         for tool in ["whatsrust_send", "whatsrust_purge_embeddings", "whatsrust_fetch_cancel", "whatsrust_typing"] {
             let reply = rpc(true, Some("2025-06-18"), &call("tools/call", json!({"name": tool, "arguments": {}}))).await;
@@ -1811,5 +2019,702 @@ mod tests {
 
         cancel.cancel();
         tokio::time::timeout(Duration::from_secs(5), server).await.expect("stops on cancel").unwrap();
+    }
+
+    // -------------------------------------------------------------------------
+    // tools/call: execution, lanes, budget
+    // -------------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fresh path for a test bridge's database.
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("whatsrust-mcp-{tag}-{ts}.db"))
+    }
+
+    /// A config whose tools run on a fresh, disconnected test bridge, plus the path of the
+    /// bridge's database (the caller deletes it).
+    async fn bridge_config(read_only: bool, tag: &str) -> (McpConfig, std::path::PathBuf) {
+        let db_path = temp_db(tag);
+        let bridge = crate::bridge::build_test_bridge_with_embedder(
+            &db_path,
+            crate::embedder::FakeEmbedder::new("test-model", 8),
+        )
+        .await;
+        let mut cfg = test_config(read_only);
+        cfg.runner = bridge_runner(Arc::new(bridge));
+        (cfg, db_path)
+    }
+
+    fn ok_json() -> ApiResponse {
+        ApiResponse::new(200, "application/json", br#"{"ok":true}"#.to_vec())
+    }
+
+    /// A runner that answers `{"ok":true}` and counts its calls.
+    fn counting_runner(calls: Arc<AtomicUsize>) -> Runner {
+        Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { ok_json() })
+        })
+    }
+
+    /// What a runner saw: method, path, query, body and `loopback_file_access`.
+    type Seen = (String, String, Vec<(String, String)>, Vec<u8>, bool);
+
+    /// A runner that answers `{"ok":true}` and records each request it gets.
+    fn recording_runner(log: Arc<parking_lot::Mutex<Vec<Seen>>>) -> Runner {
+        Arc::new(move |req| {
+            let seen = (req.method, req.path, req.query, req.body, req.context.loopback_file_access);
+            log.lock().push(seen);
+            Box::pin(async { ok_json() })
+        })
+    }
+
+    /// A `tools/call` request body.
+    fn tool_call(name: &str, arguments: Value) -> Value {
+        call("tools/call", json!({"name": name, "arguments": arguments}))
+    }
+
+    /// Send a `tools/call` through [`exchange`] with the legacy version header.
+    async fn call_over_wire(cfg: McpConfig, name: &str, arguments: Value) -> Reply {
+        exchange(cfg, &post_with("MCP-Protocol-Version: 2025-06-18\r\n", &tool_call(name, arguments).to_string())).await
+    }
+
+    /// The text of the first content block of a tool result.
+    fn result_text(result: &Value) -> &str {
+        result["content"][0]["text"].as_str().unwrap_or_else(|| panic!("no text in {result}"))
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_status_runs_in_process_and_returns_the_rest_body() {
+        let (cfg, db_path) = bridge_config(false, "status").await;
+        let reply = call_over_wire(cfg, "whatsrust_status", json!({})).await;
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.header("Content-Type"), Some("application/json"));
+        assert_eq!(reply.json()["id"], 1);
+        let result = reply.rpc_result();
+        assert_eq!(result.as_object().map(|o| o.len()), Some(1), "no isError, no resultType: {result}");
+        assert_eq!(result["content"].as_array().map(Vec::len), Some(1));
+        assert_eq!(result["content"][0]["type"], "text");
+        let status: Value = serde_json::from_str(result_text(&result)).expect("the REST status JSON");
+        assert_eq!((status["ok"].clone(), status["state"].clone(), status["connected"].clone()), (json!(true), json!("Disconnected"), json!(false)));
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_without_arguments_means_empty_arguments() {
+        let (cfg, db_path) = bridge_config(false, "noargs").await;
+        let body = call("tools/call", json!({"name": "whatsrust_status"}));
+        let reply = exchange(cfg, &post_with("MCP-Protocol-Version: 2025-06-18\r\n", &body.to_string())).await;
+        assert_eq!(reply.status, 200);
+        assert!(reply.rpc_result().get("isError").is_none());
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_rest_errors_are_error_results_with_the_rest_body() {
+        let (cfg, db_path) = bridge_config(false, "resterr").await;
+        let (cfg2, db_path2) = bridge_config(false, "resterr2").await;
+
+        // A 400 the REST handler gives: a group reaction without a sender.
+        let args = json!({"jid": "120363000000000000@g.us", "id": "3EB0AAAA", "emoji": "x", "from_me": false});
+        let reply = call_over_wire(cfg, "whatsrust_react", args).await;
+        assert_eq!(reply.status, 200, "a tool failure is not an HTTP error");
+        let result = reply.rpc_result();
+        assert_eq!(result["isError"], true);
+        let body: Value = serde_json::from_str(result_text(&result)).unwrap();
+        assert_eq!(body, json!({"ok": false, "code": "bad_request", "error": "sender_jid is required for group reactions"}));
+
+        // A 503: the disconnected bridge has no client.
+        let reply = call_over_wire(cfg2, "whatsrust_typing", json!({"jid": "1@s.whatsapp.net"})).await;
+        assert_eq!(reply.status, 200);
+        let result = reply.rpc_result();
+        assert_eq!(result["isError"], true);
+        assert_eq!(result_text(&result), r#"{"code":"unavailable","error":"not connected","ok":false}"#);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&db_path2);
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_read_only_refuses_write_tools_and_runs_read_tools() {
+        let (cfg, db_path) = bridge_config(true, "readonly").await;
+        let reply = call_over_wire(cfg, "whatsrust_status", json!({})).await;
+        assert_eq!(reply.status, 200);
+        let result = reply.rpc_result();
+        assert!(result.get("isError").is_none(), "{result}");
+        assert!(result_text(&result).contains("\"ok\":true"));
+        let _ = std::fs::remove_file(&db_path);
+
+        // A write tool is refused before anything runs, and takes no permit.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut cfg = test_config(true);
+        cfg.runner = counting_runner(calls.clone());
+        let write = cfg.lanes.write.clone();
+        let reply = call_over_wire(cfg, "whatsrust_typing", json!({"jid": "1@s.whatsapp.net"})).await;
+        assert_rpc_error(&reply, 200, -32600, "write access denied in read-only mode", json!(1));
+        assert_eq!((calls.load(Ordering::SeqCst), write.available_permits()), (0, WRITE_LANE_PERMITS));
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_invalid_arguments_run_nothing_and_take_no_permit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let make = || {
+            let mut cfg = test_config(false);
+            cfg.runner = counting_runner(calls.clone());
+            cfg
+        };
+
+        // Tool errors from `validated_args`: HTTP 200, `isError`, the registry's message.
+        let cases = [
+            (
+                "whatsrust_send",
+                json!({"jid": 5, "text": "hi"}),
+                "whatsrust_send: invalid argument(s): jid must be a string. Nothing was sent.",
+            ),
+            (
+                "whatsrust_send",
+                json!({"jid": "1@s.whatsapp.net"}),
+                "whatsrust_send: invalid argument(s): text is required. Nothing was sent.",
+            ),
+            (
+                "whatsrust_image",
+                json!({"jid": "1@s.whatsapp.net", "data": "AAAA", "path": "/etc/passwd"}),
+                "whatsrust_image: unknown argument(s): path. Allowed arguments: caption, data, jid, mime. Nothing was sent.",
+            ),
+            (
+                "whatsrust_history",
+                json!({"jid": "1@g.us", "limit": 5.5}),
+                "whatsrust_history: invalid argument(s): limit must be an integer (64-bit). Nothing was sent.",
+            ),
+        ];
+        for (tool, args, message) in cases {
+            let cfg = make();
+            let write = cfg.lanes.write.clone();
+            let reply = call_over_wire(cfg, tool, args.clone()).await;
+            assert_eq!(reply.status, 200, "{tool} {args}");
+            let result = reply.rpc_result();
+            assert_eq!((result["isError"].clone(), result_text(&result)), (json!(true), message), "{tool} {args}");
+            assert_eq!(write.available_permits(), WRITE_LANE_PERMITS);
+        }
+
+        // Non-object `arguments` is a protocol error.
+        for args in [json!("path"), json!(5), json!(true), json!(["jid"])] {
+            let reply = call_over_wire(make(), "whatsrust_image", args.clone()).await;
+            assert_rpc_error(&reply, 200, -32602, "arguments must be a JSON object", json!(1));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing was dispatched");
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_builds_the_rest_request_from_the_registry_mapping() {
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let make = || {
+            let mut cfg = test_config(false);
+            cfg.runner = recording_runner(log.clone());
+            cfg
+        };
+
+        let reply = call_over_wire(make(), "whatsrust_history", json!({"jid": "a b&c=d+\u{e9}@g.us", "limit": 5.0})).await;
+        assert!(reply.rpc_result().get("isError").is_none());
+        let reply = call_over_wire(make(), "whatsrust_send", json!({"jid": "1@s.whatsapp.net", "text": "hi", "mentions": null})).await;
+        assert!(reply.rpc_result().get("isError").is_none());
+        let reply = call_over_wire(make(), "whatsrust_fetch_history", json!({"chat_jid": "1@g.us"})).await;
+        assert!(reply.rpc_result().get("isError").is_none());
+
+        let seen = log.lock();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        // GET: decoded pairs in wire order (no URL encoding in-process), no body, no file access.
+        assert_eq!(
+            seen[0],
+            (
+                "GET".to_string(),
+                "/api/history".to_string(),
+                vec![pair("jid", "a b&c=d+\u{e9}@g.us"), pair("limit", "5")],
+                Vec::new(),
+                false
+            )
+        );
+        // POST: the validated arguments (a null optional dropped) as the compact JSON body.
+        assert_eq!(
+            seen[1],
+            (
+                "POST".to_string(),
+                "/api/send".to_string(),
+                vec![pair("sync", "true")],
+                br#"{"jid":"1@s.whatsapp.net","text":"hi"}"#.to_vec(),
+                false
+            )
+        );
+        // The body mapping rebuilds this one (mode defaults to "all").
+        assert_eq!(seen[2].3, br#"{"chat_jid":"1@g.us","mode":"all"}"#.to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_over_the_route_cap_is_the_rest_bad_request_result() {
+        // A 1.5 MiB `text` is inside the 10 MiB envelope but over `/api/send`'s 1 MiB cap, so
+        // REST (over TCP) would have answered 400 "bad request"; so does the in-process call.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut cfg = test_config(false);
+        cfg.runner = counting_runner(calls.clone());
+        let write = cfg.lanes.write.clone();
+        let large = cfg.lanes.large_body.clone();
+        let args = json!({"jid": "1@s.whatsapp.net", "text": "x".repeat(1_500_000)});
+        let reply = call_over_wire(cfg, "whatsrust_send", args).await;
+        assert_eq!(reply.status, 200);
+        let result = reply.rpc_result();
+        assert_eq!(result["isError"], true);
+        assert_eq!(result_text(&result), r#"{"code":"bad_request","error":"bad request","ok":false}"#);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "not dispatched");
+        assert_eq!((write.available_permits(), large.available_permits()), (WRITE_LANE_PERMITS, LARGE_BODY_PERMITS));
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_cap_is_exact_at_one_mib() {
+        // The mapped body of `whatsrust_send` is the arguments; pad `text` to exactly 1 MiB, then one more.
+        let base = serde_json::to_vec(&json!({"jid": "1@s.whatsapp.net", "text": ""})).unwrap().len();
+        for (extra, dispatched) in [(0usize, 1usize), (1, 0)] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut cfg = test_config(false);
+            cfg.runner = counting_runner(calls.clone());
+            let text = "x".repeat(1024 * 1024 - base + extra);
+            let reply = call_over_wire(cfg, "whatsrust_send", json!({"jid": "1@s.whatsapp.net", "text": text})).await;
+            assert_eq!(reply.status, 200);
+            assert_eq!(calls.load(Ordering::SeqCst), dispatched, "extra {extra}");
+            assert_eq!(reply.rpc_result().get("isError").is_some(), dispatched == 0, "extra {extra}");
+        }
+    }
+
+    // --- run_with_budget ---
+
+    fn lane(permits: usize) -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(permits))
+    }
+
+    async fn panics() -> ApiResponse {
+        panic!("test: the tool task panics")
+    }
+
+    #[tokio::test]
+    async fn test_run_with_budget_passes_the_response_through_and_frees_the_permit() {
+        let sem = lane(1);
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = run_with_budget(async { ApiResponse::new(200, "application/json", b"{\"a\":1}".to_vec()) }, permit, deadline).await;
+        assert_eq!(result, json!({"content": [{"type": "text", "text": "{\"a\":1}"}]}));
+        // The task has ended, so the permit is back (its drop is the last thing the task does).
+        tokio::task::yield_now().await;
+        assert_eq!(sem.available_permits(), 1);
+
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        let failed = run_with_budget(async { json_err(400, "nope") }, permit, deadline).await;
+        assert_eq!(failed["isError"], true);
+        assert_eq!(result_text(&failed), r#"{"code":"bad_request","error":"nope","ok":false}"#);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_with_budget_timeout_keeps_the_permit_until_the_task_ends() {
+        let sem = lane(1);
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        let started = Instant::now();
+        let slow = async {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            ok_json()
+        };
+
+        let result = run_with_budget(slow, permit, started + TOOL_BUDGET).await;
+
+        assert_eq!(result, json!({"content": [{"type": "text", "text": TIMEOUT_TEXT}], "isError": true}));
+        assert_eq!(TIMEOUT_TEXT, "Operation timed out after 40s; it may still complete; check before retrying.");
+        assert_eq!(started.elapsed(), Duration::from_secs(40), "the wait ends at the deadline");
+        assert_eq!(sem.available_permits(), 0, "the task is still running, so the lane is still held");
+
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(sem.available_permits(), 1, "freed when the task finished, not when the wait ended");
+    }
+
+    #[tokio::test]
+    async fn test_run_with_budget_maps_a_panicked_task_to_an_internal_error_result() {
+        let sem = lane(1);
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        let result = run_with_budget(panics(), permit, Instant::now() + Duration::from_secs(5)).await;
+        assert_eq!(result, json!({"content": [{"type": "text", "text": "internal error while running the tool"}], "isError": true}));
+        assert!(!result.to_string().contains("panic"), "no panic details: {result}");
+        tokio::task::yield_now().await;
+        assert_eq!(sem.available_permits(), 1, "unwinding drops the permit");
+    }
+
+    #[test]
+    fn test_at_capacity_is_a_503_json_rpc_error_with_retry_after() {
+        for id in [json!(7), Value::Null] {
+            let response = at_capacity(&id);
+            assert_eq!(response.status, 503);
+            assert_eq!(response.headers, vec![("Retry-After", "10".to_string())]);
+            assert_eq!(
+                body_json(&response),
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "server is at capacity; retry later"}})
+            );
+        }
+    }
+
+    // --- lanes over the wire ---
+
+    /// A shared gate: every call a [`gated_runner`] holds bumps `entered` and then waits for a
+    /// permit of `release`.
+    struct Gate {
+        entered: AtomicUsize,
+        release: Semaphore,
+    }
+
+    impl Gate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self { entered: AtomicUsize::new(0), release: Semaphore::new(0) })
+        }
+
+        /// Wait until `n` calls are held at the gate.
+        async fn wait_for(&self, n: usize) {
+            for _ in 0..500 {
+                if self.entered.load(Ordering::SeqCst) >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("only {} calls reached the gate, wanted {n}", self.entered.load(Ordering::SeqCst));
+        }
+    }
+
+    /// A runner that holds every call at `gate` except those to `free_path`, which finish at once.
+    fn gated_runner(gate: Arc<Gate>, free_path: &'static str) -> Runner {
+        Arc::new(move |req| {
+            let gate = gate.clone();
+            Box::pin(async move {
+                if req.path != free_path {
+                    gate.entered.fetch_add(1, Ordering::SeqCst);
+                    gate.release.acquire().await.expect("the gate is never closed").forget();
+                }
+                ok_json()
+            })
+        })
+    }
+
+    /// Serve `cfg` with the accept loop on a fresh loopback port.
+    async fn serve_on_loopback(cfg: McpConfig) -> (std::net::SocketAddr, CancellationToken, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(accept_loop(listener, Arc::new(cfg), cancel.clone()));
+        (addr, cancel, server)
+    }
+
+    async fn stop(cancel: CancellationToken, server: tokio::task::JoinHandle<()>) {
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), server).await.expect("stops on cancel").unwrap();
+    }
+
+    /// POST `body` with the legacy version header on its own connection to `addr`.
+    async fn post_to(addr: std::net::SocketAddr, body: &Value) -> Reply {
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&post_with("MCP-Protocol-Version: 2025-06-18\r\n", &body.to_string())).await.unwrap();
+        Reply::parse(&read_until_closed(&mut client).await)
+    }
+
+    fn assert_at_capacity(reply: &Reply, id: Value) {
+        assert_rpc_error(reply, 503, -32000, "server is at capacity; retry later", id);
+        assert_eq!(reply.header("Retry-After"), Some("10"));
+    }
+
+    #[tokio::test]
+    async fn test_write_lane_holds_four_calls_and_the_fifth_gets_503_while_reads_still_run() {
+        let gate = Gate::new();
+        let mut cfg = test_config(false);
+        cfg.runner = gated_runner(gate.clone(), "/api/status");
+        cfg.lanes.wait = Duration::from_millis(300);
+        let (write, read) = (cfg.lanes.write.clone(), cfg.lanes.read.clone());
+        let (addr, cancel, server) = serve_on_loopback(cfg).await;
+
+        let typing = tool_call("whatsrust_typing", json!({"jid": "1@s.whatsapp.net"}));
+        let held: Vec<_> = (0..WRITE_LANE_PERMITS)
+            .map(|_| {
+                let typing = typing.clone();
+                tokio::spawn(async move { post_to(addr, &typing).await })
+            })
+            .collect();
+        gate.wait_for(WRITE_LANE_PERMITS).await;
+        assert_eq!(write.available_permits(), 0, "four write calls hold the whole lane");
+
+        // The fifth waits for the lane, then gets the 503; its id is echoed.
+        let started = std::time::Instant::now();
+        let fifth = post_to(addr, &typing).await;
+        assert_at_capacity(&fifth, json!(1));
+        assert!(started.elapsed() >= Duration::from_millis(250), "it waited for a permit first");
+
+        // The read lane is separate.
+        let status = post_to(addr, &tool_call("whatsrust_status", json!({}))).await;
+        assert_eq!(status.status, 200);
+        assert!(status.rpc_result().get("isError").is_none());
+        assert_eq!(read.available_permits(), READ_LANE_PERMITS);
+
+        gate.release.add_permits(WRITE_LANE_PERMITS);
+        for call in held {
+            let reply = call.await.unwrap();
+            assert_eq!(reply.status, 200);
+            assert!(reply.rpc_result().get("isError").is_none());
+        }
+        assert_eq!(write.available_permits(), WRITE_LANE_PERMITS, "every permit came back");
+        stop(cancel, server).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_lane_holds_three_calls_and_the_fourth_gets_503_while_writes_still_run() {
+        let gate = Gate::new();
+        let mut cfg = test_config(false);
+        cfg.runner = gated_runner(gate.clone(), "/api/typing");
+        cfg.lanes.wait = Duration::from_millis(300);
+        let (write, read) = (cfg.lanes.write.clone(), cfg.lanes.read.clone());
+        let (addr, cancel, server) = serve_on_loopback(cfg).await;
+
+        let groups = tool_call("whatsrust_groups", json!({}));
+        let held: Vec<_> = (0..READ_LANE_PERMITS)
+            .map(|_| {
+                let groups = groups.clone();
+                tokio::spawn(async move { post_to(addr, &groups).await })
+            })
+            .collect();
+        gate.wait_for(READ_LANE_PERMITS).await;
+        assert_eq!(read.available_permits(), 0);
+
+        assert_at_capacity(&post_to(addr, &groups).await, json!(1));
+        let typing = post_to(addr, &tool_call("whatsrust_typing", json!({"jid": "1@s.whatsapp.net"}))).await;
+        assert_eq!(typing.status, 200);
+        assert_eq!(write.available_permits(), WRITE_LANE_PERMITS);
+
+        gate.release.add_permits(READ_LANE_PERMITS);
+        for call in held {
+            assert_eq!(call.await.unwrap().status, 200);
+        }
+        assert_eq!(read.available_permits(), READ_LANE_PERMITS);
+        stop(cancel, server).await;
+    }
+
+    #[tokio::test]
+    async fn test_a_waiting_call_gets_the_permit_when_one_is_freed_in_time() {
+        let mut cfg = test_config(false);
+        cfg.lanes.wait = Duration::from_secs(3);
+        let write = cfg.lanes.write.clone();
+        let (addr, cancel, server) = serve_on_loopback(cfg).await;
+
+        let all = write.clone().try_acquire_many_owned(WRITE_LANE_PERMITS as u32).expect("the lane is idle");
+        let waiting = tokio::spawn(async move {
+            post_to(addr, &tool_call("whatsrust_typing", json!({"jid": "1@s.whatsapp.net"}))).await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(all);
+
+        let reply = waiting.await.unwrap();
+        assert_eq!(reply.status, 200, "{:?}", String::from_utf8_lossy(&reply.body));
+        assert_eq!(write.available_permits(), WRITE_LANE_PERMITS);
+        stop(cancel, server).await;
+    }
+
+    #[tokio::test]
+    async fn test_non_tool_requests_take_no_lane_permit() {
+        let mut cfg = test_config(false);
+        cfg.lanes.wait = Duration::from_millis(100);
+        let lanes = [cfg.lanes.read.clone(), cfg.lanes.write.clone(), cfg.lanes.large_body.clone()];
+        let _held: Vec<_> = lanes.iter().map(|l| l.clone().try_acquire_many_owned(l.available_permits() as u32).unwrap()).collect();
+        let (addr, cancel, server) = serve_on_loopback(cfg).await;
+
+        // Every lane is full, and none of these needs one.
+        for body in [
+            call("initialize", json!({"protocolVersion": "2025-06-18"})),
+            call("ping", json!({})),
+            call("tools/list", json!({})),
+            call("nope", json!({})),
+            tool_call("whatsrust_nope", json!({})),
+            tool_call("whatsrust_send", json!({"jid": 5})),
+        ] {
+            let reply = post_to(addr, &body).await;
+            assert_eq!(reply.status, 200, "{body}");
+        }
+        let notification = post_to(addr, &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+        assert_eq!(notification.status, 202);
+        stop(cancel, server).await;
+    }
+
+    /// A `ping` whose envelope is padded to `len` bytes of body.
+    fn padded_ping(len: usize) -> String {
+        let bare = json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"pad": ""}}).to_string();
+        let body = bare.replace(r#""pad":"""#, &format!(r#""pad":"{}""#, "x".repeat(len - bare.len())));
+        assert_eq!(body.len(), len);
+        body
+    }
+
+    /// The head of a `POST /mcp` that declares `len` body bytes.
+    fn head_declaring(len: usize) -> String {
+        format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:7271\r\nContent-Type: application/json\r\nAuthorization: Bearer {TOKEN}\r\n\
+             MCP-Protocol-Version: 2025-06-18\r\nContent-Length: {len}\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn test_a_large_body_takes_the_large_permit_before_its_body_is_read() {
+        let mut cfg = test_config(false);
+        cfg.lanes.wait = Duration::from_millis(300);
+        let large = cfg.lanes.large_body.clone();
+        let (addr, cancel, server) = serve_on_loopback(cfg).await;
+
+        // The first large request sends only its head: the permit is already taken.
+        let body = padded_ping(LARGE_BODY_BYTES + 1);
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        first.write_all(head_declaring(body.len()).as_bytes()).await.unwrap();
+        for _ in 0..200 {
+            if large.available_permits() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(large.available_permits(), 0, "taken before any body byte arrived");
+
+        // A second large request is refused before its body is read (any method needs the permit).
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second.write_all(head_declaring(LARGE_BODY_BYTES + 1).as_bytes()).await.unwrap();
+        let reply = Reply::parse(&read_until_closed(&mut second).await);
+        assert_at_capacity(&reply, Value::Null);
+
+        // A small request is unaffected.
+        let small = post_to(addr, &call("ping", json!({}))).await;
+        assert_eq!(small.status, 200);
+
+        // The first one completes normally and gives the permit back.
+        first.write_all(body.as_bytes()).await.unwrap();
+        let reply = Reply::parse(&read_until_closed(&mut first).await);
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.rpc_result(), json!({}));
+        assert_eq!(large.available_permits(), LARGE_BODY_PERMITS);
+        stop(cancel, server).await;
+    }
+
+    #[tokio::test]
+    async fn test_a_body_of_exactly_one_mib_needs_no_large_permit() {
+        let mut cfg = test_config(false);
+        cfg.lanes.wait = Duration::from_millis(100);
+        let large = cfg.lanes.large_body.clone();
+        let _held = large.clone().try_acquire_owned().unwrap();
+        let (addr, cancel, server) = serve_on_loopback(cfg).await;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let body = padded_ping(LARGE_BODY_BYTES);
+        client.write_all(head_declaring(body.len()).as_bytes()).await.unwrap();
+        client.write_all(body.as_bytes()).await.unwrap();
+        assert_eq!(Reply::parse(&read_until_closed(&mut client).await).status, 200);
+        stop(cancel, server).await;
+    }
+
+    #[tokio::test]
+    async fn test_a_large_tools_call_holds_the_large_permit_through_dispatch_and_no_other() {
+        let gate = Gate::new();
+        let mut cfg = test_config(false);
+        cfg.runner = gated_runner(gate.clone(), "/nowhere");
+        cfg.lanes.wait = Duration::from_millis(300);
+        let (large, write) = (cfg.lanes.large_body.clone(), cfg.lanes.write.clone());
+        let (addr, cancel, server) = serve_on_loopback(cfg).await;
+
+        // A media tool may carry a body over 1 MiB (its route cap is 70 MiB).
+        let image = tool_call("whatsrust_image", json!({"jid": "1@s.whatsapp.net", "data": "A".repeat(LARGE_BODY_BYTES + 4)}));
+        let running = tokio::spawn(async move { post_to(addr, &image).await });
+        gate.wait_for(1).await;
+        assert_eq!(large.available_permits(), 0, "held by the running call");
+        assert_eq!(write.available_permits(), WRITE_LANE_PERMITS, "a large call takes no write permit");
+
+        // While it runs, another large request is refused.
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second.write_all(head_declaring(LARGE_BODY_BYTES + 1).as_bytes()).await.unwrap();
+        assert_at_capacity(&Reply::parse(&read_until_closed(&mut second).await), Value::Null);
+
+        gate.release.add_permits(1);
+        let reply = running.await.unwrap();
+        assert_eq!(reply.status, 200);
+        assert!(reply.rpc_result().get("isError").is_none(), "{:?}", String::from_utf8_lossy(&reply.body));
+        assert_eq!(large.available_permits(), LARGE_BODY_PERMITS);
+        stop(cancel, server).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_tool_that_outlasts_the_budget_gets_the_timeout_result_and_keeps_its_lane() {
+        let (mut client, server_side) = tokio::io::duplex(64 * 1024);
+        let mut cfg = test_config(false);
+        cfg.runner = Arc::new(|_| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(100)).await;
+                ok_json()
+            })
+        });
+        let write = cfg.lanes.write.clone();
+        let started = Instant::now();
+        let server = tokio::spawn(async move {
+            serve_connection(server_side, &cfg, Instant::now()).await;
+            started.elapsed()
+        });
+
+        let body = tool_call("whatsrust_typing", json!({"jid": "1@s.whatsapp.net"})).to_string();
+        client.write_all(&post_with("MCP-Protocol-Version: 2025-06-18\r\n", &body)).await.unwrap();
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        let answered_at = server.await.unwrap();
+
+        let reply = Reply::parse(&bytes);
+        assert_eq!(reply.status, 200);
+        let result = reply.rpc_result();
+        assert_eq!(result["isError"], true);
+        assert_eq!(result_text(&result), "Operation timed out after 40s; it may still complete; check before retrying.");
+        // The budget runs from body completion, which is immediate here.
+        assert_eq!(answered_at, Duration::from_secs(40));
+        assert_eq!(write.available_permits(), WRITE_LANE_PERMITS - 1, "the call is still running");
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(write.available_permits(), WRITE_LANE_PERMITS, "released when the call ended");
+    }
+
+    // --- official SDK ---
+
+    /// Runs the official Python MCP SDK (`scripts/mcp_sdk_smoke.py`, through `uv`) against the
+    /// real listener on a test bridge: handshake, `tools/list`, a tool call, an unknown tool.
+    /// Run it with `cargo test sdk_smoke_python -- --ignored --nocapture`; the script's own
+    /// output, including every HTTP request the SDK made, is printed.
+    #[tokio::test]
+    #[ignore = "needs `uv` and network access to fetch the `mcp` package"]
+    async fn sdk_smoke_python() {
+        if std::process::Command::new("uv").arg("--version").output().is_err() {
+            println!("skipped: `uv` is not installed (https://docs.astral.sh/uv/)");
+            return;
+        }
+        let db_path = temp_db("sdk");
+        let bridge = crate::bridge::build_test_bridge_with_embedder(
+            &db_path,
+            crate::embedder::FakeEmbedder::new("test-model", 8),
+        )
+        .await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}/mcp", listener.local_addr().unwrap().port());
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(serve_for_test(Arc::new(bridge), listener, TOKEN, cancel.clone()));
+
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/mcp_sdk_smoke.py");
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("uv")
+                .args(["run", "--quiet", "--no-project", "--with", "mcp<2", "python", "-I", script, &url])
+                .env("WHATSRUST_MCP_TOKEN", TOKEN)
+                .output()
+        })
+        .await
+        .unwrap()
+        .expect("`uv` starts");
+
+        println!("--- stdout ---\n{}", String::from_utf8_lossy(&output.stdout));
+        println!("--- stderr ---\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "the SDK smoke script failed: {}", output.status);
+
+        stop(cancel, server).await;
+        let _ = std::fs::remove_file(&db_path);
     }
 }
