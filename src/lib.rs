@@ -6,6 +6,7 @@ pub mod embed_drain;
 pub mod embedder;
 pub mod instance_lock;
 pub mod mcp;
+pub mod mcp_registry;
 pub mod media_utils;
 pub mod outbound;
 pub mod polls;

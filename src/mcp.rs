@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::bridge::SYNC_CLIENT_TIMEOUT;
+use crate::mcp_registry::{validated_args, ArgsError, REGISTRY};
 
 /// Run the MCP server on stdin/stdout. Blocks until EOF.
 pub fn run_mcp_server(port: u16) {
@@ -93,233 +94,17 @@ fn handle_rpc(req: &JsonRpcRequest, port: u16) -> JsonRpcResponse {
             }
         })),
         "notifications/initialized" => json_rpc_ok(req.id.clone(), json!({})),
-        "tools/list" => json_rpc_ok(req.id.clone(), json!({ "tools": tool_definitions() })),
+        "tools/list" => json_rpc_ok(req.id.clone(), json!({ "tools": REGISTRY.tool_definitions() })),
         "tools/call" => {
             let params = req.params.as_ref().unwrap_or(&Value::Null);
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = call_tool(name, &args, port);
-            json_rpc_ok(req.id.clone(), result)
+            let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+            match call_tool(name, args, port) {
+                Ok(result) => json_rpc_ok(req.id.clone(), result),
+                Err(message) => json_rpc_error(req.id.clone(), -32602, &message),
+            }
         }
         _ => json_rpc_error(req.id.clone(), -32601, &format!("method not found: {}", req.method)),
-    }
-}
-
-fn tool_definitions() -> Vec<Value> {
-    vec![
-        tool_def("whatsrust_status", "Get bridge status, metrics, and connection state", json!({"type":"object","properties":{}})),
-        tool_def("whatsrust_send", "Send a text message (optionally with @mentions)",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string","description":"Recipient JID (phone@s.whatsapp.net or group@g.us)"},
-                "text":{"type":"string","description":"Message text"},
-                "mentions":{"type":"array","items":{"type":"string"},"description":"JIDs to @mention (optional)"}
-            },"required":["jid","text"]})),
-        tool_def("whatsrust_reply", "Reply to a message (quote)",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string"},
-                "id":{"type":"string","description":"Message ID to reply to"},
-                "sender":{"type":"string","description":"Sender JID of the quoted message"},
-                "text":{"type":"string"},
-                "mentions":{"type":"array","items":{"type":"string"},"description":"JIDs to @mention"}
-            },"required":["jid","id","sender","text"]})),
-        tool_def("whatsrust_react", "React to a message with an emoji",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string"},
-                "id":{"type":"string","description":"Target message ID"},
-                "emoji":{"type":"string"},
-                "from_me":{"type":"boolean","description":"Whether target is from us (default true)"},
-                "sender_jid":{"type":"string","description":"Target sender JID (required for group reactions when from_me=false)"}
-            },"required":["jid","id","emoji"]})),
-        tool_def("whatsrust_edit", "Edit a previously sent message",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string"},"id":{"type":"string"},"text":{"type":"string"}
-            },"required":["jid","id","text"]})),
-        tool_def("whatsrust_revoke", "Delete a message for everyone",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string"},"id":{"type":"string"}
-            },"required":["jid","id"]})),
-        tool_def("whatsrust_image", "Send an image (base64)",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string"},"data":{"type":"string","description":"Base64-encoded image"},
-                "mime":{"type":"string","description":"MIME type (default image/jpeg)"},
-                "caption":{"type":"string"}
-            },"required":["jid","data"]})),
-        tool_def("whatsrust_groups", "List all joined groups", json!({"type":"object","properties":{}})),
-        tool_def("whatsrust_group_info", "Get group details and members",
-            json!({"type":"object","properties":{"jid":{"type":"string"}},"required":["jid"]})),
-        tool_def("whatsrust_history", "Get recent messages for a chat",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string"},"limit":{"type":"integer","description":"Max messages (default 20)"},
-                "before":{"type":"integer","description":"Unix timestamp for pagination"}
-            },"required":["jid"]})),
-        tool_def("whatsrust_search", "Search message history",
-            json!({"type":"object","properties":{
-                "q":{"type":"string","description":"Search query"},
-                "jid":{"type":"string","description":"Limit to specific chat (optional)"},
-                "limit":{"type":"integer"}
-            },"required":["q"]})),
-        tool_def("whatsrust_fetch_history",
-            "Trigger a per-chat historical backfill. Runs as a paced background job (anti-ban) and is daemon-clamped (cooldown, queue-depth, max-messages); poll whatsrust_fetch_status for progress.",
-            json!({"type":"object","properties":{
-                "chat_jid":{"type":"string","description":"Chat JID to backfill"},
-                "mode":{"type":"string","description":"all | since | count; default all"},
-                "target_value":{"type":"integer","description":"ms-timestamp for since, count for count"}
-            },"required":["chat_jid"]})),
-        tool_def("whatsrust_fetch_status", "Poll history-fetch job status. Pass job_id for a single job, or active=true to list only active jobs, or omit both for all jobs.",
-            json!({"type":"object","properties":{
-                "job_id":{"type":"integer","description":"Specific job ID to query (optional)"},
-                "active":{"type":"boolean","description":"List only active jobs (optional)"}
-            }})),
-        tool_def("whatsrust_fetch_cancel", "Cancel a history-fetch backfill job",
-            json!({"type":"object","properties":{
-                "job_id":{"type":"integer","description":"Job ID to cancel"}
-            },"required":["job_id"]})),
-        tool_def("whatsrust_typing", "Send typing indicator",
-            json!({"type":"object","properties":{"jid":{"type":"string"}},"required":["jid"]})),
-        tool_def("whatsrust_location", "Send a location pin",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string"},"lat":{"type":"number"},"lon":{"type":"number"},
-                "name":{"type":"string"},"address":{"type":"string"}
-            },"required":["jid","lat","lon"]})),
-        tool_def("whatsrust_contact", "Send a contact card",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string"},"name":{"type":"string"},
-                "phone":{"type":"string","description":"Phone number of the contact in international format, digits only (e.g. 972500000000)"}
-            },"required":["jid","name","phone"]})),
-        tool_def("whatsrust_poll", "Create a poll",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string"},"question":{"type":"string"},
-                "options":{"type":"array","items":{"type":"string"}},
-                "selectable_count":{"type":"integer","description":"Max selectable options"}
-            },"required":["jid","question","options","selectable_count"]})),
-        // Chat management
-        tool_def("whatsrust_pin_chat", "Pin a chat to the top",
-            json!({"type":"object","properties":{"jid":{"type":"string"}},"required":["jid"]})),
-        tool_def("whatsrust_unpin_chat", "Unpin a chat",
-            json!({"type":"object","properties":{"jid":{"type":"string"}},"required":["jid"]})),
-        tool_def("whatsrust_mute_chat", "Mute a chat indefinitely",
-            json!({"type":"object","properties":{"jid":{"type":"string"}},"required":["jid"]})),
-        tool_def("whatsrust_unmute_chat", "Unmute a chat",
-            json!({"type":"object","properties":{"jid":{"type":"string"}},"required":["jid"]})),
-        tool_def("whatsrust_archive_chat", "Archive a chat",
-            json!({"type":"object","properties":{"jid":{"type":"string"}},"required":["jid"]})),
-        tool_def("whatsrust_unarchive_chat", "Unarchive a chat",
-            json!({"type":"object","properties":{"jid":{"type":"string"}},"required":["jid"]})),
-        tool_def("whatsrust_mark_read", "Mark a chat as read",
-            json!({"type":"object","properties":{"jid":{"type":"string"}},"required":["jid"]})),
-        tool_def("whatsrust_delete_chat", "Delete a chat and its media",
-            json!({"type":"object","properties":{"jid":{"type":"string"}},"required":["jid"]})),
-        tool_def("whatsrust_delete_for_me", "Delete a message for me only",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string"},"id":{"type":"string","description":"Message ID"},
-                "sender":{"type":"string","description":"Sender JID (for group messages from others)"},
-                "from_me":{"type":"boolean","description":"Whether message is from us (default true)"}
-            },"required":["jid","id"]})),
-        tool_def("whatsrust_star", "Star a message",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string"},"id":{"type":"string","description":"Message ID"},
-                "sender":{"type":"string","description":"Sender JID (for group messages from others)"},
-                "from_me":{"type":"boolean","description":"Whether message is from us (default true)"}
-            },"required":["jid","id"]})),
-        tool_def("whatsrust_unstar", "Unstar a message",
-            json!({"type":"object","properties":{
-                "jid":{"type":"string"},"id":{"type":"string","description":"Message ID"},
-                "sender":{"type":"string","description":"Sender JID (for group messages from others)"},
-                "from_me":{"type":"boolean","description":"Whether message is from us (default true)"}
-            },"required":["jid","id"]})),
-        tool_def("whatsrust_status_text", "Post a text status/story to specified recipients",
-            json!({"type":"object","properties":{
-                "recipients":{"type":"array","items":{"type":"string"},"description":"Phone numbers of recipients"},
-                "text":{"type":"string","description":"Status text"},
-                "background_argb":{"type":"integer","description":"Background color as 0xAARRGGBB (default 0xFF1E6E4F)"},
-                "font":{"type":"integer","description":"Font style 0-4 (default 0)"},
-                "privacy":{"type":"string","description":"contacts|allowlist|denylist (default contacts)"}
-            },"required":["recipients","text"]})),
-        tool_def("whatsrust_status_image", "Post an image status/story",
-            json!({"type":"object","properties":{
-                "recipients":{"type":"array","items":{"type":"string"}},
-                "data":{"type":"string","description":"Base64-encoded image"},
-                "mime":{"type":"string","description":"MIME type (default image/jpeg)"},
-                "caption":{"type":"string"},
-                "privacy":{"type":"string"}
-            },"required":["recipients","data"]})),
-        tool_def("whatsrust_status_video", "Post a video status/story",
-            json!({"type":"object","properties":{
-                "recipients":{"type":"array","items":{"type":"string"}},
-                "data":{"type":"string","description":"Base64-encoded video"},
-                "mime":{"type":"string","description":"MIME type (default video/mp4)"},
-                "caption":{"type":"string"},
-                "seconds":{"type":"integer","description":"Duration in seconds"},
-                "privacy":{"type":"string"}
-            },"required":["recipients","data"]})),
-        tool_def("whatsrust_status_revoke", "Revoke a previously posted status/story",
-            json!({"type":"object","properties":{
-                "recipients":{"type":"array","items":{"type":"string"},"description":"Same recipients as original post"},
-                "message_id":{"type":"string","description":"ID returned when status was posted"},
-                "privacy":{"type":"string"}
-            },"required":["recipients","message_id"]})),
-        tool_def("whatsrust_purge_embeddings", "Purge all embeddings for a given model and reclaim disk space (M2.5)",
-            json!({"type":"object","properties":{
-                "model_id":{"type":"string","description":"Model ID to purge embeddings for"}
-            },"required":["model_id"]})),
-    ]
-}
-
-fn tool_def(name: &str, description: &str, mut input_schema: Value) -> Value {
-    // Every tool is strict: `validated_args` rejects undeclared keys, so the advertised
-    // schema says the same. Set here once instead of in each schema literal.
-    input_schema["additionalProperties"] = json!(false);
-    json!({ "name": name, "description": description, "inputSchema": input_schema })
-}
-
-/// The `inputSchema.properties` of the named tool, or `None` for an unknown tool or a schema
-/// without an object `properties`.
-fn declared_properties(name: &str) -> Option<serde_json::Map<String, Value>> {
-    tool_definitions()
-        .into_iter()
-        .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
-        .and_then(|t| t.pointer("/inputSchema/properties").and_then(Value::as_object).cloned())
-}
-
-/// The top-level keys of `given` that are not in `declared`, sorted.
-fn unknown_keys(given: &serde_json::Map<String, Value>, declared: &serde_json::Map<String, Value>) -> Vec<String> {
-    let mut unknown: Vec<String> = given.keys().filter(|k| !declared.contains_key(k.as_str())).cloned().collect();
-    unknown.sort();
-    unknown
-}
-
-/// Error text for a call that passed undeclared arguments: names the tool, the unknown key(s)
-/// and the allowed keys (both sorted), and states that nothing was sent.
-fn unknown_args_message(name: &str, unknown: &[String], declared: &serde_json::Map<String, Value>) -> String {
-    let mut allowed: Vec<&str> = declared.keys().map(String::as_str).collect();
-    allowed.sort_unstable();
-    let allowed = if allowed.is_empty() { "(none)".to_string() } else { allowed.join(", ") };
-    format!(
-        "{name}: unknown argument(s): {}. Allowed arguments: {allowed}. Nothing was sent.",
-        unknown.join(", ")
-    )
-}
-
-/// Check a tool call's `arguments` against that tool's declared `inputSchema.properties` and
-/// return the arguments to forward. Absent or `null` arguments mean `{}`; any non-object value
-/// is an error, and so is any top-level key the tool does not declare (e.g. `path`, which would
-/// make the daemon read a local file and send it, or `schedule_at`, which a sync send cannot
-/// honour and would silently turn into an immediate send). Only key names are checked, not
-/// value types. An unknown tool passes through as `{}`; `call_tool`'s dispatch reports it.
-fn validated_args(name: &str, args: &Value) -> Result<Value, String> {
-    let Some(declared) = declared_properties(name) else {
-        return Ok(json!({}));
-    };
-    let given = match args {
-        Value::Null => return Ok(json!({})),
-        Value::Object(map) => map,
-        _ => return Err("arguments must be a JSON object".to_string()),
-    };
-    let unknown = unknown_keys(given, &declared);
-    if unknown.is_empty() {
-        Ok(args.clone())
-    } else {
-        Err(unknown_args_message(name, &unknown, &declared))
     }
 }
 
@@ -328,87 +113,45 @@ fn tool_error(message: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": message }], "isError": true })
 }
 
-fn call_tool(name: &str, args: &Value, port: u16) -> Value {
-    // Single choke point: a call with undeclared or malformed arguments is rejected here,
-    // before any HTTP request, so every tool below only ever sees schema-declared arguments.
-    let args = &match validated_args(name, args) {
-        Ok(args) => args,
-        Err(message) => return tool_error(&message),
+/// The request target for a tool's REST call: `path`, then `?k=v&k=v` when there are query
+/// pairs, with every key and value URL-encoded.
+fn rest_target(path: &str, query: &[(String, String)]) -> String {
+    let mut target = path.to_string();
+    for (i, (key, value)) in query.iter().enumerate() {
+        target.push(if i == 0 { '?' } else { '&' });
+        target.push_str(&crate::api::urlencode(key));
+        target.push('=');
+        target.push_str(&crate::api::urlencode(value));
+    }
+    target
+}
+
+/// Validate one `tools/call` and proxy it to the daemon. `Err` is a JSON-RPC invalid-params
+/// message (unknown tool, non-object `arguments`); every other failure is an `isError` tool
+/// result in `Ok`.
+fn call_tool(name: &str, args: Value, port: u16) -> Result<Value, String> {
+    // Single choke point: a call with undeclared, mistyped or missing arguments is rejected
+    // here, before any HTTP request, so the REST mapping only ever sees valid arguments.
+    let (tool, args) = match validated_args(name, args) {
+        Ok(validated) => validated,
+        Err(ArgsError::InvalidParams(message)) => return Err(message),
+        Err(ArgsError::Tool(message)) => return Ok(tool_error(&message)),
     };
-    let result = match name {
-        "whatsrust_status" => http_get(port, "/api/status"),
-        "whatsrust_groups" => http_get(port, "/api/groups"),
-        "whatsrust_group_info" => {
-            let jid = args.get("jid").and_then(|v| v.as_str()).unwrap_or("");
-            http_get(port, &format!("/api/group-info?jid={}", crate::api::urlencode(jid)))
+    let mapping = &tool.rest_mapping;
+    let target = rest_target(mapping.path, &(mapping.query)(&args));
+    let result = match mapping.method {
+        "GET" => http_get(port, &target),
+        "POST" => {
+            let body = (mapping.body)(args).unwrap_or_else(|| json!({}));
+            http_post(port, &target, &body)
         }
-        "whatsrust_history" => {
-            let jid = args.get("jid").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
-            let before = args.get("before").and_then(|v| v.as_i64());
-            let mut url = format!("/api/history?jid={}&limit={limit}", crate::api::urlencode(jid));
-            if let Some(b) = before { url.push_str(&format!("&before={b}")); }
-            http_get(port, &url)
-        }
-        "whatsrust_search" => {
-            let q = args.get("q").and_then(|v| v.as_str()).unwrap_or("");
-            let jid = args.get("jid").and_then(|v| v.as_str());
-            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
-            let mut url = format!("/api/search?q={}&limit={limit}", crate::api::urlencode(q));
-            if let Some(j) = jid { url.push_str(&format!("&jid={}", crate::api::urlencode(j))); }
-            http_get(port, &url)
-        }
-        "whatsrust_send" => http_post(port, "/api/send?sync=true", args),
-        "whatsrust_reply" => http_post(port, "/api/reply", args),
-        "whatsrust_react" => http_post(port, "/api/react", args),
-        "whatsrust_edit" => http_post(port, "/api/edit", args),
-        "whatsrust_revoke" => http_post(port, "/api/revoke", args),
-        "whatsrust_image" => http_post(port, "/api/image", args),
-        "whatsrust_typing" => http_post(port, "/api/typing", args),
-        "whatsrust_location" => http_post(port, "/api/location", args),
-        "whatsrust_contact" => http_post(port, "/api/contact", args),
-        "whatsrust_poll" => http_post(port, "/api/poll", args),
-        "whatsrust_pin_chat" => http_post(port, "/api/pin-chat", args),
-        "whatsrust_unpin_chat" => http_post(port, "/api/unpin-chat", args),
-        "whatsrust_mute_chat" => http_post(port, "/api/mute-chat", args),
-        "whatsrust_unmute_chat" => http_post(port, "/api/unmute-chat", args),
-        "whatsrust_archive_chat" => http_post(port, "/api/archive-chat", args),
-        "whatsrust_unarchive_chat" => http_post(port, "/api/unarchive-chat", args),
-        "whatsrust_mark_read" => http_post(port, "/api/mark-read", args),
-        "whatsrust_delete_chat" => http_post(port, "/api/delete-chat", args),
-        "whatsrust_delete_for_me" => http_post(port, "/api/delete-for-me", args),
-        "whatsrust_star" => http_post(port, "/api/star", args),
-        "whatsrust_unstar" => http_post(port, "/api/unstar", args),
-        "whatsrust_fetch_history" => {
-            let chat_jid = args.get("chat_jid").and_then(|v| v.as_str()).unwrap_or("");
-            let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("all");
-            let mut body = serde_json::json!({"chat_jid": chat_jid, "mode": mode});
-            if let Some(tv) = args.get("target_value").and_then(|v| v.as_i64()) { body["target_value"] = serde_json::json!(tv); }
-            http_post(port, "/api/history-fetch", &body)
-        }
-        "whatsrust_fetch_status" => {
-            if let Some(id) = args.get("job_id").and_then(|v| v.as_i64()) {
-                http_get(port, &format!("/api/history-fetch?job_id={id}"))
-            } else {
-                // Default active=true (active-only) to match CLI behaviour; pass active:false
-                // explicitly to list all jobs.
-                let active = args.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
-                http_get(port, &format!("/api/history-fetch?active={active}"))
-            }
-        }
-        "whatsrust_fetch_cancel" => http_post(port, "/api/history-fetch/cancel", args),
-        "whatsrust_status_text" => http_post(port, "/api/status-text", args),
-        "whatsrust_status_image" => http_post(port, "/api/status-image", args),
-        "whatsrust_status_video" => http_post(port, "/api/status-video", args),
-        "whatsrust_status_revoke" => http_post(port, "/api/status-revoke", args),
-        "whatsrust_purge_embeddings" => http_post(port, "/api/embeddings/purge", args),
-        _ => Err(format!("unknown tool: {name}")),
+        other => Err(format!("{name}: unsupported REST method {other}")),
     };
 
-    match result {
+    Ok(match result {
         Ok(body) => json!({ "content": [{ "type": "text", "text": body }] }),
         Err(e) => tool_error(&e),
-    }
+    })
 }
 
 /// Blocking HTTP GET to the daemon.
@@ -496,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_tool_definitions_include_fetch_history() {
-        let tools = tool_definitions();
+        let tools = REGISTRY.tool_definitions();
         let names: Vec<&str> = tools.iter()
             .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
             .collect();
@@ -507,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_fetch_history_description_mentions_pacing() {
-        let tools = tool_definitions();
+        let tools = REGISTRY.tool_definitions();
         let tool = tools.iter().find(|t| t.get("name").and_then(|v| v.as_str()) == Some("whatsrust_fetch_history"))
             .expect("whatsrust_fetch_history must exist");
         let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
@@ -606,7 +349,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        let result = call_tool(tool, &args, port);
+        let result = call_tool(tool, args, port).expect("a tool error, not a JSON-RPC error");
 
         assert_eq!(result["isError"], json!(true), "{tool}: must be a tool error");
         let text = result["content"][0]["text"].as_str().expect("error text");
@@ -614,80 +357,52 @@ mod tests {
             text.contains(tool) && text.contains("unknown argument") && text.contains(key),
             "{tool}: unexpected error text: {text}"
         );
-        // call_tool is synchronous: had it dialled the port, the connection would already be
-        // queued and accept() would return at once.
+        assert_no_connection(&listener, tool).await;
+    }
+
+    /// `call_tool` is synchronous: had it dialled the port, the connection would already be
+    /// queued and accept() would return at once.
+    async fn assert_no_connection(listener: &tokio::net::TcpListener, tool: &str) {
         let accepted = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
         assert!(accepted.is_err(), "{tool}: a rejected call must not contact the daemon");
     }
 
-    #[test]
-    fn test_validated_args_error_names_tool_sorted_unknown_keys_and_allowed_keys() {
-        let err = validated_args("whatsrust_image", &json!({"jid": "j", "data": "AAAA", "zeta": 1, "path": "/etc/passwd"}))
-            .expect_err("undeclared keys must be rejected");
-        assert_eq!(
-            err,
-            "whatsrust_image: unknown argument(s): path, zeta. Allowed arguments: caption, data, jid, mime. Nothing was sent."
-        );
+    /// Like [`assert_rejected_before_sending`], for a tool error with exactly this text.
+    async fn assert_tool_error_before_sending(tool: &str, args: Value, expected: &str) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
 
-        let err = validated_args("whatsrust_status", &json!({"x": 1})).expect_err("no-param tool takes nothing");
-        assert_eq!(err, "whatsrust_status: unknown argument(s): x. Allowed arguments: (none). Nothing was sent.");
+        let result = call_tool(tool, args.clone(), port).expect("a tool error, not a JSON-RPC error");
+
+        assert_eq!(result["isError"], json!(true), "{tool} {args}: must be a tool error");
+        assert_eq!(result["content"][0]["text"], json!(expected), "{tool} {args}");
+        assert_no_connection(&listener, tool).await;
+    }
+
+    /// Run a `tools/call` against a local listener and return the request line it sent.
+    async fn sent_request_line(tool: &str, args: Value) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let tool_name = tool.to_string();
+        let client = std::thread::spawn(move || rpc_tools_call(&tool_name, args, port));
+        let raw = serve_one_request(&listener, STUB_OK_RESPONSE).await;
+        client.join().expect("client thread panicked");
+
+        let (head, _) = request_head_and_body(&raw);
+        head.lines().next().expect("request line").to_string()
     }
 
     #[test]
-    fn test_validated_args_accepts_declared_keys_verbatim_including_nested_values() {
-        let send = json!({"jid": "1@g.us", "text": "hi", "mentions": ["1@s.whatsapp.net", "2@s.whatsapp.net"]});
-        assert_eq!(validated_args("whatsrust_send", &send), Ok(send.clone()));
-
-        let required_only = json!({"jid": "1@g.us", "text": "hi"});
-        assert_eq!(validated_args("whatsrust_send", &required_only), Ok(required_only.clone()));
-
-        // Only key names are checked, not value types (that is a later design item).
-        let wrong_type = json!({"jid": 5, "text": ["not", "a", "string"]});
-        assert_eq!(validated_args("whatsrust_send", &wrong_type), Ok(wrong_type.clone()));
-    }
-
-    #[test]
-    fn test_validated_args_null_arguments_mean_empty_object() {
-        assert_eq!(validated_args("whatsrust_status", &Value::Null), Ok(json!({})));
-        assert_eq!(validated_args("whatsrust_image", &Value::Null), Ok(json!({})));
-    }
-
-    #[test]
-    fn test_validated_args_rejects_non_object_arguments() {
-        for args in [json!("path"), json!(5), json!(true), json!(["jid"])] {
-            assert_eq!(
-                validated_args("whatsrust_image", &args),
-                Err("arguments must be a JSON object".to_string()),
-                "args: {args}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_validated_args_unknown_tool_passes_through_for_dispatch_to_report() {
-        assert_eq!(validated_args("whatsrust_nope", &json!({"path": "/etc/passwd"})), Ok(json!({})));
-        assert_eq!(validated_args("", &json!("not an object")), Ok(json!({})));
-    }
-
-    #[test]
-    fn test_validated_args_contact_accepts_phone_and_rejects_vcard() {
-        // REST builds (and sanitizes) the vCard itself from `name` + `phone`; a raw `vcard`
-        // must never be forwarded.
-        let ok = json!({"jid": "1@s.whatsapp.net", "name": "Ann", "phone": "972500000000"});
-        assert_eq!(validated_args("whatsrust_contact", &ok), Ok(ok.clone()));
-
-        let with_vcard = json!({"jid": "1@s.whatsapp.net", "name": "Ann", "phone": "972500000000", "vcard": "BEGIN:VCARD"});
-        let err = validated_args("whatsrust_contact", &with_vcard).expect_err("vcard is not declared");
-        assert!(err.contains("vcard"), "{err}");
-    }
-
-    #[test]
-    fn test_call_tool_non_object_arguments_is_a_tool_error() {
+    fn test_tools_call_non_object_arguments_is_invalid_params() {
         // Port 1 is never dialled: validation fails before any HTTP call.
         for args in [json!("path"), json!(5), json!(true), json!(["jid"])] {
-            let result = call_tool("whatsrust_image", &args, 1);
-            assert_eq!(result["isError"], json!(true), "args: {args}");
-            assert_eq!(result["content"][0]["text"], json!("arguments must be a JSON object"), "args: {args}");
+            let response = rpc_tools_call("whatsrust_image", args.clone(), 1);
+            assert_eq!(response.result, None, "args: {args}: a JSON-RPC error, not a tool result");
+            assert_eq!(response.id, json!(1), "args: {args}");
+            let error = response.error.expect("error object");
+            assert_eq!(error["code"], json!(-32602), "args: {args}");
+            assert_eq!(error["message"], json!("arguments must be a JSON object"), "args: {args}");
         }
     }
 
@@ -721,10 +436,10 @@ mod tests {
 
         let args = json!({"jid": "1@s.whatsapp.net", "data": "AAAA", "mime": "image/png", "caption": "c"});
         let sent_args = args.clone();
-        let client = std::thread::spawn(move || call_tool("whatsrust_image", &sent_args, port));
+        let client = std::thread::spawn(move || call_tool("whatsrust_image", sent_args, port));
 
         let raw = serve_one_request(&listener, STUB_RESPONSE).await;
-        client.join().expect("client thread panicked");
+        client.join().expect("client thread panicked").expect("a tool result");
 
         let (head, body) = request_head_and_body(&raw);
         assert!(head.starts_with("POST /api/image "), "unexpected request line: {head}");
@@ -737,15 +452,323 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        let client = std::thread::spawn(move || call_tool("whatsrust_status", &Value::Null, port));
+        let client = std::thread::spawn(move || call_tool("whatsrust_status", Value::Null, port));
 
         let raw = serve_one_request(&listener, STUB_OK_RESPONSE).await;
-        let result = client.join().expect("client thread panicked");
+        let result = client.join().expect("client thread panicked").expect("a tool result");
 
         let (head, _) = request_head_and_body(&raw);
         assert!(head.starts_with("GET /api/status "), "unexpected request line: {head}");
         assert!(result.get("isError").is_none(), "null arguments must be treated as {{}}: {result}");
         assert_eq!(result["content"][0]["text"], json!("{\"ok\":true}"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Wire equivalence: for every tool, the exact request (method, target including the query
+    // string and its parameter order, JSON body) that a valid `tools/call` puts on the wire.
+    // Pins the tool -> REST mapping so it can move (shared registry) without changing what
+    // the daemon receives.
+    // -------------------------------------------------------------------------
+
+    /// All 34 tool names, in `tools/list` order.
+    const ALL_TOOL_NAMES: [&str; 34] = [
+        "whatsrust_status", "whatsrust_send", "whatsrust_reply", "whatsrust_react", "whatsrust_edit",
+        "whatsrust_revoke", "whatsrust_image", "whatsrust_groups", "whatsrust_group_info",
+        "whatsrust_history", "whatsrust_search", "whatsrust_fetch_history", "whatsrust_fetch_status",
+        "whatsrust_fetch_cancel", "whatsrust_typing", "whatsrust_location", "whatsrust_contact",
+        "whatsrust_poll", "whatsrust_pin_chat", "whatsrust_unpin_chat", "whatsrust_mute_chat",
+        "whatsrust_unmute_chat", "whatsrust_archive_chat", "whatsrust_unarchive_chat",
+        "whatsrust_mark_read", "whatsrust_delete_chat", "whatsrust_delete_for_me", "whatsrust_star",
+        "whatsrust_unstar", "whatsrust_status_text", "whatsrust_status_image", "whatsrust_status_video",
+        "whatsrust_status_revoke", "whatsrust_purge_embeddings",
+    ];
+
+    /// A `tools/call` for `name` through the JSON-RPC entry point.
+    fn rpc_tools_call(name: &str, args: Value, port: u16) -> JsonRpcResponse {
+        let req = JsonRpcRequest {
+            jsonrpc: None,
+            id: json!(1),
+            method: "tools/call".to_string(),
+            params: Some(json!({ "name": name, "arguments": args })),
+        };
+        handle_rpc(&req, port)
+    }
+
+    /// One expected request: tool, valid arguments, the exact request line without the HTTP
+    /// version (`"METHOD target"`), and the exact JSON body (`None` for GET).
+    struct WireCase {
+        tool: &'static str,
+        args: Value,
+        request: &'static str,
+        body: Option<Value>,
+    }
+
+    fn wire_get(tool: &'static str, args: Value, request: &'static str) -> WireCase {
+        WireCase { tool, args, request, body: None }
+    }
+
+    /// A POST whose body is the arguments verbatim.
+    fn wire_post(tool: &'static str, request: &'static str, args: Value) -> WireCase {
+        WireCase { tool, body: Some(args.clone()), args, request }
+    }
+
+    fn wire_cases() -> Vec<WireCase> {
+        let jid = "123456789@s.whatsapp.net";
+        let group = "120363000000000000@g.us";
+        let msg_target = json!({"jid": group, "id": "3EB0AAAA", "sender": jid, "from_me": false});
+        let msg_minimal = json!({"jid": group, "id": "3EB0AAAA"});
+        let chat = json!({"jid": group});
+        vec![
+            wire_get("whatsrust_status", json!({}), "GET /api/status"),
+            wire_get("whatsrust_groups", json!({}), "GET /api/groups"),
+            wire_get("whatsrust_group_info", json!({"jid": group}), "GET /api/group-info?jid=120363000000000000%40g.us"),
+            wire_get(
+                "whatsrust_group_info",
+                json!({"jid": "a b&c=d+\u{e9}/x?y#z@g.us"}),
+                "GET /api/group-info?jid=a%20b%26c%3Dd%2B%C3%A9%2Fx%3Fy%23z%40g.us",
+            ),
+            // history: jid, limit (default 20), then optional before
+            wire_get("whatsrust_history", json!({"jid": jid}), "GET /api/history?jid=123456789%40s.whatsapp.net&limit=20"),
+            wire_get("whatsrust_history", json!({"jid": jid, "limit": 5}), "GET /api/history?jid=123456789%40s.whatsapp.net&limit=5"),
+            wire_get(
+                "whatsrust_history",
+                json!({"jid": jid, "limit": 5, "before": 1_700_000_000}),
+                "GET /api/history?jid=123456789%40s.whatsapp.net&limit=5&before=1700000000",
+            ),
+            wire_get(
+                "whatsrust_history",
+                json!({"jid": jid, "before": 1_700_000_000}),
+                "GET /api/history?jid=123456789%40s.whatsapp.net&limit=20&before=1700000000",
+            ),
+            // search: q, limit (default 20), then optional jid
+            wire_get("whatsrust_search", json!({"q": "hello world"}), "GET /api/search?q=hello%20world&limit=20"),
+            wire_get("whatsrust_search", json!({"q": "x", "jid": jid}), "GET /api/search?q=x&limit=20&jid=123456789%40s.whatsapp.net"),
+            wire_get(
+                "whatsrust_search",
+                json!({"q": "h\u{e9}llo", "jid": jid, "limit": 7}),
+                "GET /api/search?q=h%C3%A9llo&limit=7&jid=123456789%40s.whatsapp.net",
+            ),
+            // fetch_history: body rebuilt as {chat_jid, mode (default "all"), target_value if present}
+            WireCase {
+                tool: "whatsrust_fetch_history",
+                args: json!({"chat_jid": group}),
+                request: "POST /api/history-fetch",
+                body: Some(json!({"chat_jid": group, "mode": "all"})),
+            },
+            WireCase {
+                tool: "whatsrust_fetch_history",
+                args: json!({"chat_jid": group, "mode": "count", "target_value": 50}),
+                request: "POST /api/history-fetch",
+                body: Some(json!({"chat_jid": group, "mode": "count", "target_value": 50})),
+            },
+            WireCase {
+                tool: "whatsrust_fetch_history",
+                args: json!({"chat_jid": group, "mode": "since", "target_value": 1_700_000_000_000_i64}),
+                request: "POST /api/history-fetch",
+                body: Some(json!({"chat_jid": group, "mode": "since", "target_value": 1_700_000_000_000_i64})),
+            },
+            WireCase {
+                tool: "whatsrust_fetch_history",
+                args: json!({"chat_jid": group, "target_value": 10}),
+                request: "POST /api/history-fetch",
+                body: Some(json!({"chat_jid": group, "mode": "all", "target_value": 10})),
+            },
+            // fetch_status: job_id if present, else active (default true)
+            wire_get("whatsrust_fetch_status", json!({"job_id": 42}), "GET /api/history-fetch?job_id=42"),
+            wire_get("whatsrust_fetch_status", json!({}), "GET /api/history-fetch?active=true"),
+            wire_get("whatsrust_fetch_status", json!({"active": false}), "GET /api/history-fetch?active=false"),
+            wire_get("whatsrust_fetch_status", json!({"active": true}), "GET /api/history-fetch?active=true"),
+            wire_get("whatsrust_fetch_status", json!({"job_id": 7, "active": false}), "GET /api/history-fetch?job_id=7"),
+            wire_post("whatsrust_fetch_cancel", "POST /api/history-fetch/cancel", json!({"job_id": 3})),
+            // send is always sync
+            wire_post(
+                "whatsrust_send",
+                "POST /api/send?sync=true",
+                json!({"jid": jid, "text": "hi there", "mentions": ["1@s.whatsapp.net", "2@s.whatsapp.net"]}),
+            ),
+            wire_post("whatsrust_send", "POST /api/send?sync=true", json!({"jid": jid, "text": "hi"})),
+            wire_post(
+                "whatsrust_reply",
+                "POST /api/reply",
+                json!({"jid": group, "id": "3EB0AAAA", "sender": jid, "text": "yes", "mentions": [jid]}),
+            ),
+            wire_post(
+                "whatsrust_react",
+                "POST /api/react",
+                json!({"jid": group, "id": "3EB0AAAA", "emoji": "\u{1f44d}", "from_me": false, "sender_jid": jid}),
+            ),
+            wire_post("whatsrust_react", "POST /api/react", json!({"jid": group, "id": "3EB0AAAA", "emoji": "\u{1f44d}"})),
+            wire_post("whatsrust_edit", "POST /api/edit", json!({"jid": group, "id": "3EB0AAAA", "text": "fixed"})),
+            wire_post("whatsrust_revoke", "POST /api/revoke", msg_minimal.clone()),
+            wire_post(
+                "whatsrust_image",
+                "POST /api/image",
+                json!({"jid": jid, "data": "AAAA", "mime": "image/png", "caption": "c"}),
+            ),
+            wire_post("whatsrust_image", "POST /api/image", json!({"jid": jid, "data": "AAAA"})),
+            wire_post("whatsrust_typing", "POST /api/typing", chat.clone()),
+            wire_post(
+                "whatsrust_location",
+                "POST /api/location",
+                json!({"jid": jid, "lat": 31.5, "lon": 34.75, "name": "Here", "address": "1 Main St"}),
+            ),
+            wire_post("whatsrust_contact", "POST /api/contact", json!({"jid": jid, "name": "Ann", "phone": "972500000000"})),
+            wire_post(
+                "whatsrust_poll",
+                "POST /api/poll",
+                json!({"jid": group, "question": "Lunch?", "options": ["pizza", "sushi"], "selectable_count": 1}),
+            ),
+            wire_post("whatsrust_pin_chat", "POST /api/pin-chat", chat.clone()),
+            wire_post("whatsrust_unpin_chat", "POST /api/unpin-chat", chat.clone()),
+            wire_post("whatsrust_mute_chat", "POST /api/mute-chat", chat.clone()),
+            wire_post("whatsrust_unmute_chat", "POST /api/unmute-chat", chat.clone()),
+            wire_post("whatsrust_archive_chat", "POST /api/archive-chat", chat.clone()),
+            wire_post("whatsrust_unarchive_chat", "POST /api/unarchive-chat", chat.clone()),
+            wire_post("whatsrust_mark_read", "POST /api/mark-read", chat.clone()),
+            wire_post("whatsrust_delete_chat", "POST /api/delete-chat", chat.clone()),
+            wire_post("whatsrust_delete_for_me", "POST /api/delete-for-me", msg_target.clone()),
+            wire_post("whatsrust_delete_for_me", "POST /api/delete-for-me", msg_minimal.clone()),
+            wire_post("whatsrust_star", "POST /api/star", msg_target.clone()),
+            wire_post("whatsrust_unstar", "POST /api/unstar", msg_target.clone()),
+            wire_post(
+                "whatsrust_status_text",
+                "POST /api/status-text",
+                json!({"recipients": ["972500000000"], "text": "hello", "background_argb": 4_280_184_399_i64, "font": 1, "privacy": "contacts"}),
+            ),
+            wire_post(
+                "whatsrust_status_image",
+                "POST /api/status-image",
+                json!({"recipients": ["972500000000"], "data": "AAAA", "mime": "image/png", "caption": "c", "privacy": "contacts"}),
+            ),
+            wire_post(
+                "whatsrust_status_video",
+                "POST /api/status-video",
+                json!({"recipients": ["972500000000"], "data": "AAAA", "mime": "video/mp4", "caption": "c", "seconds": 12, "privacy": "contacts"}),
+            ),
+            wire_post(
+                "whatsrust_status_revoke",
+                "POST /api/status-revoke",
+                json!({"recipients": ["972500000000"], "message_id": "3EB0BBBB", "privacy": "contacts"}),
+            ),
+            wire_post("whatsrust_purge_embeddings", "POST /api/embeddings/purge", json!({"model_id": "bge-m3"})),
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_wire_requests_for_every_tool() {
+        let cases = wire_cases();
+
+        let covered: std::collections::BTreeSet<&str> = cases.iter().map(|c| c.tool).collect();
+        let expected: std::collections::BTreeSet<&str> = ALL_TOOL_NAMES.iter().copied().collect();
+        assert_eq!(ALL_TOOL_NAMES.len(), expected.len(), "ALL_TOOL_NAMES must not repeat a tool");
+        assert_eq!(covered, expected, "every one of the 34 tools needs at least one wire case");
+
+        for case in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+
+            let (tool, args) = (case.tool, case.args.clone());
+            let client = std::thread::spawn(move || rpc_tools_call(tool, args, port));
+            let raw = serve_one_request(&listener, STUB_OK_RESPONSE).await;
+            let response = client.join().expect("client thread panicked");
+
+            let label = format!("{} {}", case.tool, case.args);
+            let result = response.result.unwrap_or_else(|| panic!("{label}: expected a tool result, got {:?}", response.error));
+            assert!(result.get("isError").is_none(), "{label}: valid arguments must not be a tool error: {result}");
+            assert_eq!(result["content"][0]["text"], json!("{\"ok\":true}"), "{label}");
+
+            let (head, body) = request_head_and_body(&raw);
+            let request_line = head.lines().next().expect("request line");
+            assert_eq!(request_line, format!("{} HTTP/1.1", case.request), "{label}: request line");
+            match &case.body {
+                Some(expected) => {
+                    let body = String::from_utf8(body).expect("UTF-8 body");
+                    assert_eq!(body, serde_json::to_string(expected).unwrap(), "{label}: body");
+                    assert!(
+                        head.contains(&format!("Content-Length: {}", body.len())),
+                        "{label}: Content-Length must match the body: {head}"
+                    );
+                }
+                None => assert!(body.is_empty(), "{label}: a GET carries no body"),
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared registry: the stdio server lists, validates and maps tools through it.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_registry_lists_the_34_tools_once_each_in_the_original_order() {
+        let names: Vec<String> = REGISTRY
+            .tool_definitions()
+            .iter()
+            .map(|t| t["name"].as_str().expect("tool has a name").to_string())
+            .collect();
+        assert_eq!(names, ALL_TOOL_NAMES);
+        let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), 34, "tool names must be unique");
+    }
+
+    #[test]
+    fn test_tools_list_entries_carry_annotations() {
+        let req = JsonRpcRequest { jsonrpc: None, id: json!(7), method: "tools/list".to_string(), params: None };
+        let response = handle_rpc(&req, 1);
+        assert_eq!(response.id, json!(7));
+        let result = response.result.expect("tools/list result");
+        let tools = result["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 34);
+        for tool in tools {
+            let annotations = tool["annotations"].as_object().unwrap_or_else(|| panic!("{}: missing annotations", tool["name"]));
+            assert!(annotations["readOnlyHint"].is_boolean(), "{}: readOnlyHint", tool["name"]);
+            assert!(annotations["openWorldHint"].is_boolean(), "{}: openWorldHint", tool["name"]);
+        }
+        let status = tools.iter().find(|t| t["name"] == "whatsrust_status").expect("whatsrust_status");
+        assert_eq!(status["annotations"], json!({"readOnlyHint": true, "openWorldHint": false}));
+        let send = tools.iter().find(|t| t["name"] == "whatsrust_send").expect("whatsrust_send");
+        assert_eq!(
+            send["annotations"],
+            json!({"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_rejects_wrong_type_and_missing_required_without_sending() {
+        assert_tool_error_before_sending(
+            "whatsrust_send",
+            json!({"jid": 5, "text": "hi"}),
+            "whatsrust_send: invalid argument(s): jid must be a string. Nothing was sent.",
+        ).await;
+        assert_tool_error_before_sending(
+            "whatsrust_send",
+            json!({"jid": "1@s.whatsapp.net"}),
+            "whatsrust_send: invalid argument(s): text is required. Nothing was sent.",
+        ).await;
+        assert_tool_error_before_sending(
+            "whatsrust_history",
+            json!({"jid": "1@s.whatsapp.net", "limit": 5.5}),
+            "whatsrust_history: invalid argument(s): limit must be an integer (64-bit). Nothing was sent.",
+        ).await;
+        assert_tool_error_before_sending(
+            "whatsrust_poll",
+            json!({"jid": "1@g.us", "options": "pizza"}),
+            "whatsrust_poll: invalid argument(s): options must be an array; question is required; selectable_count is required. Nothing was sent.",
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_integral_float_is_sent_as_an_integer() {
+        let line = sent_request_line("whatsrust_history", json!({"jid": "1@g.us", "limit": 5.0})).await;
+        assert_eq!(line, "GET /api/history?jid=1%40g.us&limit=5 HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_optional_null_is_not_forwarded() {
+        let line = sent_request_line("whatsrust_history", json!({"jid": "1@g.us", "before": null})).await;
+        assert_eq!(line, "GET /api/history?jid=1%40g.us&limit=20 HTTP/1.1");
+
+        let line = sent_request_line("whatsrust_search", json!({"q": "x", "jid": null, "limit": null})).await;
+        assert_eq!(line, "GET /api/search?q=x&limit=20 HTTP/1.1");
     }
 
     #[test]
@@ -756,7 +779,7 @@ mod tests {
         for key in ["schedule_at", "link_preview"] {
             assert!(!declared.contains_key(key), "whatsrust_send must not declare `{key}`");
         }
-        let tools = tool_definitions();
+        let tools = REGISTRY.tool_definitions();
         let send = tools.iter().find(|t| t["name"] == "whatsrust_send").unwrap();
         let description = send["description"].as_str().unwrap().to_lowercase();
         assert!(!description.contains("link preview"), "description must not advertise link previews: {description}");
@@ -764,7 +787,7 @@ mod tests {
 
     #[test]
     fn test_every_tool_schema_forbids_additional_properties() {
-        for tool in tool_definitions() {
+        for tool in REGISTRY.tool_definitions() {
             let name = tool["name"].as_str().expect("tool has a name");
             assert_eq!(
                 tool.pointer("/inputSchema/additionalProperties"),
@@ -772,6 +795,11 @@ mod tests {
                 "{name}: inputSchema must set additionalProperties:false (undeclared keys are rejected)"
             );
         }
+    }
+
+    /// The `inputSchema.properties` of the named tool, or `None` for an unknown tool.
+    fn declared_properties(name: &str) -> Option<serde_json::Map<String, Value>> {
+        REGISTRY.find_tool(name).map(|t| t.properties().clone())
     }
 
     /// Hand-maintained mirror of `src/api.rs`: for each POST-forwarding tool, the fields its REST
@@ -807,7 +835,7 @@ mod tests {
     ];
 
     /// Tools intentionally absent from `REST_REQUIRED_FIELDS`: GET tools, and POST tools whose
-    /// REST struct has no required field (all `Option`) or whose body `call_tool` rebuilds.
+    /// REST struct has no required field (all `Option`) or whose body its registry mapping rebuilds.
     const NO_REQUIRED_REST_STRUCT: &[&str] = &[
         "whatsrust_status", "whatsrust_groups", "whatsrust_group_info", "whatsrust_history",
         "whatsrust_search", "whatsrust_fetch_status", "whatsrust_fetch_history",
@@ -833,7 +861,7 @@ mod tests {
     fn test_every_tool_is_classified_for_the_rest_required_fields_guard() {
         // A new tool must be added to REST_REQUIRED_FIELDS (or consciously exempted), so the
         // guard above cannot be bypassed by simply not listing it.
-        for tool in tool_definitions() {
+        for tool in REGISTRY.tool_definitions() {
             let name = tool["name"].as_str().expect("tool has a name");
             let in_table = REST_REQUIRED_FIELDS.iter().filter(|(t, _)| *t == name).count();
             let exempt = NO_REQUIRED_REST_STRUCT.contains(&name);
@@ -849,7 +877,7 @@ mod tests {
 
     #[test]
     fn test_every_required_schema_key_is_declared_in_properties() {
-        for tool in tool_definitions() {
+        for tool in REGISTRY.tool_definitions() {
             let name = tool["name"].as_str().expect("tool has a name");
             let declared = declared_properties(name).expect("properties object");
             let required = tool.pointer("/inputSchema/required").and_then(Value::as_array);
@@ -860,21 +888,25 @@ mod tests {
     }
 
     #[test]
-    fn test_call_tool_unknown_tool_reports_error_without_panicking() {
-        // Port 1 is never dialled: the unknown-tool arm fails before any HTTP call. The unknown
-        // tool is reported whatever the arguments look like.
+    fn test_tools_call_unknown_tool_is_invalid_params_without_panicking() {
+        // Port 1 is never dialled: the unknown tool is rejected before any HTTP call, whatever
+        // the arguments look like.
         for args in [json!({"path": "/etc/passwd"}), json!("not an object"), Value::Null] {
-            let result = call_tool("whatsrust_nope", &args, 1);
-            assert_eq!(result["isError"], json!(true), "args: {args}");
-            assert_eq!(result["content"][0]["text"], json!("unknown tool: whatsrust_nope"), "args: {args}");
+            let response = rpc_tools_call("whatsrust_nope", args.clone(), 1);
+            assert_eq!(response.result, None, "args: {args}");
+            let error = response.error.expect("error object");
+            assert_eq!(error["code"], json!(-32602), "args: {args}");
+            assert_eq!(error["message"], json!("Unknown tool: whatsrust_nope"), "args: {args}");
         }
+        let response = rpc_tools_call("", json!({}), 1);
+        assert_eq!(response.error.expect("error object")["message"], json!("Unknown tool: "));
     }
 
     #[test]
     fn test_every_tool_definition_has_an_object_input_schema_properties() {
         // Guards the validator's single source of truth: a tool whose schema loses its
         // `properties` object would reject every argument.
-        for tool in tool_definitions() {
+        for tool in REGISTRY.tool_definitions() {
             let name = tool["name"].as_str().expect("tool has a name");
             assert!(
                 matches!(tool.pointer("/inputSchema/properties"), Some(Value::Object(_))),
@@ -888,7 +920,7 @@ mod tests {
     fn test_no_tool_schema_declares_a_path_property() {
         // `path` makes the REST media handlers read a local file and send it; declaring it in an
         // MCP schema would let it through the strict argument check and re-open that route.
-        for tool in tool_definitions() {
+        for tool in REGISTRY.tool_definitions() {
             let name = tool["name"].as_str().expect("tool has a name");
             let declared = declared_properties(name).expect("properties object");
             assert!(!declared.contains_key("path"), "{name}: must not declare `path`");

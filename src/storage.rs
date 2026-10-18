@@ -6649,17 +6649,16 @@ mod tests {
 
         // Verify MCP forwards to the exact path `/api/embeddings/purge` with the expected payload.
         // The API handler parses the JSON and calls bridge.purge_embeddings(model_id).
-        let mcp_source = include_str!("mcp.rs");
-        // Find the dispatch line (it's in the call_tool match, separate from the tool_def line)
-        let mcp_dispatch_found = mcp_source
+        let registry_source = include_str!("mcp_registry.rs");
+        // The REST mapping lives in the tool's registry entry (a few lines after its name).
+        let purge_entry = registry_source
             .lines()
-            .any(|line| {
-                line.contains("\"whatsrust_purge_embeddings\"")
-                    && line.contains("http_post")
-                    && line.contains("\"/api/embeddings/purge\"")
-            });
+            .skip_while(|line| !line.contains("\"whatsrust_purge_embeddings\""))
+            .take(10)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            mcp_dispatch_found,
+            purge_entry.contains("RestMapping::post(\"/api/embeddings/purge\")"),
             "MCP should forward whatsrust_purge_embeddings to /api/embeddings/purge"
         );
 
