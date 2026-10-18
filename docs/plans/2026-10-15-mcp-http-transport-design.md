@@ -132,7 +132,7 @@ A dedicated `/mcp` listener runs inside the daemon on its own port, serving only
 
 The MCP listener cannot reach REST routes by construction. ADR 0046 (`validated_args` rejects undeclared keys, including `path`) + listener isolation = double defense.
 
-**Partial bind:** If only one listener binds (e.g. MCP port set but REST port is 0, or vice versa), the daemon continues with the successfully bound listener. If neither binds, the daemon exits (no HTTP server).
+**Partial bind:** If only one listener binds (e.g. MCP port set but REST port is 0, or vice versa), the daemon continues with the successfully bound listener. An enabled listener that fails to bind exits. Headless (both off) keeps working.
 
 **Connection limit:** The MCP listener has its own in-flight limit (default 8 concurrent requests). This is separate from the REST listener's 64-permit pool. A separate semaphore prevents MCP from starving REST.
 
@@ -404,7 +404,7 @@ Era is detected using a precedence order:
 
 **Era signal clarification:** A `_meta` object alone is NOT a modern signal. Legacy requests may carry `_meta.progressToken` (progress utility, per 2025-11-25 spec). Only the flat namespaced key `"io.modelcontextprotocol/protocolVersion"` inside `_meta` marks a modern request.
 
-**Additional validation (any era):** `Mcp-Method` and `Mcp-Name` headers, if present, are validated against the body (anti-smuggling rule). Mismatch → 400 `-32020`. Their presence does not force modern era; only the precedence order above determines the era.
+**Additional validation (any era):** `Mcp-Method` and `Mcp-Name` headers, if present, are validated against the body (anti-smuggling rule). Mismatch → 400 `-32020`. Their presence does not force modern era; only the precedence order above determines the era. This validation lands in Phase 4 for both eras.
 
 **No assumptions about 2025-06-18 vs 2025-11-25 differences.** Both are treated identically (no differences requiring different server behaviour are documented in the changelogs; if differences matter, they will be discovered during implementation).
 
@@ -412,9 +412,9 @@ Era is detected using a precedence order:
 
 **Validation (per spec: Streamable HTTP, Request Metadata):**
 - `MCP-Protocol-Version` header MUST match `params._meta["io.modelcontextprotocol/protocolVersion"]`. Mismatch → 400 `-32020` HeaderMismatch.
-- `Mcp-Method` header is REQUIRED for all requests. Missing → 400 `-32020` HeaderMismatch. Present: MUST match `method`. Mismatch → 400 `-32020`.
-- `Mcp-Name` header is REQUIRED for `tools/call`, `resources/read`, `prompts/get` requests. Missing where required → 400 `-32020`. Present: MUST match `params.name` or `params.uri`. Mismatch → 400 `-32020`.
-- `Mcp-Name` may use base64 sentinel `=?base64?...?=` per spec; server decodes before comparison.
+- `Mcp-Method` header is REQUIRED for all requests. Missing → 400 `-32020` HeaderMismatch. Present: MUST match `method`. Mismatch → 400 `-32020`. (Phase 4)
+- `Mcp-Name` header is REQUIRED for `tools/call`, `resources/read`, `prompts/get` requests. Missing where required → 400 `-32020`. Present: MUST match `params.name` or `params.uri`. Mismatch → 400 `-32020`. (Phase 4)
+- `Mcp-Name` may use base64 sentinel `=?base64?...?=` per spec; server decodes before comparison. (Phase 4)
 - Duplicate `MCP-Protocol-Version`, `Mcp-Method`, or `Mcp-Name` headers are rejected (400 `-32020`) in every era.
 - Header names are case-insensitive (per spec). Header values (method, name) are case-sensitive.
 - Unsupported protocol version → 400 `-32022` with `data: {supported: ["2026-07-28", "2025-11-25", "2025-06-18"], requested: "<version>"}`.
@@ -430,7 +430,7 @@ Era is detected using a precedence order:
 
 ### Legacy Requests (2025-11-25, 2025-06-18)
 
-**Header handling:** Supported legacy versions (`2025-11-25`, `2025-06-18`) both require clients to send `MCP-Protocol-Version: <version>` on all requests after `initialize` (per 2025-11-25 spec). If present, its value is used as the protocol version. If absent, see era detection (precedence order). If present with an invalid or unsupported value and method ≠ `initialize`, server responds with 400 `-32022` per 2025-11-25 spec. Other headers (`Mcp-Method`, `Mcp-Name`) are validated if present (anti-smuggling rule), but legacy clients do not send them.
+**Header handling:** Supported legacy versions (`2025-11-25`, `2025-06-18`) both require clients to send `MCP-Protocol-Version: <version>` on all requests after `initialize` (per 2025-11-25 spec). If present, its value is used as the protocol version. If absent, see era detection (precedence order). If present with an invalid or unsupported value and method ≠ `initialize`, server responds with 400 `-32022` per 2025-11-25 spec. Other headers (`Mcp-Method`, `Mcp-Name`) are validated if present (anti-smuggling rule, Phase 4), but legacy clients do not send them.
 
 **Version negotiation (`initialize`):**
 - Client sends `method: "initialize"` with `params.protocolVersion`.
@@ -466,10 +466,10 @@ Era is detected using a precedence order:
 The MCP listener runs on `WHATSRUST_MCP_BIND:WHATSRUST_MCP_PORT` (unset or 0 = disabled). Its own bind, accept loop, and connection limit. Only `/mcp` is routed; every other path gets 404 before the token check.
 
 ```
-TCP accept on MCP listener (outer connection cap: 32)
+TCP accept on MCP listener (outer connection cap: 32, over cap → 503 + Retry-After: 10)
   ↓
 read_request_head(stream, wall_clock_deadline = arrival + 20s) → (method, path, headers, content_length)
-  ↓ (per-read timeout 10s; total head read capped by wall-clock deadline)
+  ↓ (per-read timeout 10s; head read capped by wall-clock deadline)
 route: is POST /mcp? (other methods on /mcp → 405 Allow: POST; other paths → 404; /.well-known/* → 404)
   ↓ (404 before gate and token; no information leak; the MCP listener serves only /mcp)
 gate_request(method, headers, is_loopback_bind, allowed_origins, allowed_hosts) → Result<(), (u16, String)>
@@ -481,7 +481,7 @@ acquire MCP semaphore (permit from lane)
 Expect: 100-continue supported after gate, token and framing checks (interim "100 Continue" only if the body is incomplete); any other Expect value → 417
   ↓
 read_request_body(stream, content_length, limit=10 MiB, deadline) → Vec<u8>
-  ↓ (413 from Content-Length at head phase if too large; body read deadline = arrival + 20s, scaled by length up to 60s cap)
+  ↓ (413 from Content-Length at head phase if too large; body read deadline = arrival + min(60s, 20s + 4s per MiB of Content-Length))
 lingering drain on early rejection (≤64 KiB or ≤1s)
   ↓
 parse JSON-RPC body → JsonRpcRequest
@@ -518,7 +518,7 @@ dispatch_mcp_method(method, params, bridge, CallContext) → JSON-RPC result or 
     spawn task: dispatch_rest_request(RestRequest, bridge) → ApiResponse
       (gate and token NOT re-run; CallContext.loopback_file_access = false)
     ↓
-    wait for task with remaining deadline (arrival + 40s total, minus head/body/parse time already spent)
+    wait for task with 40s deadline from body completion
       - enqueue-and-wait routes receive remaining budget; enqueue runs as spawned task publishing job_id through shared cell
       - on timeout: task continues, permit held until task ends
       - timeout response carries job_id whenever job exists, "outcome unknown, check before retrying" otherwise
@@ -541,8 +541,8 @@ write to stream
 
 `read_request` is split into two phases:
 
-1. **`read_request_head(stream, deadline)`** → `(method, path, headers, content_length, leftover: Vec<u8>)`. Reads until `\r\n\r\n`, parses request line and headers. If a chunk read included body bytes, they are returned as `leftover`. Per-read timeout 10 s; wall-clock deadline from request arrival.
-2. **`read_request_body(stream, content_length, limit, leftover, deadline)`** → `Vec<u8>`. Reads exactly `content_length` bytes total (starting with `leftover`, then reading from stream). Errors if over `limit`. Deadline scaled by length (e.g. 10 MiB body → 60 s cap from arrival).
+1. **`read_request_head(stream, deadline)`** → `(method, path, headers, content_length, leftover: Vec<u8>)`. Reads until `\r\n\r\n`, parses request line and headers. If a chunk read included body bytes, they are returned as `leftover`. Per-read timeout 10 s; wall-clock deadline arrival + 20 s.
+2. **`read_request_body(stream, content_length, limit, leftover, deadline)`** → `Vec<u8>`. Reads exactly `content_length` bytes total (starting with `leftover`, then reading from stream). Errors if over `limit`. Deadline arrival + min(60 s, 20 s + 4 s per MiB of Content-Length).
 
 Routing, gate, and token check run between head and body. This prevents buffering 10 MiB before authentication. Routing runs first so non-`/mcp` paths (including `/.well-known/*`) get 404 before the token check; no information leak because the MCP listener serves only `/mcp`.
 
@@ -576,21 +576,23 @@ Routing, gate, and token check run between head and body. This prevents bufferin
 - **Peak memory bound:** 1 large (10 MiB) + 7 small (7 MiB) = ~17 MiB for MCP listener. Conservatively, each request holds ~2× body size (TCP buffer + parsed JSON). REST listener (64 permits, 1 MiB cap for non-media) adds ~128 MiB. Process-wide FDs are noted (outer cap 32 for MCP accept loop).
 - Excess MCP connections → 503 Service Unavailable with `Retry-After: 10`.
 
-### Server-Side Deadline (One Absolute Deadline)
+### Server-Side Deadline (Body and Tool Budgets)
 
 **Task model:** Each tool call is spawned as a task. The deadline stops *waiting*, not the task. The task continues to completion. The permit is held until the task ends, not until the timeout fires. This prevents mid-exchange corruption (the ADR 0042 precedent) and ensures `job_id` exists when a job does.
 
-**One absolute deadline from request arrival:** The MCP handler measures an absolute deadline from TCP accept (e.g. arrival + 40 s). Head read, permit wait, body read, and tool wait all count against it. Enqueue-and-wait routes receive the remaining budget (deadline minus now). No outer timer stacks on top of the 30 s bridge wait. Rationale:
-- Avoids the double-timer problem: outer 40 s versus enqueue + 30 s.
-- Structured response lands before the client's 45 s timeout (`SYNC_CLIENT_TIMEOUT`).
+**Body deadline (scaled by size):** The body may arrive up to arrival + min(60 s, 20 s + 4 s per MiB of Content-Length) (a 10 MiB body gets the 60 s cap), plus the 10 s per-read idle timeout. Reason: tolerate slow uplinks.
+
+**Tool budget (40 s from body completion):** The tool budget starts when the body is complete, not at arrival. Enqueue-and-wait routes receive the remaining budget (deadline minus now). No outer timer stacks on top of the 30 s bridge wait. Rationale:
+- A 60 s body read cannot fit inside a 40 s budget measured from arrival.
+- Structured response lands before the client's 45 s timeout (`SYNC_CLIENT_TIMEOUT`) for fast uplinks.
 - The enqueue runs as a spawned task that publishes `job_id` through a shared cell, so a timeout response carries `job_id` whenever a job exists, and "outcome unknown, check before retrying" otherwise.
 
-**Timeout value:** `REQUEST_DEADLINE = 40 s` from arrival. Rationale:
+**Timeout value:** `TOOL_BUDGET = 40 s` from body completion. Rationale:
 - `SYNC_SEND_WAIT = 30 s` (bridge wait for outbound job).
 - `SYNC_CLIENT_TIMEOUT = 45 s` (whatsrust's CLI and stdio proxy wait).
-- The structured response lands before the client gives up.
-- **Third-party MCP clients:** Must set timeout ≥50 s to reliably receive the structured timeout response. Documented in HOWTO.
-- Long tools: `enqueue_and_wait` times out at 30 s and returns 504 with `job_id` (ADR 0047), which is within the 40 s deadline. Semantic search wait is up to 20 s (ADR 0042), leaving 20 s for the search.
+- Long tools: `enqueue_and_wait` times out at 30 s and returns 504 with `job_id` (ADR 0047), which fits within the 40 s tool budget. Semantic search wait is up to 20 s (ADR 0042), leaving 20 s for the search.
+
+**Consequence:** Worst-case response time ≈ body time + 40 s (≈100 s for a slow 10 MiB upload). Third-party MCP clients must set a timeout of at least 50 s plus their upload time to reliably receive the structured timeout response.
 
 **Real stall source:** The single DB `Mutex<Connection>` (src/storage.rs ~1044, `spawn_blocking`). It is held across long operations such as `purge_embeddings` (storage.rs:1884+). `busy_timeout=5000` does not bound that wait. The dropped future from a timeout does not cancel a DB write (spawn_blocking is not cancellable).
 
@@ -612,7 +614,7 @@ Routing, gate, and token check run between head and body. This prevents bufferin
 | Wrong path (not `/mcp`) | 404 | - | `{"ok":false,"code":"not_found","error":"..."}` | REST-shaped (routed before token check); includes `/.well-known/*` and `/mcp/` |
 | Wrong method on `/mcp` (GET/DELETE/PUT/HEAD/OPTIONS) | 405 | -32600 | JSON-RPC error + `Allow: POST` header | After routing |
 | `Expect` value other than `100-continue` | 417 | - | `{"ok":false,"code":"expectation_failed","error":"..."}` | After gate, token and framing checks. `100-continue` itself is supported: interim `100 Continue` when the body is incomplete |
-| Body too large (from `Content-Length`) | 413 | -32600 | JSON-RPC error | Head phase; JSON-RPC error body |
+| Body too large (from `Content-Length`) | 413 | -32600 | JSON-RPC error | Head phase; JSON-RPC error body; reason phrase "Content Too Large" |
 | Chunked body (`Transfer-Encoding`) | 411 | -32600 | JSON-RPC error | Head phase; `json_err` code `length_required` |
 | Malformed JSON | 400 | -32700 | JSON-RPC error | Parse error |
 | JSON array (batch) | 400 | -32600 | JSON-RPC error (not text) | "Batching is not supported" |
@@ -623,6 +625,7 @@ Routing, gate, and token check run between head and body. This prevents bufferin
 | Non-object arguments | 200 | -32602 | JSON-RPC error | Invalid params |
 | Undeclared keys in arguments | 200 | - | `{result:{content:[...],isError:true}}` | Tool execution error (from validated_args) |
 | Write access in read-only mode | 200 | -32600 | JSON-RPC error | "write access denied in read-only mode" |
+| `tools/call` stub (Phase 2 only) | 501 | -32603 | JSON-RPC error | "not implemented yet; use the stdio server"; reason phrase "Not Implemented" |
 | Tool execution error (REST 4xx/5xx) | 200 | - | `{result:{content:[...],isError:true}}` | Tool execution error, not protocol error |
 | At capacity (semaphore exhausted) | 503 | -32000 | JSON-RPC error + `Retry-After: 10` header | Implementation-defined code (−32000…−32019); after gate/token/routing; `tokio::time::timeout(5s, semaphore.acquire_owned())` |
 
@@ -847,8 +850,10 @@ The spec requires these fields on all CacheableResult responses (modern era only
 - 202: "Accepted"
 - 405: "Method Not Allowed"
 - 411: "Length Required"
+- 413: "Content Too Large"
 - 415: "Unsupported Media Type"
 - 417: "Expectation Failed"
+- 501: "Not Implemented"
 
 ### `json_err` Codes
 
@@ -950,18 +955,19 @@ All configuration reuses existing env vars plus four new variables:
 - `WHATSRUST_MCP_READ_ONLY` (default off). When set, only read-access tools exposed. Server-side enforcement; stdio unaffected.
 
 **Token policy checked in `main()` before `WhatsAppBridge::start` (bind both listeners here before bridge start):** If any rule is violated, the daemon exits non-zero with an exact fix message (ADR 0022 pattern):
-1. MCP listener enabled (`WHATSRUST_MCP_PORT` > 0) AND `WHATSRUST_MCP_TOKEN` unset → exit with fix. **Moved to Phase 2:** the MCP listener does not exist before Phase 2.
-2. MCP listener enabled AND REST listener enabled AND `WHATSRUST_MCP_TOKEN` equals `WHATSRUST_API_TOKEN` → exit with fix. **Moved to Phase 2:** the MCP listener does not exist before Phase 2.
-3. MCP listener enabled AND `WHATSRUST_MCP_TOKEN` length < 22 → exit with fix: "WHATSRUST_MCP_TOKEN must be at least 22 characters (currently: N); generate with `openssl rand -base64 32`. Refusing to start." **Moved to Phase 2:** the MCP listener does not exist before Phase 2.
+1. MCP listener enabled (`WHATSRUST_MCP_PORT` > 0) AND `WHATSRUST_MCP_TOKEN` unset → exit with fix. **Implemented in Phase 2.** The token is always required when the MCP listener is enabled (rule 6 is covered by this rule).
+2. MCP listener enabled AND REST listener enabled AND `WHATSRUST_MCP_TOKEN` equals `WHATSRUST_API_TOKEN` → exit with fix. **Implemented in Phase 2.**
+3. MCP listener enabled AND `WHATSRUST_MCP_TOKEN` length < 22 → exit with fix: "WHATSRUST_MCP_TOKEN must be at least 22 characters (currently: N); generate with `openssl rand -base64 32`. Refusing to start." **Implemented in Phase 2.**
 4. REST listener enabled (`WHATSRUST_PORT` > 0) AND allowlist non-empty AND `WHATSRUST_API_TOKEN` unset → exit with fix. **Implemented in Phase 0b.**
 5. REST listener enabled AND non-loopback bind (`WHATSRUST_ALLOW_REMOTE=1`) AND `WHATSRUST_API_TOKEN` unset → exit with fix. **Implemented in Phase 0b**, together with its companion case: REST listener enabled AND non-loopback `WHATSRUST_BIND` without `WHATSRUST_ALLOW_REMOTE=1` → exit with fix (before Phase 0b, `serve()` logged this and left the daemon running without an API).
-6. MCP listener enabled AND non-loopback bind (`WHATSRUST_MCP_ALLOW_REMOTE=1`) AND `WHATSRUST_MCP_TOKEN` unset → exit with fix. **Moved to Phase 2:** the MCP listener does not exist before Phase 2.
-7. MCP port equals REST port (both > 0) → exit with fix: "WHATSRUST_MCP_PORT must differ from WHATSRUST_PORT. Refusing to start." **Moved to Phase 2:** the MCP listener does not exist before Phase 2.
-8. An explicitly enabled listener (port > 0) that fails to bind → exit non-zero with fix. **REST half implemented in Phase 0b. MCP half moved to Phase 2:** the MCP listener does not exist before Phase 2.
+6. MCP listener enabled AND non-loopback bind (`WHATSRUST_MCP_ALLOW_REMOTE=1`) AND `WHATSRUST_MCP_TOKEN` unset → exit with fix. **Implemented in Phase 2** (covered by rule 1). The companion case: MCP listener enabled AND non-loopback `WHATSRUST_MCP_BIND` without `WHATSRUST_MCP_ALLOW_REMOTE=1` → exit with fix. **Implemented in Phase 2.**
+7. MCP port equals REST port (both > 0) → exit with fix: "WHATSRUST_MCP_PORT must differ from WHATSRUST_PORT. Refusing to start." **Implemented in Phase 2.**
+8. An explicitly enabled listener (port > 0) that fails to bind → exit non-zero with fix. **REST half implemented in Phase 0b. MCP half implemented in Phase 2.**
+9. Unparseable `WHATSRUST_MCP_PORT` → exit with fix (see "Unparseable port value" below). **Implemented in Phase 2.**
 
-**Bind semantics:** The REST listener is bound in `main()` before `WhatsAppBridge::start` in Phase 0b. The MCP listener will be bound there in Phase 2. An explicitly enabled listener that fails to bind → exit with fix. Headless (both disabled: REST port 0 and MCP port 0/unset) keeps working (existing behaviour).
+**Bind semantics:** The REST listener was bound in `main()` before `WhatsAppBridge::start` in Phase 0b. The MCP listener was bound there in Phase 2. An explicitly enabled listener that fails to bind exits with fix. Headless (both disabled: REST port 0 and MCP port 0/unset) keeps working.
 
-**Unparseable port value:** Exit with fix: "WHATSRUST_MCP_PORT is not a valid port number. Refusing to start." Rationale: fail-closed; an unparseable value likely means a config error, not "off".
+**Unparseable port value:** Exit with fix: "WHATSRUST_MCP_PORT is not a valid port number (got: <value>). Set it to a port such as 7271, or unset it to turn the MCP listener off. Refusing to start." Rationale: fail-closed; an unparseable value likely means a config error, not "off".
 
 **MCP enabled, REST disabled:** Allowed. The MCP listener can run without the REST listener. Rationale: MCP is stateless and independent. Users may want only the MCP interface.
 
@@ -1022,31 +1028,33 @@ That step updates the golden fixtures on purpose, so every changed byte shows up
 
 ### Phase 2: MCP Listener Skeleton (Opt-In, Routing, Era Detection)
 
-- **Config rules moved from Phase 0b:** implement rules 1, 2, 3, 6, 7 and the MCP half of rule 8 (§13) here, because the MCP listener does not exist before Phase 2. Follow the 0b pattern: a pure validator, called from `main()` before `WhatsAppBridge::start`, and an MCP listener bound in `main()` and handed to `serve_mcp`. Rule 2 and rule 7 compare against the REST settings that 0b already validates.
-- Factor `serve()` into shared infrastructure: `bind_and_listen(bind, port)`, `accept_loop(listener, bridge, is_loopback, token, allowed_origins, allowed_hosts, cancel)`, `read_request_head`, `read_request_body`, `gate_request`, `request_has_api_token`.
-- Add `serve_mcp(bridge, mcp_bind, mcp_port, mcp_token, read_only, cancel)`: new listener on `WHATSRUST_MCP_BIND:WHATSRUST_MCP_PORT` with its own lane semaphores. Routes only `/mcp` (POST only; GET/DELETE/PUT/HEAD/OPTIONS → 405 with JSON-RPC error body + `Allow: POST`; other paths including `/.well-known/*` and `/mcp/` → 404).
-- Spawn both listeners from `main.rs` (REST already bound in Phase 0b; MCP bound here in Phase 2). If neither was enabled (port > 0), exit (no HTTP server). If only one was enabled, continue with that listener.
-- Parse JSON-RPC body. Array (batch) → 400 `-32600` with JSON-RPC error body ("Batching is not supported").
-- Implement `detect_era(headers, body)` (header-primary, per precedence in §5).
-- Stub handlers: `server/discover`, `tools/list`, `tools/call` return "not implemented" (501).
+**Implemented (2026-10-18).**
+
+- Config rules: implemented rules 1, 2, 3, 6, 7, 9 and the MCP half of rule 8 (§13). Pure validator called from `main()` before `WhatsAppBridge::start`, MCP listener bound in `main()` and handed to `serve_mcp`. Rules 2 and 7 compare against the REST settings validated by 0b.
+- Shared infrastructure: reused `read_request_head`, `read_request_body`, `gate_request`, `request_has_api_token`, `respond_and_drain`, `ApiResponse` from the REST listener. No new `bind_and_listen`/`accept_loop` functions in api.rs; Phase 2 implemented its own `accept_loop` and `bind_mcp_listener` in `src/mcp_http.rs`.
+- Added `src/mcp_http.rs`: MCP listener on `WHATSRUST_MCP_BIND:WHATSRUST_MCP_PORT` with 32-connection outer cap. Routes only `/mcp` (POST only; GET/DELETE/PUT/HEAD/OPTIONS → 405 with JSON-RPC error body + `Allow: POST`; other paths including `/.well-known/*` and `/mcp/` → 404).
+- Spawned both listeners from `main.rs` (REST already bound in Phase 0b; MCP bound here). Headless (both off) keeps working. An enabled listener that fails to bind exits with fix.
+- JSON-RPC body parsing: array (batch) → 400 `-32600` with JSON-RPC error body ("Batching is not supported").
+- Implemented `detect_era(headers, body)` (header-primary, per precedence in §5).
+- Implemented real handlers for `initialize` (stateless, no session ID, counter-offer or echo), `ping` → `{}`, `tools/list` (from registry with read-only filter). Implemented `tools/call` unknown-tool check (200 -32602), read-only mode check (200 -32600), then 501 -32603 stub "not implemented yet; use the stdio server" (Phase 3 implements it).
 - Notifications accepted with 202 regardless of era headers; JSON-RPC id present → 202 + no body, no error.
 - Non-loopback MCP bind logs loud warning when `WHATSRUST_MCP_ALLOW_REMOTE` is set (native TLS is a planned follow-up).
-- Manual test: `curl -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer <WHATSRUST_MCP_TOKEN>' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' http://127.0.0.1:7271/mcp` → 501 (or stub response).
+- Test counts: 540 lib + 536 bin (`make test`), 549 lib + 545 bin (`make test-all`), 36 lib / 48 bin clippy (`make lint`).
 
-**Exit criteria:** MCP listener routed, opt-in works (port > 0), separate bind works, era detected, gate/token applied. GET/DELETE/PUT/HEAD/OPTIONS → 405. Wrong path → 404. `/.well-known/*` → 404 (routed before token). Oversize body (Content-Length > 10 MiB) → 413 at head phase. Read-only switch checks access_class.
+**Exit criteria:** MCP listener routed, opt-in works (port > 0), separate bind works, era detected, gate/token applied. GET/DELETE/PUT/HEAD/OPTIONS → 405. Wrong path → 404. `/.well-known/*` → 404 (routed before token). Oversize body (Content-Length > 10 MiB) → 413 at head phase. Read-only switch checks access_class. All criteria met.
 
 ### Phase 3: Legacy Request Handling (Legacy-Only Staging)
 
 - **Implement permit lanes:** 3 read + 4 write/network + 1 large-body (8 total). Lane selection by access_class and body size. Exit criterion before `tools/call` ships.
 - **Golden test:** All 34 tools through stdio-proxy and MCP listener, compare normalised results. Exit criterion before `tools/call` ships.
-- Implement `handle_initialize` (stateless, no session ID, counter-offer version with `2025-11-25` or echo when supported).
-- Implement `handle_tools_list` for legacy (no header validation, no `resultType` / `ttlMs` / `cacheScope` fields).
-- Implement `handle_tools_call` dispatch: if `WHATSRUST_MCP_READ_ONLY` set, check access_class == Read (else `-32600`); find tool, call `validated_args`, spawn task, execute in-process via `dispatch_rest_request`, wait with remaining deadline (arrival + 40s total), map response. Per-route body cap enforcement (from inline prefix test, not route table). Release permit after task ends.
-- Handle `notifications/*` → 202 (accepted unconditionally, no header validation; JSON-RPC id present → 202 + no body, no error).
-- Handle `ping` → 200 + `{"result": {}}`.
-- Unknown method → 200 + `-32601` (legacy clients; avoids "endpoint gone" interpretation).
-- **Modern traffic → 400 `-32022` with `supported: ["2025-11-25", "2025-06-18"]` (legacy-only list for Phase 3 staging).** This triggers the spec's `initialize` fallback in modern clients.
-- Task model: tool execution spawned as task, one absolute deadline from arrival (arrival + 40s), permit held until task ends. Timeout message: "Operation timed out after Ns; it may still complete; check before retrying."
+- Implement `handle_initialize` (stateless, no session ID, counter-offer version with `2025-11-25` or echo when supported). **Done in Phase 2.**
+- Implement `handle_tools_list` for legacy (no header validation, no `resultType` / `ttlMs` / `cacheScope` fields). **Done in Phase 2.**
+- Implement `handle_tools_call` dispatch: if `WHATSRUST_MCP_READ_ONLY` set, check access_class == Read (else `-32600`); find tool, call `validated_args`, spawn task, execute in-process via `dispatch_rest_request`, wait with 40 s deadline from body completion, map response. Per-route body cap enforcement (from inline prefix test, not route table). Release permit after task ends.
+- Handle `notifications/*` → 202 (accepted unconditionally, no header validation; JSON-RPC id present → 202 + no body, no error). **Done in Phase 2.**
+- Handle `ping` → 200 + `{"result": {}}`. **Done in Phase 2.**
+- Unknown method → 200 + `-32601` (legacy clients; avoids "endpoint gone" interpretation). **Done in Phase 2.**
+- **Modern traffic → 400 `-32022` with `supported: ["2025-11-25", "2025-06-18"]` (legacy-only list for Phase 3 staging).** This triggers the spec's `initialize` fallback in modern clients. **Done in Phase 2.**
+- Task model: tool execution spawned as task, 40 s deadline from body completion, permit held until task ends. Timeout message: "Operation timed out after Ns; it may still complete; check before retrying."
 - Integration test: legacy `initialize` + `tools/list` + `tools/call` for `whatsrust_status` and `whatsrust_send`. 2025-06-18 handshake test (MUST echo when supported).
 - **Official SDK or Inspector test:** Run the MCP listener against an official MCP SDK client or the MCP Inspector. Verify legacy handshake, tool list, and tool call work.
 - **Proxy snippet testing:** Test the documented nginx and Caddy snippets against real servers. Verify: TLS, `client_max_body_size` / `max_size`, Host rewrite to 127.0.0.1, POST forwarding. No `limit_req` in the snippet.
@@ -1077,7 +1085,7 @@ That step updates the golden fixtures on purpose, so every changed byte shows up
 - Update `docs/HOWTO.md`:
   - How to enable MCP listener (set `WHATSRUST_MCP_PORT`), configure `WHATSRUST_MCP_TOKEN`, test with curl.
   - Proxy snippet (nginx + Caddy, tested), `WHATSRUST_ALLOWED_HOSTS` setting.
-  - **Minimum client timeout:** Third-party MCP clients should set their timeout ≥50 s to reliably receive the structured timeout response (daemon tool timeout is 40 s, whatsrust's client timeout is 45 s).
+  - **Minimum client timeout:** Third-party MCP clients should set their timeout ≥50 s plus their upload time to reliably receive the structured timeout response (daemon tool timeout is 40 s from body completion; worst-case response time ≈ body time + 40 s).
   - `.env` loading: only in daemon mode; CLI and `whatsrust mcp` read tokens from process environment.
   - Fail2ban example for 401 throttling (replaces `limit_req`).
 - Update `docs/plans/FEATURES.md` (F3 → ✅).

@@ -89,6 +89,7 @@ src/
   api.rs             REST API (59 endpoints) + SSE + CLI HTTP client
   mcp.rs             MCP stdio server (34 tools, JSON-RPC)
   mcp_registry.rs    Shared MCP tool registry (metadata, annotations, validation, REST mapping)
+  mcp_http.rs        Opt-in MCP Streamable HTTP listener (POST /mcp)
   storage.rs         rusqlite store + v8 messages table (FTS5, embed_status) + embeddings (vectors) + schema migrations
   backfill.rs        Historical backfill worker (on-demand fetch, FIFO, pacer)
   polls.rs           Poll crypto (HKDF-SHA256 + AES-256-GCM)

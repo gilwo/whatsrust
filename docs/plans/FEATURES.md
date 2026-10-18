@@ -42,7 +42,7 @@ Stateless separate binary, pure vectorizer; stdio JSON-RPC v1; transport-neutral
 ### F3 — MCP streamable HTTP transport (on top of stdio) 🟡 In progress
 Add MCP Streamable HTTP transport alongside the existing stdio transport — so MCP clients
 can connect over HTTP (remote/multiplexed) in addition to spawn-as-child stdio.
-- **Status:** ADR 0045 accepted 2026-10-16; implementation in progress: Phase 0a, the behaviour-change step, Phase 0b and Phase 1 done (2026-10-17/18); Phases 2–5 open.
+- **Status:** ADR 0045 accepted 2026-10-16; implementation in progress: Phase 0a, the behaviour-change step, Phase 0b, Phase 1 and Phase 2 done (2026-10-17/18); Phases 3–5 open.
 - **Design:** A dedicated `/mcp` listener runs inside the daemon on its own port (`WHATSRUST_MCP_PORT`, off by default), serving only the `/mcp` route. Supports dual-era clients: modern (2026-07-28) and legacy (2025-11-25, 2025-06-18) from one stateless endpoint. In-process dispatch to existing REST handlers via a shared tool registry (`src/mcp_registry.rs`). Separate configuration: `WHATSRUST_MCP_TOKEN` (required, ≥22 characters, must differ from `WHATSRUST_API_TOKEN`), `WHATSRUST_MCP_BIND` (default `127.0.0.1`, independent of `WHATSRUST_BIND`), `WHATSRUST_MCP_ALLOW_REMOTE` (opt-in for non-loopback bind, logs loud warning), and `WHATSRUST_MCP_READ_ONLY` (server-side read-only switch). The stdio proxy keeps its transport but now shares the registry (annotations in `tools/list`, the same argument validation).
 - **References:** Design doc `docs/plans/2026-10-15-mcp-http-transport-design.md`, ADR 0045.
 - [x] Design pass + ADR
@@ -50,7 +50,7 @@ can connect over HTTP (remote/multiplexed) in addition to spawn-as-child stdio.
 - [x] Behaviour-change step after 0a: gate + token before body read, lingering drain, new reason phrases, 415 code, 411 chunked, Expect: 100-continue supported after auth (other expectations 417), read deadlines — done 2026-10-17
 - [x] Phase 0b: Config enforcement (REST rules; MCP-listener rules moved to Phase 2) — done 2026-10-18
 - [x] Phase 1: Shared registry (access_class, integral float normalisation, ADR 0046 amendment) — done 2026-10-18
-- [ ] Phase 2: `/mcp` skeleton (opt-in, separate bind, routing, era detection, read-only switch)
+- [x] Phase 2: `/mcp` skeleton (opt-in, separate bind, routing, era detection, read-only switch) — done 2026-10-18 (initialize, ping, tools/list live; tools/call stubbed)
 - [ ] Phase 3: Legacy request handling (lanes, golden test, official SDK test, proxy snippet tested)
 - [ ] Phase 4: Modern request handling (dual-era staging)
 - [ ] Phase 5: Polish, logging, metrics, documentation
