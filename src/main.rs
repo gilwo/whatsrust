@@ -23,6 +23,11 @@ mod dedup;
 mod embed_drain;
 mod embedder;
 mod instance_lock;
+mod mcp_http;
+// Phase 3 (`tools/call` over HTTP) uses the rest of the registry (`validated_args`, the REST
+// mapping) and removes this allow; until then only the stdio server in the lib crate does.
+#[allow(dead_code)]
+mod mcp_registry;
 mod media_utils;
 mod outbound;
 mod polls;
@@ -455,6 +460,11 @@ async fn async_main() -> Result<()> {
         eprintln!("{msg}");
         std::process::exit(1);
     }
+    // --- Fail-closed MCP listener config validation (F3 Phase 2); MCP port unset or 0 skips every check ---
+    if let Err(msg) = mcp_http::validate_mcp_startup_from_env(api_port) {
+        eprintln!("{msg}");
+        std::process::exit(1);
+    }
     // Single-FIFO backfill worker is the standing design (ADR 0026); multi-worker concurrency is a potential future enhancement.
     if backfill_max_concurrent > 1 {
         warn!(
@@ -521,6 +531,20 @@ async fn async_main() -> Result<()> {
         None
     };
 
+    // The MCP listener binds the same way, and an enabled one that cannot bind also exits.
+    let mcp_port = mcp_http::mcp_port_from_env();
+    let mcp_listener = if mcp_port > 0 {
+        match mcp_http::bind_mcp_listener(&mcp_http::mcp_bind_host(), mcp_port).await {
+            Ok(listener) => Some(listener),
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     let bridge = Arc::new(WhatsAppBridge::start(config, inbound_tx, cancel.clone()));
 
     info!("bridge started, state: {:?}", bridge.state());
@@ -532,6 +556,14 @@ async fn async_main() -> Result<()> {
         let api_cancel = cancel.clone();
         tokio::spawn(async move {
             api::serve_with_listener(api_bridge, listener, api_cancel).await;
+        });
+    }
+
+    // Spawn the MCP server on the listener bound above (it does not need the bridge yet)
+    if let Some(listener) = mcp_listener {
+        let mcp_cancel = cancel.clone();
+        tokio::spawn(async move {
+            mcp_http::serve_mcp(listener, mcp_cancel).await;
         });
     }
 
