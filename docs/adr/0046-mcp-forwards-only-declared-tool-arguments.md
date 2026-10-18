@@ -3,6 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-10-15
 **Revised:** 2026-10-15 (drop → reject)
+**Amended:** 2026-10-18 (F3 Phase 1)
 
 ## Context
 
@@ -88,3 +89,13 @@ filesystem paths; the `whatsrust_contact` tool is now usable.
 must apply the same validation or introduce its own guards; an agent written against an older schema
 that declares a since-removed parameter (like `schedule_at` on `whatsrust_send`) will fail the call
 until it's updated (but this is correct behaviour: the parameter never worked).
+
+## Amendment (2026-10-18)
+
+Validation moved to `src/mcp_registry.rs` (shared tool registry; `tool_def` replaced by `McpToolMeta::new`). The stdio server and the planned HTTP listener use the same registry so they cannot drift apart.
+
+`validated_args(name, args)` checks in order: (1) unknown tool (including empty name) and non-object arguments are now JSON-RPC `-32602 Invalid params` (supersedes the "Unknown tool → Ok({})" bullet and the `tool_error` wording for those two cases); (2) undeclared keys are still reported alone with the unchanged message; (3) a declared optional key set to `null` is dropped (treated as absent, not forwarded); (4) every remaining value must match its property's top-level `type` (string, boolean, array, object, number, integer); `integer` must fit i64 (integral floats inside the i64 range are normalised, e.g. `5.0` → `5`; fractional floats, u64 above i64::MAX and out-of-range floats are rejected); (5) every `required` key must be present and non-null. Type and required problems are reported together in one message, sorted by field: `"{tool}: invalid argument(s): {field} must be a string; {field} is required. Nothing was sent."` (integer wording: "must be an integer (64-bit)").
+
+Nested values (array items, nested objects) are not checked at the validation layer; REST handlers validate them.
+
+**Why:** the MCP spec treats an unknown tool as a protocol error (the client calls a tool not in `tools/list`); type errors are caught and reported before anything is sent; LLM clients often send `null` for unused optional parameters.
