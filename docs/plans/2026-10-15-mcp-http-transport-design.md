@@ -52,9 +52,9 @@ The daemon already has a hand-rolled HTTP server (`src/api.rs`) with 59 REST end
 - **Process model:** `whatsrust mcp` spawns a separate process from the daemon.
 - **File:** `src/mcp.rs:run_mcp_server()` (stdio JSON-RPC loop, lines 16–49).
 - **Protocol version:** Advertises `"2024-11-05"` (line 88), uses `initialize` handshake.
-- **Tool registry:** `tool_definitions()` (lines 108–266) returns 34 tool definitions as `Vec<Value>`.
-- **Tool dispatch:** `call_tool()` (lines 331–412) maps tool name + args to REST method, path, and body; executes via blocking `http_get()`/`http_post()` (lines 414–470) over TCP to the daemon.
-- **Argument filtering:** `validated_args()` (line 309, ADR 0046) rejects undeclared keys at the choke point with `isError: true`, so `path` (local-file read) is unreachable via MCP.
+- **Tool registry (since Phase 1):** `REGISTRY` in `src/mcp_registry.rs` holds the 34 tools (schema, annotations, access class, REST mapping); `tools/list` returns `REGISTRY.tool_definitions()`.
+- **Tool dispatch:** `call_tool()` in `src/mcp.rs` validates the call, builds the request from the tool's `RestMapping`, and executes it via blocking `http_get()`/`http_post()` over TCP to the daemon.
+- **Argument validation:** `validated_args()` (ADR 0046, amended 2026-10-18) rejects unknown tools and undeclared, mistyped or missing arguments before any request, so `path` (local-file read) is unreachable via MCP.
 - **No bridge access:** The stdio server runs without a `WhatsAppBridge` instance; it's a stateless proxy.
 
 ### REST API (In-Daemon, Direct Bridge Access)
@@ -167,39 +167,49 @@ pub struct ToolAnnotations {
     pub open_world_hint: bool,
 }
 
+impl ToolAnnotations {
+    pub fn to_json(self) -> Value {
+        if self.read_only_hint {
+            json!({ "readOnlyHint": true, "openWorldHint": self.open_world_hint })
+        } else {
+            json!({
+                "readOnlyHint": false,
+                "destructiveHint": self.destructive_hint,
+                "idempotentHint": self.idempotent_hint,
+                "openWorldHint": self.open_world_hint,
+            })
+        }
+    }
+}
+
 pub struct RestMapping {
     pub method: &'static str,
-    pub path: fn(&serde_json::Value) -> String,  // builds path from args (may include query)
-    pub query: fn(&serde_json::Value) -> Vec<(String, String)>,  // query pairs
-    pub body: fn(&serde_json::Value) -> Option<serde_json::Value>,  // body JSON
+    pub path: &'static str,
+    pub query: fn(&Value) -> Vec<(String, String)>,
+    pub body: fn(Value) -> Option<Value>,
 }
 
 pub struct McpToolMeta {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: Value,
     pub annotations: ToolAnnotations,
     pub access_class: AccessClass,
     pub rest_mapping: RestMapping,
 }
 
 pub struct McpRegistry {
-    tools: Vec<McpToolMeta>,  // 34 tools
+    tools: Vec<McpToolMeta>,
 }
 
 impl McpRegistry {
-    pub fn tool_definitions(&self) -> Vec<serde_json::Value> {
+    pub fn tool_definitions(&self) -> Vec<Value> {
         self.tools.iter().map(|t| {
             json!({
                 "name": t.name,
                 "description": t.description,
                 "inputSchema": t.input_schema,
-                "annotations": {
-                    "readOnlyHint": t.annotations.read_only_hint,
-                    "destructiveHint": t.annotations.destructive_hint,
-                    "idempotentHint": t.annotations.idempotent_hint,
-                    "openWorldHint": t.annotations.open_world_hint,
-                }
+                "annotations": t.annotations.to_json(),
             })
         }).collect()
     }
@@ -208,11 +218,13 @@ impl McpRegistry {
         self.tools.iter().find(|t| t.name == name)
     }
 }
+
+pub static REGISTRY: LazyLock<McpRegistry> = LazyLock::new(McpRegistry::build);
 ```
 
-Populated at compile time with all 34 tools. Both `src/mcp.rs` (stdio) and the MCP listener use `REGISTRY.tool_definitions()` to list tools. The mapping is stored in the tool entry, not in a parallel match that can drift. A test verifies every tool has a mapping. The registry stores `inputSchema` with `"additionalProperties": false` added to every schema (ADR 0046).
+Built once on first use (`LazyLock`) with all 34 tools. Both `src/mcp.rs` (stdio) and the MCP listener use `REGISTRY.tool_definitions()` to list tools. The mapping is stored in the tool entry, not in a parallel match that can drift. A test verifies every tool has a mapping. The registry stores `inputSchema` with `"additionalProperties": false` added to every schema (ADR 0046).
 
-**Annotations:** The registry includes `ToolAnnotations` per MCP 2026-07-28 schema and an `access_class` field (`Read` / `Write`) for server-side read-only switch enforcement. **Classification rule:** `destructiveHint: true` for every tool that changes remote (WhatsApp) state. `purge_embeddings` deletes local data, so `destructiveHint: true` and `openWorldHint: false`. `fetch_cancel` only updates the local store (`handle_history_fetch_cancel`), so `destructiveHint: false`. `fetch_history` is network-touching (ban-risk pacing), so `destructiveHint: false` (local job creation) but `openWorldHint: true` (triggers network fetch). Read-only tools (status, groups, group_info, history, search, fetch_status) have `readOnlyHint: true`. Full table in §9.
+**Annotations:** The registry includes `ToolAnnotations` per MCP 2026-07-28 schema and an `access_class` field (`Read` / `Write`) for server-side read-only switch enforcement. **Classification rule:** `destructiveHint: true` for every tool that changes remote (WhatsApp) state. `purge_embeddings` deletes local data (vectors), so `destructiveHint: true` and `openWorldHint: false`. `fetch_cancel` only updates the local store (`handle_history_fetch_cancel`), so `destructiveHint: false`. `fetch_history` creates a local job that then fetches from WhatsApp (ban-risk pacing), so `destructiveHint: false` but `openWorldHint: true`. Read-only tools (status, groups, group_info, history, search, fetch_status) have `readOnlyHint: true`. Full table in §9. For read-only tools the "n/a" hints (`destructiveHint`, `idempotentHint`) are omitted from the JSON.
 
 Sharing the registry changes stdio `tools/list` output (annotations are now included). This is expected and acceptable.
 
@@ -263,9 +275,9 @@ The tool entry's `rest_mapping` builds this from MCP args. For example, `whatsru
 ```rust
 RestMapping {
     method: "POST",
-    path: |_| "/api/send".to_string(),
-    query: |_| vec![("sync".to_string(), "true".to_string())],
-    body: |args| Some(args.clone()),
+    path: "/api/send",
+    query: sync_query,
+    body: args_as_body,
 }
 ```
 
@@ -274,20 +286,20 @@ For `whatsrust_history`:
 ```rust
 RestMapping {
     method: "GET",
-    path: |_| "/api/history".to_string(),
-    query: |args| {
-        let jid = args.get("jid").and_then(|v| v.as_str()).unwrap_or("");
-        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
-        let mut q = vec![
-            ("jid".to_string(), jid.to_string()),
-            ("limit".to_string(), limit.to_string()),
-        ];
-        if let Some(b) = args.get("before").and_then(|v| v.as_i64()) {
-            q.push(("before".to_string(), b.to_string()));
-        }
-        q
-    },
-    body: |_| None,
+    path: "/api/history",
+    query: history_query,
+    body: no_body,
+}
+
+fn history_query(args: &Value) -> Vec<(String, String)> {
+    let mut query = vec![
+        ("jid".to_string(), str_arg(args, "jid").to_string()),
+        ("limit".to_string(), i64_arg(args, "limit").unwrap_or(20).to_string()),
+    ];
+    if let Some(before) = i64_arg(args, "before") {
+        query.push(("before".to_string(), before.to_string()));
+    }
+    query
 }
 ```
 
@@ -301,31 +313,33 @@ The tool→REST mapping is the only intentional duplication (carried in the regi
 
 ### Argument Validation
 
-`validated_args()` (line 309, ADR 0046 revised) runs at the shared choke point before the mapping is called. It validates that:
-1. `arguments` is an object (or absent/null, which becomes `{}`).
-2. All top-level keys are declared in the tool's `inputSchema.properties`.
-3. Each provided top-level value matches its schema `type` (string / integer / number / boolean / array / object). **Integer rule:** `"type": "integer"` accepts `is_i64() || is_u64() || (is_f64() && fract == 0.0)`. `validated_args` normalises integral floats: `5.0` becomes `5` in the arguments it returns. Non-integral floats → `isError` naming the field. serde_json's `as_i64` returns `None` for floats (~/.cargo/registry/.../serde_json-1.0.151/src/number.rs:143, `N::Float(_) => None`), so normalisation is explicit.
-4. All `required` fields are present.
+`validated_args()` (ADR 0046 revised) runs at the shared choke point before the mapping is called. It validates in order:
+1. Unknown tool (including empty name) or non-object `arguments` → `-32602 Invalid params` (absent/null arguments become `{}`).
+2. Undeclared top-level keys → `isError: true` listing unknown and allowed keys. Reported alone.
+3. A declared optional key set to `null` is dropped (treated as absent, not forwarded).
+4. Each remaining value matches its schema `type` (string, boolean, array, object, number, integer). **Integer rule:** must fit i64. Integral floats inside the i64 range are normalised (`5.0` → `5`); fractional floats, u64 above i64::MAX and out-of-range floats are rejected.
+5. All `required` fields are present and non-null.
 
-Validation returns:
-- Non-object `arguments`: `-32602 Invalid params`.
-- Unknown tool: `-32602 Unknown tool`.
-- Undeclared keys: `isError: true` with message listing the unknown key(s) and the allowed keys.
-- Wrong-type value (including non-integral floats for integer fields) or missing required field: `isError: true` naming the field and the expected type or "required".
+Type and required problems are reported together in one message, sorted by field: `"{tool}: invalid argument(s): {field} must be a string; {field} is required. Nothing was sent."` (integer wording: "must be an integer (64-bit)").
 
-This is top-level validation only (no deep schema traversal, no `minLength`/`pattern`/`enum`). Complex validation (e.g. jid format, base64 decoding, business logic) happens in REST handlers. Handler 4xx/5xx responses map to `isError: true`.
+This is top-level validation only (no deep schema traversal, no `minLength`/`pattern`/`enum`). Nested values (array items, nested objects) are not inspected. Complex validation (jid format, base64 decoding, business logic) happens in REST handlers. Handler 4xx/5xx responses map to `isError: true`.
 
-Mappings apply defaults only to absent keys, never to present-but-wrong-typed values. For example, `whatsrust_history`:
+Mappings apply defaults only to absent keys. For example, `history_query`:
 ```rust
-query: |args| {
-    let jid = args.get("jid").and_then(|v| v.as_str()).unwrap_or("");  // absent → ""
-    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);  // absent → 20
-    // validated_args rejected wrong-type or normalised integral floats, so as_i64 succeeds.
-    vec![("jid".to_string(), jid.to_string()), ("limit".to_string(), limit.to_string())]
+fn history_query(args: &Value) -> Vec<(String, String)> {
+    let mut query = vec![
+        ("jid".to_string(), str_arg(args, "jid").to_string()),
+        ("limit".to_string(), i64_arg(args, "limit").unwrap_or(20).to_string()),
+    ];
+    // validated_args already checked type and required, so unwrap_or applies to absence only.
+    if let Some(before) = i64_arg(args, "before") {
+        query.push(("before".to_string(), before.to_string()));
+    }
+    query
 }
 ```
 
-**Stdio change in Phase 1:** Today stdio returns `isError: true` for non-object `arguments` and unknown tool (via `tool_error`). Phase 1 changes stdio to return `-32602` for both, matching the spec and HTTP behaviour. This is an ADR 0046 amendment (listed as a Phase 1 task). The integer normalisation and type checks apply to both transports.
+**Stdio change in Phase 1:** Stdio now returns `-32602` for unknown tool and non-object arguments (previously `isError: true`), matching the spec. The integer i64 rule, null-handling, type checks and combined message are implemented.
 
 Error classification:
 - Protocol errors (`-32602`): non-object `arguments`, unknown tool.
@@ -759,7 +773,7 @@ Per MCP spec (2026-07-28 schema), the `Tool` type includes an `annotations` fiel
 
 Annotations are **informational only** (hints). Per spec, "clients MUST consider tool annotations to be untrusted unless they come from trusted servers." Any enforcement (e.g. filtering by profile) is **server-side**, deferred to F5.
 
-**Annotation rule:** `destructiveHint: true` for every tool that changes remote state (sends messages, changes WhatsApp state, posts statuses). `destructiveHint: false` for local-state-only tools (`fetch_history`, `purge_embeddings`). Read-only tools have `readOnlyHint: true` (and `destructiveHint` / `idempotentHint` are n/a).
+**Annotation rule:** `destructiveHint: true` for every tool that changes remote state (sends messages, changes WhatsApp state, posts statuses). `fetch_history` (creates a local job that fetches from WhatsApp) and `fetch_cancel` (local store only) are not destructive. `purge_embeddings` is destructive (deletes local vectors). Read-only tools have `readOnlyHint: true`; for read-only tools the "n/a" hints are omitted from the JSON.
 
 ### Annotation Table (34 Tools)
 
@@ -990,18 +1004,21 @@ That step updates the golden fixtures on purpose, so every changed byte shows up
 
 ### Phase 1: Shared Registry
 
-- Create `src/mcp_registry.rs` with `McpRegistry`, `McpToolMeta`, `AccessClass`, `RestMapping`.
-- Populate 34 tool entries (name, schema with `"additionalProperties": false`, annotations, access_class, rest_mapping).
-- `whatsrust_send` schema already lacks `link_preview` and `schedule_at` (mcp.rs:111-116, test at :751).
-- Update `src/mcp.rs` to use `REGISTRY.tool_definitions()` and tool entry mappings. `validated_args` (ADR 0046 revised) now:
-  - Checks top-level `type` and `required` per schema. Integer rule: integral floats normalised (`5.0` → `5` in arguments it returns); non-integral floats → `isError` naming field.
-  - Returns `-32602` for non-object `arguments` and unknown tool (stdio changes from `isError: true` to `-32602`, matching spec and HTTP). **This is an ADR 0046 amendment and a test change at mcp.rs:644**, because a test currently asserts value types are unchecked. Amendment states: stdio `-32602` for non-object args and unknown tool (matching HTTP); top-level type and required checks added; integral floats normalised. Document both as Phase 1 tasks.
+**Implemented (2026-10-18).**
+
+- Created `src/mcp_registry.rs` with `McpRegistry`, `McpToolMeta`, `AccessClass`, `RestMapping`.
+- Populated 34 tool entries (name, schema with `"additionalProperties": false`, annotations, access_class, rest_mapping).
+- `whatsrust_send` schema already lacked `link_preview` and `schedule_at`.
+- Updated `src/mcp.rs` to use `REGISTRY.tool_definitions()` and tool entry mappings. `validated_args` (ADR 0046 revised) now:
+  - Checks top-level `type` and `required` per schema. Integer rule: must fit i64; integral floats inside the i64 range normalised (`5.0` → `5`); fractional floats, u64 above i64::MAX and out-of-range floats rejected.
+  - Returns `-32602` for non-object `arguments` and unknown tool (stdio changed from `isError: true` to `-32602`, matching spec and HTTP). An ADR 0046 amendment documents: stdio `-32602` for non-object args and unknown tool; top-level type and required checks added; optional null dropped; integer i64 rule and combined message. Test updated.
   - Returns `isError: true` for undeclared keys, wrong-type values (including non-integral floats), missing required fields.
+- Fixed `whatsrust_fetch_status` description (clarified active-only default).
 - Mappings apply defaults only to absent keys (never to present-but-wrong-typed values). Move ownership instead of cloning where possible.
 - Test: registry construction, tool lookup, annotations serialization, access_class, `validated_args` validation (non-object → `-32602`, unknown tool → `-32602`, undeclared keys → `isError`, wrong-type → `isError`, missing required → `isError`, integral floats normalised, non-integral floats → `isError`).
 - Stdio regression test: call tools, assert annotations included, validation errors have `-32602` codes (not `isError`), undeclared keys rejected, wrong-type values rejected, integral floats normalised.
 
-**Exit criteria:** Stdio uses the registry. Annotations and access_class included. `validated_args` checks `type` and `required`, normalises integral floats. Non-object arguments and unknown tool return `-32602`. Undeclared keys / wrong-type / missing required return `isError: true`. Stdio regression passes. ADR 0046 amended; mcp.rs:644 test changed.
+**Exit criteria:** Stdio uses the registry. Annotations and access_class included. `validated_args` checks `type` and `required`, normalises integral floats. Non-object arguments and unknown tool return `-32602`. Undeclared keys / wrong-type / missing required return `isError: true`. Stdio regression passes. ADR 0046 amended; validation tests updated.
 
 ### Phase 2: MCP Listener Skeleton (Opt-In, Routing, Era Detection)
 

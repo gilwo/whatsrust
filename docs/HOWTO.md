@@ -346,7 +346,11 @@ Cursor, etc.) over JSON-RPC/stdio.
    `whatsrust_purge_embeddings`, etc.) — see `README.md` § "MCP server
    for AI agents" for the full narrative list.
 4. **MCP-specific behaviour (ADR 0046):** undeclared arguments are rejected
-   (isError naming them); media tools accept only base64 `data` — the local-file
+   (isError naming them, nothing sent); wrong-type values and missing required
+   fields are rejected (isError naming the fields, nothing sent); unknown tools
+   and non-object arguments return JSON-RPC `-32602`; every tool carries MCP
+   annotations (`readOnlyHint` and `openWorldHint`; write tools also
+   `destructiveHint` and `idempotentHint`). Media tools accept only base64 `data` — the local-file
    `path` mode (available in the REST API for CLI use) is unreachable via MCP.
    `whatsrust_contact` takes `phone` (international format, digits only), not a
    pre-built vCard. `whatsrust_send` via MCP has no link preview or scheduling —
@@ -609,9 +613,9 @@ do, via the Makefile.
 
 **Steps:**
 ```bash
-make test        # cargo test — default suite (441 lib + 437 bin tests, verified 2026-10-18)
+make test        # cargo test — default suite (470 lib + 437 bin tests, verified 2026-10-18)
 make test-all     # cargo test --features fake-embedder — also runs the
-                   # fake-embedder sidecar round-trip tests (450 lib + 446 bin;
+                   # fake-embedder sidecar round-trip tests (479 lib + 446 bin;
                    # 9 extra tests per target vs `make test`, gated behind the
                    # non-default `fake-embedder` Cargo feature so a plain
                    # `cargo build`/`cargo test` never touches that sidecar
@@ -638,10 +642,10 @@ make fmt          # cargo fmt — reformats the codebase in place. Not run as
 **Verification (outputs captured while writing this doc):**
 - `make help` — lists all targets with one-line descriptions, default target.
 - `make build` — `Finished \`dev\` profile [unoptimized + debuginfo] target(s)`, exit 0.
-- `make lint` — `whatsrust (bin "whatsrust") generated 38 warnings`, exit 0 (non-fatal).
-- `make test` — `test result: ok. 441 passed; 0 failed ...` (lib) and
+- `make lint` — `whatsrust (bin "whatsrust") generated 48 warnings`, exit 0 (non-fatal).
+- `make test` — `test result: ok. 470 passed; 0 failed ...` (lib) and
   `test result: ok. 437 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-18).
-- `make test-all` — `test result: ok. 450 passed; 0 failed ...` (lib, includes
+- `make test-all` — `test result: ok. 479 passed; 0 failed ...` (lib, includes
   the 9 extra fake-embedder-gated tests per target) and `test result: ok. 446 passed; 0 failed ...` (bin), exit 0 (verified 2026-10-18).
 
 `CONTRIBUTING.md` asks contributors to run `cargo test` and `cargo clippy`

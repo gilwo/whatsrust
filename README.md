@@ -87,7 +87,8 @@ src/
   media_utils.rs     Media enrichment: image dims + thumbnails, audio waveform
   bridge_events.rs   Broadcast event bus (tokio::sync::broadcast)
   api.rs             REST API (59 endpoints) + SSE + CLI HTTP client
-  mcp.rs             MCP server (34 tools, JSON-RPC over stdio)
+  mcp.rs             MCP stdio server (34 tools, JSON-RPC)
+  mcp_registry.rs    Shared MCP tool registry (metadata, annotations, validation, REST mapping)
   storage.rs         rusqlite store + v8 messages table (FTS5, embed_status) + embeddings (vectors) + schema migrations
   backfill.rs        Historical backfill worker (on-demand fetch, FIFO, pacer)
   polls.rs           Poll crypto (HKDF-SHA256 + AES-256-GCM)
@@ -286,7 +287,7 @@ Run `whatsrust mcp` to start a Model Context Protocol server with 34 tools over 
 
 Works out of the box with Claude Code -- just add it to your MCP config and your AI agent gets full WhatsApp access.
 
-**MCP-specific behaviour (ADR 0046):** undeclared arguments are rejected (isError naming them); media tools (`whatsrust_image`, `whatsrust_status_image`, `whatsrust_status_video`) accept only base64 `data` — the local-file `path` mode (available in the REST API for CLI use) is unreachable via MCP. The `whatsrust_contact` tool takes `phone` (international format, digits only, e.g. `972500000000`), not a pre-built vCard. `whatsrust_send` via MCP has no link preview or scheduling — use REST async `/api/send` for those.
+**MCP-specific behaviour (ADR 0046):** undeclared arguments are rejected (isError naming them, nothing sent); wrong-type values and missing required fields are rejected (isError naming the fields, nothing sent); unknown tools and non-object arguments return JSON-RPC `-32602`; every tool carries MCP annotations (`readOnlyHint` and `openWorldHint`; write tools also `destructiveHint` and `idempotentHint`). Media tools (`whatsrust_image`, `whatsrust_status_image`, `whatsrust_status_video`) accept only base64 `data` — the local-file `path` mode (available in the REST API for CLI use) is unreachable via MCP. The `whatsrust_contact` tool takes `phone` (international format, digits only, e.g. `972500000000`), not a pre-built vCard. `whatsrust_send` via MCP has no link preview or scheduling — use REST async `/api/send` for those.
 
 ---
 
