@@ -782,9 +782,9 @@ do, via the Makefile.
 
 **Steps:**
 ```bash
-make test        # cargo test — default suite (616 lib + 616 bin tests, 3 ignored per target, verified 2026-10-19)
+make test        # cargo test — default suite (620 lib + 625 bin tests, 3 ignored per target, verified 2026-10-19)
 make test-all     # cargo test --features fake-embedder — also runs the
-                   # fake-embedder sidecar round-trip tests (625 lib + 625 bin;
+                   # fake-embedder sidecar round-trip tests (629 lib + 634 bin;
                    # 9 extra tests per target vs `make test`, gated behind the
                    # non-default `fake-embedder` Cargo feature so a plain
                    # `cargo build`/`cargo test` never touches that sidecar
@@ -812,10 +812,10 @@ make fmt          # cargo fmt — reformats the codebase in place. Not run as
 - `make help` — lists all targets with one-line descriptions, default target.
 - `make build` — `Finished \`dev\` profile [unoptimized + debuginfo] target(s)`, exit 0.
 - `make lint` — `whatsrust (bin "whatsrust") generated 48 warnings`, exit 0 (non-fatal).
-- `make test` — `test result: ok. 616 passed; 0 failed; 3 ignored ...` (lib) and
-  `test result: ok. 616 passed; 0 failed; 3 ignored ...` (bin), exit 0 (verified 2026-10-19).
-- `make test-all` — `test result: ok. 625 passed; 0 failed; 3 ignored ...` (lib, includes
-  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 625 passed; 0 failed; 3 ignored ...` (bin), exit 0 (verified 2026-10-19).
+- `make test` — `test result: ok. 620 passed; 0 failed; 3 ignored ...` (lib) and
+  `test result: ok. 625 passed; 0 failed; 3 ignored ...` (bin), exit 0 (verified 2026-10-19).
+- `make test-all` — `test result: ok. 629 passed; 0 failed; 3 ignored ...` (lib, includes
+  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 634 passed; 0 failed; 3 ignored ...` (bin), exit 0 (verified 2026-10-19).
 
 `CONTRIBUTING.md` asks contributors to run `cargo test` and `cargo clippy`
 before submitting a PR — `make test` and `make lint` are equivalent to that,
