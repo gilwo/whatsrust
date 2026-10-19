@@ -220,13 +220,17 @@ directory; there is no Rust change.
 
 ```bash
 scripts/run-profile.sh new dev            # create runs/dev/ (logs/ + .env); --semantic enables the embedder sidecar
-scripts/run-profile.sh list               # profiles with REST/MCP port, DB present, instance lock held
-scripts/run-profile.sh daemon dev         # build once (--release for the release binary), run in runs/dev/
+scripts/run-profile.sh daemon dev         # build once (--release for the release binary), run in runs/dev/ in tmux session whatsrust-dev
+scripts/run-profile.sh daemon dev --detach  # same, but leave it running in the background (prints how to attach)
+scripts/run-profile.sh attach dev         # attach to the session (Ctrl-b d detaches; the daemon keeps running)
+scripts/run-profile.sh list               # the profiles whose daemon runs in a tmux session
+scripts/run-profile.sh list --all         # every profile: REST/MCP port, DB present, instance lock held, tmux running
 scripts/run-profile.sh cli dev status     # `whatsrust status` against dev's daemon
 scripts/run-profile.sh mcp dev            # `whatsrust mcp` (stdio) against dev's daemon, for an MCP client config
 scripts/run-profile.sh env dev            # port/bind and whether a token is set (the token is never shown)
 make new-profile P=dev [SEMANTIC=1]       # same as `new`
 make run-profile P=dev [RELEASE=1]        # same as `daemon`
+make attach-profile P=dev                 # same as `attach`
 ```
 
 - **Ports:** the first profile gets REST `9270` and MCP `9271`, then `9280/9281`, `9290/9291`, … (step 10).
@@ -240,15 +244,44 @@ make run-profile P=dev [RELEASE=1]        # same as `daemon`
   (§5a) is off: to enable it, uncomment `WHATSRUST_MCP_PORT` and `WHATSRUST_MCP_TOKEN` in the profile's
   `.env` and paste a token you generate with `openssl rand -base64 32`. The script never generates or prints
   a token. Profile names use letters, digits, `.`, `_`, `-`.
-- **Logs:** `daemon` prints to the terminal with colours and writes the same output, without colour codes, to
-  `runs/<profile>/logs/<UTC-YYYYmmdd-HHMMSS>.log` (mode 600; treat it as private). The REPL on stdin works as
-  usual and Ctrl+C is the normal graceful stop.
-- **Environment:** variables exported in your shell beat the profile's `.env` (§2); `daemon` names any such
-  variable (never its value) when it starts. `cli` and `mcp` read only `WHATSRUST_PORT`, `WHATSRUST_BIND`
-  and `WHATSRUST_API_TOKEN` from the profile's `.env`. For an MCP client config, use
+- **tmux:** when `tmux` (3.2 or newer) is installed, `daemon` builds in your terminal (build errors show
+  there), then starts the daemon in a tmux session named `whatsrust-<profile>` whose start directory is
+  `runs/<profile>/`. Run from a terminal it attaches right away (it switches your client when you are already
+  inside tmux); with `--detach`, or without a terminal (a script, CI), it leaves the session running and prints
+  `attach with: scripts/run-profile.sh attach <profile>`. Either way it prints the session name and the log path.
+  Detach with **Ctrl-b d**: the daemon keeps running, so a closed terminal no longer stops it. `attach <profile>`
+  (or `make attach-profile P=<profile>`) reattaches; with no such session it says how to start one. A second
+  `daemon <profile>` while the session exists is refused. A `.` in a profile name becomes `_` in the session name
+  (tmux does that). The session is created at the size of your terminal so the pairing QR code is not cut off.
+- **When the daemon stops inside tmux** (it exits, Ctrl+C, SIGTERM, SIGHUP, a crash), the pane does not vanish. It
+  prints `daemon ended: exit code <n>` (for codes above 128 also the signal, e.g. `exit code 143 (SIGTERM)`), the
+  log path, and `You are in tmux session whatsrust-<profile>: press Enter to close it, or Ctrl-b d to detach.`
+  Press Enter to close the session. If you kill the whole session (`tmux kill-session`) no note is possible.
+- **Without tmux** (not on `PATH`, or `daemon <profile> --foreground`) `daemon` runs in the current terminal as
+  before and ends with `daemon exited with code <n> (log: ...)`. When tmux is not installed it first prints
+  `note: tmux not found; running in the foreground (install: brew install tmux)`.
+- **Logs:** `daemon` prints to the terminal (or the tmux pane) with colours and writes the same output, without
+  colour codes, to `runs/<profile>/logs/<UTC-YYYYmmdd-HHMMSS>.log` (mode 600; treat it as private). The REPL on
+  stdin works as usual (in tmux, type into the attached pane) and Ctrl+C is the normal graceful stop.
+- **Environment:** variables exported in your shell beat the profile's `.env` (§2); when `daemon` runs in your
+  terminal it names any such variable (never its value) when it starts. **A tmux session does not get your
+  shell's environment:** only `WHATSRUST_ENV_FILE` (the profile's `.env`) is passed in, and no other variable,
+  so tokens never appear in a process argument list. Exported `WHATSRUST_*`, `WHATSAPP_*`, `HEALTH_PORT`,
+  `BACKUP_DIR` and `RUST_LOG` are therefore **not applied** inside the session (the warning at start says so):
+  put those settings in the profile's `.env`. (If an already running tmux server carries such variables in its
+  own environment, the pane warns that they override the `.env`.) `cli` and `mcp` read only `WHATSRUST_PORT`,
+  `WHATSRUST_BIND` and `WHATSRUST_API_TOKEN` from the profile's `.env`. For an MCP client config, use
   `scripts/run-profile.sh` as the command and `["mcp", "<profile>"]` as the arguments.
-- **`list` lock column:** `HELD` means a process has `runs/<profile>/whatsapp.db.instance.lock` open (checked
-  with `lsof`; `unknown` if `lsof` is missing). The lock file stays on disk after a stop; that is normal.
+- **`list`:** by default shows only the profiles whose daemon runs in a `whatsrust-<profile>` tmux session
+  (SESSION, PROFILE, REST, MCP, STARTED in local time, ATTACHED yes/no); other tmux sessions are ignored. With
+  none it prints `no run-profile daemons in tmux (scripts/run-profile.sh list --all shows every profile)`.
+  `list --all` shows every profile with REST, MCP, DB, LOCK and a TMUX column (`running` when its session
+  exists, else `-`). Without tmux, `list` prints a note and shows the `--all` view. A session whose daemon has
+  already stopped but is still waiting for Enter counts as running here.
+- **`list --all` lock column:** `HELD` means a process has `runs/<profile>/whatsapp.db.instance.lock` open
+  (checked with `lsof`; `unknown` if `lsof` is missing). The lock file stays on disk after a stop; that is normal.
+- **Testing/advanced:** `RUN_PROFILE_TMUX_SOCKET=<name>` makes every tmux call of the script use the private
+  server `tmux -L <name>` instead of your default one (used by the script's own checks).
 
 **Caveat:** never run two copies of the same paired DB at once. Each profile is its own linked device, so
 pair a new one (scan its QR code) or move (not copy) an existing DB into the profile folder. Pair one profile

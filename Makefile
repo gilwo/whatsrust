@@ -5,7 +5,7 @@
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release release-all dist run embedder-build run-semantic new-profile run-profile embedder-smoke calibrate test test-all lint lint-strict fmt fmt-check clean py-sidecar-setup py-sidecar-smoke run-semantic-py
+.PHONY: help build release release-all dist run embedder-build run-semantic new-profile run-profile attach-profile embedder-smoke calibrate test test-all lint lint-strict fmt fmt-check clean py-sidecar-setup py-sidecar-smoke run-semantic-py
 
 # Model for the Rust embedder sidecar: bge-m3 (default, stronger multilingual/cross-language
 # recall) or minilm (lighter, faster). Override on the command line, e.g.:
@@ -81,9 +81,13 @@ new-profile: ## Create runs/<profile>/ with logs/ and a .env (make new-profile P
 	@test -n "$$P" || { echo "Error: set P=<profile>, e.g. make new-profile P=dev" >&2; exit 1; }
 	scripts/run-profile.sh new "$$P" $(if $(SEMANTIC),--semantic)
 
-run-profile: ## Run the daemon with state in runs/<profile>/ (make run-profile P=<name> [RELEASE=1])
+run-profile: ## Run the daemon with state in runs/<profile>/, in a tmux session when tmux exists (make run-profile P=<name> [RELEASE=1])
 	@test -n "$$P" || { echo "Error: set P=<profile>, e.g. make run-profile P=dev (create it first: make new-profile P=dev)" >&2; exit 1; }
 	scripts/run-profile.sh daemon "$$P" $(if $(RELEASE),--release)
+
+attach-profile: ## Attach to the tmux session of a profile's daemon (make attach-profile P=<name>)
+	@test -n "$$P" || { echo "Error: set P=<profile>, e.g. make attach-profile P=dev" >&2; exit 1; }
+	scripts/run-profile.sh attach "$$P"
 
 test: ## Run the default test suite (cargo test)
 	cargo test
