@@ -822,6 +822,9 @@ async fn handle_status(bridge: &WhatsAppBridge) -> ApiResponse {
         // null when the device hasn't completed pairing yet. See
         // bridge::resolve_device_name / BridgeConfig::device_name.
         "device_name": device_name,
+        // Additive (F3 Phase 5): the MCP HTTP listener's counters and lane gauges, or null
+        // when the daemon's MCP listener is off. See mcp_http::status_snapshot.
+        "mcp_http": crate::mcp_http::status_snapshot(),
     }))
 }
 

@@ -2152,6 +2152,11 @@ fn print_cli_help() {
     println!("  WHATSRUST_API_TOKEN  Optional API bearer token; required for remote binds and proxy allowlists");
     println!("  WHATSRUST_ALLOWED_ORIGINS  Comma-separated allowed Origin values (default: none; requires WHATSRUST_API_TOKEN; see ADR 0044)");
     println!("  WHATSRUST_ALLOWED_HOSTS   Comma-separated allowed Host values beyond loopback (default: none; requires WHATSRUST_API_TOKEN; see ADR 0044)");
+    println!("  WHATSRUST_MCP_PORT  MCP HTTP listener port (unset or 0 = off; e.g. 7271)");
+    println!("  WHATSRUST_MCP_TOKEN  MCP listener bearer token; required when on; at least 22 characters; must differ from WHATSRUST_API_TOKEN");
+    println!("  WHATSRUST_MCP_BIND  MCP listener bind address (default: 127.0.0.1)");
+    println!("  WHATSRUST_MCP_ALLOW_REMOTE=1  Permit a non-loopback MCP bind (cleartext unless a TLS proxy is in front)");
+    println!("  WHATSRUST_MCP_READ_ONLY=1  MCP listener offers only the 6 read tools");
     println!("  WHATSRUST_SEND_BURST     Max burst size before rate limit (default: 5)");
     println!("  WHATSRUST_SKIP_HISTORY_SYNC=1  Skip history sync (leaner pairing, but 1:1 DMs fail with 463; default: off)");
     println!("  WHATSRUST_DEVICE_NAME  Name shown in Linked Devices (default: whatsrust); used only when pairing");
