@@ -175,6 +175,11 @@ fn get_port() -> u16 {
         .unwrap_or(7270)
 }
 
+/// First 40 bytes of a quoted reply, cut back to a char boundary so multi-byte text never panics.
+fn quote_preview(text: &str) -> &str {
+    &text[..text.floor_char_boundary(40)]
+}
+
 fn read_local_media_file(path: &Path) -> Result<Vec<u8>> {
     let meta = std::fs::metadata(path)?;
     if !meta.is_file() {
@@ -466,7 +471,7 @@ async fn async_main() -> Result<()> {
                     if qt.is_empty() {
                         format!(" (reply to {})", r.stanza_id)
                     } else {
-                        let preview = if qt.len() > 40 { &qt[..40] } else { qt };
+                        let preview = quote_preview(qt);
                         format!(" (reply to {}: \"{}\")", r.stanza_id, preview)
                     }
                 })
@@ -2108,6 +2113,56 @@ mod cli_tests {
         let (from_me, sender_jid) = parse_cli_react_args_without_emoji(&args).unwrap();
         assert!(!from_me);
         assert_eq!(sender_jid.as_deref(), Some("alice@s.whatsapp.net"));
+    }
+}
+
+#[cfg(test)]
+mod quote_preview_tests {
+    use super::*;
+
+    #[test]
+    fn short_ascii_is_unchanged() {
+        assert_eq!(quote_preview("hello"), "hello");
+        let exactly_40 = "a".repeat(40);
+        assert_eq!(quote_preview(&exactly_40), exactly_40);
+    }
+
+    #[test]
+    fn long_ascii_is_cut_to_40_bytes() {
+        let long = "a".repeat(100);
+        assert_eq!(quote_preview(&long), "a".repeat(40));
+    }
+
+    #[test]
+    fn hebrew_straddling_byte_40_does_not_panic() {
+        // The crash case: byte 40 falls inside the 2-byte 'ש' occupying bytes 39..41.
+        let text = format!("{}שלום עולם", "a".repeat(39));
+        assert!(!text.is_char_boundary(40));
+        let preview = quote_preview(&text);
+        assert_eq!(preview, "a".repeat(39));
+        assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn long_hebrew_is_cut_on_a_char_boundary() {
+        let text = "ש".repeat(30);
+        assert!(text.len() > 40);
+        let preview = quote_preview(&text);
+        assert_eq!(preview.len(), 40);
+        assert_eq!(preview, "ש".repeat(20));
+    }
+
+    #[test]
+    fn emoji_straddling_byte_40_is_cut_before_it() {
+        // 38 ASCII bytes, then a 4-byte emoji at bytes 38..42 spanning the limit.
+        let text = format!("{}😀tail", "a".repeat(38));
+        assert!(!text.is_char_boundary(40));
+        assert_eq!(quote_preview(&text), "a".repeat(38));
+    }
+
+    #[test]
+    fn empty_is_empty() {
+        assert_eq!(quote_preview(""), "");
     }
 }
 
