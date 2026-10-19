@@ -144,13 +144,8 @@ pub fn prepare_text_for_embedding(
         "text" => text,
         "image" | "video" | "document" => {
             // Strip `"[… ] "` prefix to extract caption. Find the closing `]`, skip it + space.
-            if let Some(close_bracket) = text.find(']') {
-                let after_bracket = close_bracket + 1;
-                if text.len() > after_bracket && text.as_bytes()[after_bracket] == b' ' {
-                    &text[after_bracket + 1..]
-                } else {
-                    &text[after_bracket..]
-                }
+            if let Some((_, after_bracket)) = text.split_once(']') {
+                after_bracket.strip_prefix(' ').unwrap_or(after_bracket)
             } else {
                 // No `]` found — shouldn't happen for a well-formed label, but gracefully
                 // fall back to the full text.
@@ -188,7 +183,8 @@ pub fn prepare_text_for_embedding(
                 .map(|(i, _)| i)
                 .unwrap_or(bare_text.len());
             let safe_offset = bare_text.floor_char_boundary(byte_offset);
-            &bare_text[..safe_offset]
+            // `get` instead of a byte-range index: a non-boundary offset can never panic.
+            bare_text.get(..safe_offset).unwrap_or(bare_text)
         } else {
             bare_text
         }
@@ -950,6 +946,33 @@ mod tests {
         assert!(truncated.chars().count() <= 100);
         // Confirm no corrupted trailing bytes by re-parsing as UTF-8.
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_prepare_text_truncates_multibyte_exactly_at_char_count() {
+        // Hebrew (2 bytes/char) and emoji (4 bytes/char): the cut must land between chars.
+        assert_eq!(prepare_text_for_embedding("text", Some("שלום"), Some(3)), Some("שלו".to_string()));
+        assert_eq!(prepare_text_for_embedding("text", Some("a😀b😀c"), Some(2)), Some("a😀".to_string()));
+        // At or under the limit nothing is cut.
+        assert_eq!(prepare_text_for_embedding("text", Some("שלום"), Some(4)), Some("שלום".to_string()));
+        assert_eq!(prepare_text_for_embedding("text", Some("שלום"), Some(100)), Some("שלום".to_string()));
+    }
+
+    #[test]
+    fn test_prepare_text_strips_label_prefix_around_multibyte_text() {
+        // Caption right after "] " and right after "]" (no space), with multi-byte label and caption.
+        assert_eq!(
+            prepare_text_for_embedding("image", Some("[image 40KB] שלום עולם"), None),
+            Some("שלום עולם".to_string())
+        );
+        assert_eq!(prepare_text_for_embedding("image", Some("[תמונה 40KB]שלום"), None), Some("שלום".to_string()));
+        assert_eq!(prepare_text_for_embedding("video", Some("[video] 😀"), None), Some("😀".to_string()));
+        // Only the first `]` ends the label; a later one stays part of the caption.
+        assert_eq!(prepare_text_for_embedding("document", Some("[doc] a]b"), None), Some("a]b".to_string()));
+        // No closing bracket: fall back to the whole text.
+        assert_eq!(prepare_text_for_embedding("image", Some("[שלום"), None), Some("[שלום".to_string()));
+        // Label with nothing after it.
+        assert_eq!(prepare_text_for_embedding("image", Some("[תמונה]"), None), None);
     }
 
     #[test]
