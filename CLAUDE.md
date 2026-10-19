@@ -14,7 +14,7 @@ Where to look for what — read the relevant doc before changing related code.
 | Operational playbook (build, configure, run, CLI/MCP usage, DB migration recovery, test/lint) | `docs/HOWTO.md` |
 | **Architecture Decision Records (the "why" ledger)** | `docs/adr/` — start at `docs/adr/0000-index.md` |
 | **Feature roadmap & status (LIVE — what's done/in-flight/planned)** | `docs/plans/FEATURES.md` |
-| **Implementation execution plan (phases, gates, milestone exit criteria)** | `docs/plans/IMPLEMENTATION-ROADMAP.md` |
+| **Implementation execution plan (phases, gates, milestone exit criteria, priority backlog)** | `docs/plans/IMPLEMENTATION-ROADMAP.md` |
 | Design specs / plans (the "what/how" blueprints) | `docs/plans/*.md` |
 | Design review reports (cold reviews, reconciliation) | `_reviewer/design/` |
 | Historical fetch + lexical search (M1 — **DONE** 2026-07-20) / semantic search (M2 — **DONE**: code-complete 2026-09-30, live-validated 2026-10-05) | `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (+ ADRs 0001–0047) |
