@@ -193,6 +193,47 @@ against a *trusted* sidecar or rare inputs. Fix opportunistically or during a la
 
 ---
 
+## Priority backlog (set 2026-10-19)
+
+The order in which open work is picked up, set with the owner after F3 and the 2026-10-19 live
+crash. Detail lives where the "Source" column points (FEATURES.md items and the follow-up
+checklists above); this table tracks order and status. Update the Status cell when an item
+starts or lands; re-rank with the owner.
+
+**Priority:** P0 = stability of live runs · P1 = next up · P2 = planned · P3 = later / when needed.
+**Effort:** S / M / L (relative size, not a time estimate).
+**Status:** ⚪ open · 🟡 in progress or partly done · 🟢 done · 👤 owner action.
+
+| P | Item | Effort | Source | Why this rank | Status |
+|---|---|---|---|---|---|
+| P0 | Rebuild and restart the live daemon on the fixed binary | – | ops | a running pre-fix binary can still abort on a long multi-byte reply | 👤 open |
+| P0 | Panic visibility: log panics before the abort | S | Q-PANIC | the 2026-10-19 abort left only a stderr backtrace | 🟢 hook done (219697d) |
+| P0 | Supervisor restart (launchd/systemd) documented | S | Q-PANIC | nothing restarted the daemon after the crash | ⚪ (with F8 operational guide) |
+| P0 | Lint guard against byte-index string slicing | S | Q-SLICE | prevents a repeat of the crash | 🟢 done (219697d) |
+| P1 | Dev run profiles (`runs/<profile>/`) | S | F9 | protects the main DB while experimenting | 🟢 done (f953948); 👤 move root state into `runs/main/` |
+| P1 | Stdio `initialize`: answer 2025-11-25/2025-06-18 and add instructions | S | F3 known nit | stdio is the main local path and still advertises 2024-11-05, which predates tool annotations | ⚪ |
+| P1 | Rate limiting for network-touching reads (`groups`, `group_info` cache misses) and chat-management via MCP | M | follow-up above | an LLM loop can hammer WhatsApp; anti-ban is a core promise | ⚪ |
+| P1 | wa-rs upgrade check | M | Q-WARS | pin is from 2026-07-01 and upstream has moved | ⚪ |
+| P1 | README (the what) + fork notice + operational guide (the how) | M | F8 | README still carries the build section and how-to detail | ⚪ |
+| P2 | ARCHITECTURE update with Mermaid diagrams | M | F8 | follows the README split | ⚪ |
+| P2 | CONTRIBUTING update | S | F8 | align with Makefile targets, ignored tests, commit and ADR rules | ⚪ |
+| P2 | Sidecar auto-respawn | M | follow-up above | semantic search silently stays off after a sidecar crash | ⚪ |
+| P2 | ADR 0047 job_id cell (spawned enqueue publishes job_id) | M | F3 follow-up | rare now that the tool budget starts after the body | ⚪ |
+| P2 | `enqueue_and_wait` skips `Lagged` broadcast errors | S | follow-up above | can report a timeout for a job that was sent | ⚪ |
+| P2 | `/api/contact` produces `TEL:++…` | S | follow-up above | wrong vCard phone format | ⚪ |
+| P2 | One parser for boolean env vars | S | follow-up above | `yes` works for some flags only | ⚪ |
+| P2 | Flaky `test_drain_worker_max_batch_clamp` → paused clock | S | follow-up above | load-dependent test failure | ⚪ |
+| P2 | Richer read tools (names, counts, contacts, groups, search pagination) | L | F7 | user value; viable item by item | ⚪ |
+| P3 | fail2ban helper script | S | Q-F2B | only for direct exposure; the proxy recipe covers most setups | ⚪ |
+| P3 | `whatsrust_send_async` MCP tool | S | follow-up above | only if an agent needs scheduling or link previews | ⚪ |
+| P3 | Two-token rotation for the MCP listener | M | F3 follow-up | needs a restart today; low frequency | ⚪ |
+| P3 | Native TLS for the MCP listener | L | F3 follow-up | the tested reverse-proxy recipe covers it | ⚪ |
+| P3 | F5 per-token access profiles | L | F5 | builds on AccessClass; not needed for a single owner | ⚪ |
+| P3 | HEAD `/mcp` returns 405 with a body | S | F3 known nit | cosmetic; the connection closes | ⚪ |
+| P3 | Test hygiene: `#[cfg(test)]` capture hooks in `log_request`/`accept_loop`; storage test that scans source text | S | F3 known nit | test-only code inside production functions; brittle text scan | ⚪ |
+
+---
+
 ## Notes
 - Per Q3: phase-level granularity; task breakdown happens when each phase is reached.
 - Per Q2: nothing past Phase 0 is detailed until GO.
