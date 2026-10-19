@@ -156,6 +156,37 @@ contact and group listing/search, and pagination for search results.
 - [ ] Investigation + design
 - [ ] Implementation
 
+### F8 — Documentation overhaul (README = what, operations guide = how, diagrams) ⚪ Planned
+Restructure the user-facing docs so each answers one question (added 2026-10-19).
+- **README (the what):** say up front that this is an experimental, feature-rich fork (link the
+  upstream project) and what it adds; keep the overview, features and pointers; drop the build
+  section (not relevant to readers of the README); move CLI/API/config/MCP detail out.
+- **Operational guide (the how):** one place for build, configure, run, CLI, REST, MCP (stdio and
+  HTTP), embedder, proxies, fail2ban, and every helper script (`scripts/*`, `tools/*`,
+  `deploy/proxy/`) with when and how to use it. Decide: extend `docs/HOWTO.md` or split it.
+- **CONTRIBUTING:** review and update (Makefile targets, ignored SDK/proxy tests, commit style,
+  docs matrix, ADR rule, "ask before changing behaviour" golden-test rule).
+- **ARCHITECTURE:** update to the current system (MCP HTTP listener, registry, request pipelines,
+  workers) and add diagrams (Mermaid: component map, inbound/outbound data flow, REST and MCP
+  request pipelines, backfill/embedding workers).
+- [ ] Plan (target structure, what moves where)
+- [ ] README + operational guide
+- [ ] CONTRIBUTING
+- [ ] ARCHITECTURE + diagrams
+
+### F9 — Dev run profiles (debug runs in their own folders) 🟢 Done (2026-10-19; owner step open)
+Keep each debug/live run's state out of the project root (added 2026-10-19).
+- **Why:** the daemon keeps everything relative to its working directory (`.env` via
+  `WHATSRUST_ENV_FILE` or `./.env`, `whatsapp.db*`, `whatsapp.db.backups/`, the instance lock,
+  pre-migration `.bak` files) and runs are started from the repo root, so the root collects DBs,
+  backups and logs from every run.
+- **As built:** one gitignored folder per profile, `runs/<profile>/`, with its own `.env`, DB and
+  `logs/`. `scripts/run-profile.sh` (`new`, `list`, `daemon`, `cli`, `mcp`, `env`) and
+  `make new-profile` / `make run-profile`; no Rust change. Docs: HOWTO §3 "Run profiles".
+- [x] Approach decision — A: profile folders + launcher script (owner, 2026-10-19)
+- [x] Script + Makefile target + docs — done 2026-10-19
+- [ ] Move existing root run state into `runs/main/` (owner, daemon stopped; HOWTO checklist)
+
 ---
 
 ## Quick Wins (project health — tracked, NOT in active focus)
@@ -175,6 +206,9 @@ now** to preserve focus on F1/F2. Pick up opportunistically or schedule delibera
 | Q-DOCS | `docs/INDEX.md` / onboarding guide | 34 .md files; discoverability gap (partly addressed by CLAUDE.md doc matrix) | S–M | Med | 🟡 Partial (CLAUDE.md matrix added 2026-06-17) |
 | Q-TRACE | Structured `#[instrument]` spans on `handle_event` / `execute_job` | Debugging "message didn't send / backfill stuck" means grepping flat logs | M | Med | ⚪ |
 | Q-SPLIT | Split 900-line `extract_content_inner` / 700-line `handle_event` | Maintainability; both are large | L | Low | ⏸️ Deferred (stack-overflow history — risky; post-F1) |
+| Q-PANIC | Panic visibility + recovery: a panic hook that logs the message and location before the release-mode abort, and a documented supervisor (launchd/systemd restart) | A UTF-8 slicing panic (fixed in a763838 on main) killed a 9 h live session on 2026-10-19; `panic = "abort"` gives no log line of its own | S | High | 🟡 Hook done 2026-10-19 (219697d: one `ERROR whatsrust::panic` line, then the default hook); supervisor docs open (F8 operational guide) |
+| Q-SLICE | Lint guard against byte-index string slicing (`clippy::string_slice` in `make lint` / CI) | Prevents a repeat of the 2026-10-19 crash; the audit found no other instance | S | High | 🟢 Done 2026-10-19 (219697d: `#![warn(clippy::string_slice)]` in both crate roots; all slices rewritten with non-panicking APIs; 0 warnings in all targets) |
+| Q-F2B | fail2ban reference + optional helper script (install filter/jail, plain-text log via `NO_COLOR=1`) | HOWTO §5a documents a filter and jail; a script makes direct (no-proxy) exposure safer | S | Low | ⚪ |
 | Q-WARS | wa-rs dependency upgrade check | Pinned at `oxidezap/whatsapp-rust` rev `9e8c70e2` (2026-07-01); upstream HEAD `7c4021d4` seen 2026-10-18 (newer than the pin). Check for new upstream commits/tags, assess breaking changes, run tests + live smoke test per CLAUDE.md "To upgrade wa-rs". Untracked `wa-rs-upgrade-impact-analysis.txt` (2026-06-29, v0.6.0→main) is dated (pre-dates current pin) and advisory only. | M | Med | ⚪ |
 
 ---
