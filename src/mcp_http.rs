@@ -2429,7 +2429,7 @@ mod tests {
             "Authorization: Basic abc\r\n".to_string(),
             format!("Authorization: {TOKEN}\r\n"),
             "X-API-Token: wrong-token-0123456789\r\n".to_string(),
-            format!("Authorization: Bearer {}\r\n", &TOKEN[..21]),
+            format!("Authorization: Bearer {}\r\n", TOKEN.get(..21).expect("ASCII test token")),
         ] {
             let raw = format!("{head}{auth}Content-Length: {}\r\n\r\n{body}", body.len());
             let reply = exchange(test_config(false), raw.as_bytes()).await;
