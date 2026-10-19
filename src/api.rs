@@ -377,13 +377,13 @@ fn parse_allowlist_env(name: &str) -> Vec<String> {
 fn normalize_host_header(value: &str) -> String {
     let v = value.trim();
     let host_part = if let Some(rest) = v.strip_prefix('[') {
-        match rest.find(']') {
-            Some(end) => &rest[..end],
+        match rest.split_once(']') {
+            Some((host, _)) => host,
             None => v,
         }
     } else if v.matches(':').count() == 1 {
-        match v.rfind(':') {
-            Some(idx) if !v[idx + 1..].is_empty() && v[idx + 1..].bytes().all(|b| b.is_ascii_digit()) => &v[..idx],
+        match v.rsplit_once(':') {
+            Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
             _ => v,
         }
     } else {
@@ -610,15 +610,15 @@ pub(crate) async fn read_request_head<R: AsyncRead + Unpin>(
     let raw_path = parts.next()?.to_string();
 
     // Split path and query
-    let (path, query) = if let Some(idx) = raw_path.find('?') {
-        let q = raw_path[idx + 1..]
+    let (path, query) = if let Some((path_part, query_part)) = raw_path.split_once('?') {
+        let q = query_part
             .split('&')
             .filter_map(|pair| {
                 let mut kv = pair.splitn(2, '=');
                 Some((decode_query_component(kv.next()?), decode_query_component(kv.next().unwrap_or(""))))
             })
             .collect();
-        (raw_path[..idx].to_string(), q)
+        (path_part.to_string(), q)
     } else {
         (raw_path, Vec::new())
     };
@@ -2859,6 +2859,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_request_head_splits_path_and_query_around_multibyte_text() {
+        let (mut client, mut server) = socket_pair().await;
+        // Raw (unencoded) UTF-8 on both sides of the `?` and inside the query.
+        client
+            .write_all("GET /שלום?q=עולם&e=😀 HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes())
+            .await
+            .unwrap();
+        let head = read_request_head(&mut server, head_deadline()).await.expect("head should parse");
+        assert_eq!(head.path, "/שלום");
+        assert_eq!(
+            head.query,
+            vec![("q".to_string(), "עולם".to_string()), ("e".to_string(), "😀".to_string())]
+        );
+    }
+
+    #[tokio::test]
     async fn test_request_body_continues_across_later_reads() {
         let (mut client, mut server) = socket_pair().await;
         client
@@ -3359,6 +3375,24 @@ mod tests {
         assert_eq!(normalize_host_header("::1"), "::1"); // bare IPv6, no brackets — left intact, not mangled as host:port
         assert_eq!(normalize_host_header("localhost."), "localhost");
         assert_eq!(normalize_host_header("127.0.0.1."), "127.0.0.1");
+    }
+
+    #[test]
+    fn test_normalize_host_header_malformed_and_multibyte_never_panics() {
+        // Unclosed bracket, bare brackets, empty/non-numeric port: value is kept as-is.
+        assert_eq!(normalize_host_header("[::1"), "[::1");
+        assert_eq!(normalize_host_header("[::1]"), "::1");
+        assert_eq!(normalize_host_header("[]:80"), "");
+        assert_eq!(normalize_host_header("localhost:"), "localhost:");
+        assert_eq!(normalize_host_header("localhost:80a"), "localhost:80a");
+        // Multi-byte text around every split point (`[`, `]`, `:`) — Hebrew is 2 bytes/char,
+        // the emoji 4. ASCII is lowercased, everything else is left alone.
+        assert_eq!(normalize_host_header("שלום:7270"), "שלום");
+        assert_eq!(normalize_host_header("שלום:ש"), "שלום:ש");
+        assert_eq!(normalize_host_header("[שלום]:7270"), "שלום");
+        assert_eq!(normalize_host_header("[😀"), "[😀");
+        assert_eq!(normalize_host_header("ש:"), "ש:");
+        assert_eq!(normalize_host_header("Ünï.EXAMPLE.:80"), "Ünï.example");
     }
 
     // -------------------------------------------------------------------------

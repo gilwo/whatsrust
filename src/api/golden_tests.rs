@@ -326,13 +326,8 @@ fn normalize_uptime(raw: Vec<u8>) -> Vec<u8> {
     let Some((head, body)) = text.split_once("\r\n\r\n") else {
         return raw;
     };
-    let Some(at) = body.find(KEY) else { return raw };
-    let digits_at = at + KEY.len();
-    let digits = body[digits_at..]
-        .bytes()
-        .take_while(u8::is_ascii_digit)
-        .count();
-    let body = format!("{}0{}", &body[..digits_at], &body[digits_at + digits..]);
+    let Some((before, after)) = body.split_once(KEY) else { return raw };
+    let body = format!("{before}{KEY}0{}", after.trim_start_matches(|c: char| c.is_ascii_digit()));
     let head: Vec<String> = head
         .split("\r\n")
         .map(|line| match line.starts_with("Content-Length:") {

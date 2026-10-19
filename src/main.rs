@@ -8,6 +8,14 @@
 //!   whatsrust              — daemon mode (bridge + REPL + API server)
 //!   whatsrust <command>    — CLI mode (sends HTTP to running daemon, prints JSON)
 
+// Byte-index slicing of a `str` (`&s[a..b]`) panics when an index is not on a
+// UTF-8 char boundary, and a panic aborts the daemon (release builds use
+// `panic = "abort"`; see `install_panic_logging`). Prefer `str::get`,
+// `split_once`, `strip_prefix`, `floor_char_boundary`; where a slice is provably
+// safe, scope an `#[allow(clippy::string_slice)]` to the smallest item with a
+// `// safe:` reason.
+#![warn(clippy::string_slice)]
+
 mod api;
 mod backfill;
 mod bridge_events;
@@ -177,7 +185,7 @@ fn get_port() -> u16 {
 
 /// First 40 bytes of a quoted reply, cut back to a char boundary so multi-byte text never panics.
 fn quote_preview(text: &str) -> &str {
-    &text[..text.floor_char_boundary(40)]
+    text.get(..text.floor_char_boundary(40)).unwrap_or(text)
 }
 
 fn read_local_media_file(path: &Path) -> Result<Vec<u8>> {
@@ -227,6 +235,72 @@ fn main() -> Result<()> {
     }
 }
 
+/// What the panic hook logs: the thread, the source location and the panic message —
+/// nothing else (no message bodies, no tokens, no backtrace).
+#[derive(Debug, PartialEq, Eq)]
+struct PanicFields {
+    /// Thread name, or `"unnamed"`.
+    thread: String,
+    /// `file:line:col`, or `"unknown"` when the panic carries no location.
+    location: String,
+    /// The `&str`/`String` payload, or `"non-string panic payload"` for `panic_any`.
+    message: String,
+}
+
+/// Pure formatting of the parts of a panic report, kept separate from the hook so it
+/// can be unit-tested (`PanicHookInfo` cannot be constructed outside the runtime).
+fn describe_panic(
+    thread_name: Option<&str>,
+    location: Option<&std::panic::Location<'_>>,
+    payload: &(dyn std::any::Any + Send),
+) -> PanicFields {
+    let message = if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    };
+    PanicFields {
+        thread: thread_name.unwrap_or("unnamed").to_string(),
+        location: location
+            .map_or_else(|| "unknown".to_string(), |l| format!("{}:{}:{}", l.file(), l.line(), l.column())),
+        message,
+    }
+}
+
+/// Install a panic hook that writes ONE structured `tracing` error event
+/// (target `whatsrust::panic`) and then runs the previously installed hook.
+///
+/// Without it a panic only reaches stderr (default message + optional backtrace) and
+/// leaves no trace in the structured log, which is what the daemon operator reads. The
+/// previous hook still runs afterwards, so the default message/backtrace still print
+/// and the exit-on-panic hook from `main()` still terminates the process. Release
+/// builds use `panic = "abort"`, so the hook is the last code that runs before the
+/// process dies. Call it once, after the tracing subscriber is initialised.
+///
+/// Privacy: the panic *message* is logged verbatim because it is the key diagnostic,
+/// even though it can quote user data (the 2026-10-19 crash quoted a Hebrew letter
+/// from a WhatsApp message). Nothing else is added — no message bodies, no tokens.
+///
+/// The message goes in `panic_message`, not `message`: tracing reserves `message` for
+/// the event text ("daemon panicked").
+fn install_panic_logging() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let fields = describe_panic(thread.name(), info.location(), info.payload());
+        error!(
+            target: "whatsrust::panic",
+            thread = fields.thread.as_str(),
+            location = fields.location.as_str(),
+            panic_message = fields.message.as_str(),
+            "daemon panicked"
+        );
+        previous(info);
+    }));
+}
+
 async fn async_main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -269,6 +343,8 @@ async fn async_main() -> Result<()> {
                 .unwrap_or_else(|_| "whatsrust=info,whatsapp_rust=info".parse().unwrap()),
         )
         .init();
+
+    install_panic_logging();
 
     info!("whatsrust v{}", env!("CARGO_PKG_VERSION"));
 
@@ -2163,6 +2239,114 @@ mod quote_preview_tests {
     #[test]
     fn empty_is_empty() {
         assert_eq!(quote_preview(""), "");
+    }
+}
+
+#[cfg(test)]
+mod panic_logging_tests {
+    use super::*;
+    use std::io::Write;
+    use std::panic::Location;
+
+    #[test]
+    fn describe_panic_str_payload() {
+        let loc = Location::caller();
+        let fields = describe_panic(Some("worker-1"), Some(loc), &"boom");
+        assert_eq!(fields.thread, "worker-1");
+        assert_eq!(fields.location, format!("{}:{}:{}", loc.file(), loc.line(), loc.column()));
+        assert_eq!(fields.message, "boom");
+    }
+
+    #[test]
+    fn describe_panic_string_payload_keeps_multibyte_text() {
+        // `panic!("{x}")` carries a `String`; the crash on 2026-10-19 quoted a Hebrew letter.
+        let payload = String::from("byte index 40 is not a char boundary; it is inside 'ש'");
+        let fields = describe_panic(Some("main"), Some(Location::caller()), &payload);
+        assert_eq!(fields.message, payload);
+    }
+
+    #[test]
+    fn describe_panic_non_string_payload() {
+        let fields = describe_panic(Some("main"), Some(Location::caller()), &42_i32);
+        assert_eq!(fields.message, "non-string panic payload");
+    }
+
+    #[test]
+    fn describe_panic_unnamed_thread_and_missing_location() {
+        let fields = describe_panic(None, None, &"boom");
+        assert_eq!(fields.thread, "unnamed");
+        assert_eq!(fields.location, "unknown");
+    }
+
+    /// A `MakeWriter` target that collects everything the fmt subscriber writes.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// End to end: a panic on a named thread yields exactly one `whatsrust::panic` error
+    /// event with thread/location/message, and the previously installed hook still runs.
+    ///
+    /// The panic and the capturing subscriber are on the same thread (`with_default` is
+    /// thread-local), so concurrently running tests cannot leak events into the buffer, and
+    /// the process-wide hook installed here only ever logs through whichever subscriber the
+    /// panicking thread has — none for other tests.
+    #[test]
+    fn panic_hook_logs_one_structured_event_then_calls_previous_hook() {
+        const THREAD: &str = "panic-log-test-thread";
+
+        // The "previous" hook records which threads reached it, then delegates to the
+        // original hook so panic messages of unrelated failing tests still print.
+        let original = std::panic::take_hook();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_by_hook = Arc::clone(&seen);
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(name) = std::thread::current().name() {
+                seen_by_hook.lock().unwrap().push(name.to_string());
+            }
+            original(info);
+        }));
+        install_panic_logging();
+
+        let buf = SharedBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+
+        std::thread::Builder::new()
+            .name(THREAD.to_string())
+            .spawn(move || {
+                tracing::subscriber::with_default(subscriber, || {
+                    let caught = std::panic::catch_unwind(|| {
+                        panic!("boom ש");
+                    });
+                    assert!(caught.is_err());
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.lines().count(), 1, "exactly one log line expected, got: {output}");
+        assert!(output.contains("ERROR"), "{output}");
+        assert!(output.contains("whatsrust::panic"), "{output}");
+        assert!(output.contains("daemon panicked"), "{output}");
+        assert!(output.contains(&format!("thread=\"{THREAD}\"")), "{output}");
+        assert!(output.contains("location=\"src/main.rs:"), "{output}");
+        assert!(output.contains("panic_message=\"boom ש\""), "{output}");
+
+        assert!(seen.lock().unwrap().iter().any(|n| n == THREAD), "previous hook was not called");
     }
 }
 
