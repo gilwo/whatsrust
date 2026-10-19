@@ -181,8 +181,11 @@ Keep each debug/live run's state out of the project root (added 2026-10-19).
   pre-migration `.bak` files) and runs are started from the repo root, so the root collects DBs,
   backups and logs from every run.
 - **As built:** one gitignored folder per profile, `runs/<profile>/`, with its own `.env`, DB and
-  `logs/`. `scripts/run-profile.sh` (`new`, `list`, `daemon`, `cli`, `mcp`, `env`) and
-  `make new-profile` / `make run-profile`; no Rust change. Docs: HOWTO §3 "Run profiles".
+  `logs/`. `scripts/run-profile.sh` (`new`, `list [--all]`, `daemon`, `attach`, `cli`, `mcp`, `env`) and
+  `make new-profile` / `make run-profile` / `make attach-profile`; no Rust change. With tmux installed,
+  `daemon` runs in session `whatsrust-<profile>` (attach when interactive, `--detach`, `--foreground`;
+  an exit note keeps the pane open until Enter); without tmux it runs in the foreground (2026-10-19).
+  Docs: HOWTO §3 "Run profiles".
 - [x] Approach decision — A: profile folders + launcher script (owner, 2026-10-19)
 - [x] Script + Makefile target + docs — done 2026-10-19
 - [ ] Move existing root run state into `runs/main/` (owner, daemon stopped; HOWTO checklist)
