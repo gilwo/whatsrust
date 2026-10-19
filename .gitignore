@@ -11,6 +11,8 @@ review-pack/
 *.log
 .mcp.json
 .env
+# Dev run profiles (F9): per-profile DB, backups, lock, logs and .env (scripts/run-profile.sh)
+runs/
 .venv-embedder/
 embedder-rs/target/
 tools/mcp-smoke-rs/target/

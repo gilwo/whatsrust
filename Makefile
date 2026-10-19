@@ -5,7 +5,7 @@
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release release-all dist run embedder-build run-semantic embedder-smoke calibrate test test-all lint lint-strict fmt fmt-check clean py-sidecar-setup py-sidecar-smoke run-semantic-py
+.PHONY: help build release release-all dist run embedder-build run-semantic new-profile run-profile embedder-smoke calibrate test test-all lint lint-strict fmt fmt-check clean py-sidecar-setup py-sidecar-smoke run-semantic-py
 
 # Model for the Rust embedder sidecar: bge-m3 (default, stronger multilingual/cross-language
 # recall) or minilm (lighter, faster). Override on the command line, e.g.:
@@ -73,6 +73,17 @@ run-semantic: embedder-build ## Run the daemon with Rust embedder sidecar enable
 	WHATSRUST_EMBEDDER_ARGS="--model $(EMBED_MODEL)" \
 	$(DEVICE_NAME_ENV) \
 	cargo run
+
+# Dev run profiles (F9): each run keeps its state (DB, backups, instance lock, logs, .env) in
+# runs/<profile>/ instead of the project root; see scripts/run-profile.sh and docs/HOWTO.md #3
+# "Run profiles". P is read from the environment inside the recipe (no re-parsing as shell code).
+new-profile: ## Create runs/<profile>/ with logs/ and a .env (make new-profile P=<name> [SEMANTIC=1])
+	@test -n "$$P" || { echo "Error: set P=<profile>, e.g. make new-profile P=dev" >&2; exit 1; }
+	scripts/run-profile.sh new "$$P" $(if $(SEMANTIC),--semantic)
+
+run-profile: ## Run the daemon with state in runs/<profile>/ (make run-profile P=<name> [RELEASE=1])
+	@test -n "$$P" || { echo "Error: set P=<profile>, e.g. make run-profile P=dev (create it first: make new-profile P=dev)" >&2; exit 1; }
+	scripts/run-profile.sh daemon "$$P" $(if $(RELEASE),--release)
 
 test: ## Run the default test suite (cargo test)
 	cargo test

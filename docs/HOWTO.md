@@ -209,6 +209,67 @@ Is the daemon running? Start it with: WHATSRUST_PORT=7270 WHATSRUST_BIND=127.0.0
 ```
 (exit code 1 — verified by running `whatsrust status` with no daemon up).
 
+### Run profiles (state in `runs/<profile>/`)
+
+**Why:** the daemon keeps its state in the directory it starts in: `whatsapp.db` (+ `-wal`, `-shm`),
+`whatsapp.db.backups/`, `whatsapp.db.instance.lock`, the `whatsapp.db.pre-migration-*.bak` files, and it
+loads `./.env`. Every debug or live run from the project root therefore shares one pile of state. A run
+profile gives each run its own folder, `runs/<profile>/` (git-ignored): its own DB, backups, lock, `.env`
+and `logs/`. The launcher `scripts/run-profile.sh` just starts the daemon with that folder as working
+directory; there is no Rust change.
+
+```bash
+scripts/run-profile.sh new dev            # create runs/dev/ (logs/ + .env); --semantic enables the embedder sidecar
+scripts/run-profile.sh list               # profiles with REST/MCP port, DB present, instance lock held
+scripts/run-profile.sh daemon dev         # build once (--release for the release binary), run in runs/dev/
+scripts/run-profile.sh cli dev status     # `whatsrust status` against dev's daemon
+scripts/run-profile.sh mcp dev            # `whatsrust mcp` (stdio) against dev's daemon, for an MCP client config
+scripts/run-profile.sh env dev            # port/bind and whether a token is set (the token is never shown)
+make new-profile P=dev [SEMANTIC=1]       # same as `new`
+make run-profile P=dev [RELEASE=1]        # same as `daemon`
+```
+
+- **Ports:** the first profile gets REST `9270` and MCP `9271`, then `9280/9281`, `9290/9291`, … (step 10).
+  `new` picks the lowest pair that no other profile's `.env` mentions; commented-out lines count, so a
+  profile keeps the MCP port reserved for it while the listener is off. All of these differ from the default
+  `7270/7271`.
+- **`.env`:** generated from `.env.example` (every example line stays commented) with an active block on top:
+  `WHATSRUST_PORT`, `WHATSRUST_DEVICE_NAME=whatsrust-<profile>` (each profile is its own linked device, so
+  each shows up under its own name) and `RUST_LOG`. With `--semantic` it also sets
+  `WHATSRUST_EMBEDDER_CMD`/`WHATSRUST_EMBEDDER_ARGS` (run `make embedder-build` once). The MCP listener
+  (§5a) is off: to enable it, uncomment `WHATSRUST_MCP_PORT` and `WHATSRUST_MCP_TOKEN` in the profile's
+  `.env` and paste a token you generate with `openssl rand -base64 32`. The script never generates or prints
+  a token. Profile names use letters, digits, `.`, `_`, `-`.
+- **Logs:** `daemon` prints to the terminal with colours and writes the same output, without colour codes, to
+  `runs/<profile>/logs/<UTC-YYYYmmdd-HHMMSS>.log` (mode 600; treat it as private). The REPL on stdin works as
+  usual and Ctrl+C is the normal graceful stop.
+- **Environment:** variables exported in your shell beat the profile's `.env` (§2); `daemon` names any such
+  variable (never its value) when it starts. `cli` and `mcp` read only `WHATSRUST_PORT`, `WHATSRUST_BIND`
+  and `WHATSRUST_API_TOKEN` from the profile's `.env`. For an MCP client config, use
+  `scripts/run-profile.sh` as the command and `["mcp", "<profile>"]` as the arguments.
+- **`list` lock column:** `HELD` means a process has `runs/<profile>/whatsapp.db.instance.lock` open (checked
+  with `lsof`; `unknown` if `lsof` is missing). The lock file stays on disk after a stop; that is normal.
+
+**Caveat:** never run two copies of the same paired DB at once. Each profile is its own linked device, so
+pair a new one (scan its QR code) or move (not copy) an existing DB into the profile folder. Pair one profile
+at a time: the QR image and HTML files go to the system temp directory under fixed names.
+
+**Move today's root state into `runs/main/` (one-time checklist for the owner):**
+1. Stop the running daemon (Ctrl+C, or `quit` in the REPL) so nothing holds `whatsapp.db`.
+2. Create the folder: `mkdir -p runs/main/logs`
+3. Move (not copy) the DB and its companions; only the ones that exist are moved:
+   ```bash
+   for f in whatsapp.db whatsapp.db-wal whatsapp.db-shm whatsapp.db.backups whatsapp.db.pre-migration-*.bak; do
+     [ -e "$f" ] && mv "$f" runs/main/
+   done
+   ```
+4. Move the config: `mv .env runs/main/.env` (it keeps its current ports, so `main` behaves as before).
+5. Move the logs: `mv ./*.log runs/main/logs/`
+6. Start it from the profile: `scripts/run-profile.sh daemon main`
+
+The old `whatsapp.db.instance.lock` can stay in the root (it is git-ignored) or be deleted; the daemon creates
+a fresh one in `runs/main/`.
+
 ---
 
 ## 3a. Re-pairing (rename the device, or after a logout)
@@ -253,6 +314,10 @@ sends one HTTP request to the local API and prints JSON to stdout).
 **Shape:** `whatsrust <subcommand> [args...]` — requires a daemon already
 running (per §3) on the same `WHATSRUST_PORT`/`HEALTH_PORT` the CLI resolves
 (default 7270).
+
+To drive a run profile's daemon (§3, "Run profiles"), use `scripts/run-profile.sh cli <profile> <subcommand> ...`
+instead of `whatsrust <subcommand> ...`; it exports that profile's `WHATSRUST_PORT`, `WHATSRUST_BIND` and
+`WHATSRUST_API_TOKEN` first.
 
 **Steps / examples** (all verified against the `cli_main` match arms in
 `src/main.rs`):
