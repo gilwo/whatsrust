@@ -99,13 +99,14 @@ const NOT_CONNECTED: &str = "HTTP/1.1 503 Service Unavailable\r\n\
     \r\n\
     {\"code\":\"unavailable\",\"error\":\"not connected\",\"ok\":false}";
 
-/// 200 status snapshot of a fresh, disconnected bridge (`uptime_secs` normalised to 0).
+/// 200 status snapshot of a fresh, disconnected bridge (`uptime_secs` normalised to 0). `mcp_http`
+/// is null: only the daemon's own MCP listener reports there, and no test starts that one.
 const STATUS_OK: &str = "HTTP/1.1 200 OK\r\n\
     Content-Type: application/json\r\n\
-    Content-Length: 346\r\n\
+    Content-Length: 362\r\n\
     Connection: close\r\n\
     \r\n\
-    {\"connected\":false,\"device_name\":null,\"embeddings\":{\"embedded\":0,\"failed\":0,\"model_id\":\"test-model\",\"pending\":0,\"skipped\":0},\"last_connect_epoch\":0,\"last_disconnect_epoch\":0,\"last_inbound_epoch\":0,\"last_outbound_epoch\":0,\"messages_received\":0,\"messages_sent\":0,\"ok\":true,\"queue_depth\":0,\"reconnect_count\":0,\"state\":\"Disconnected\",\"uptime_secs\":0}";
+    {\"connected\":false,\"device_name\":null,\"embeddings\":{\"embedded\":0,\"failed\":0,\"model_id\":\"test-model\",\"pending\":0,\"skipped\":0},\"last_connect_epoch\":0,\"last_disconnect_epoch\":0,\"last_inbound_epoch\":0,\"last_outbound_epoch\":0,\"mcp_http\":null,\"messages_received\":0,\"messages_sent\":0,\"ok\":true,\"queue_depth\":0,\"reconnect_count\":0,\"state\":\"Disconnected\",\"uptime_secs\":0}";
 
 /// 404 for a route the server does not have.
 const NOT_FOUND: &str = "HTTP/1.1 404 Not Found\r\n\

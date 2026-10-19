@@ -1,0 +1,25 @@
+# Caddy: TLS reverse proxy for the whatsrust MCP listener (WHATSRUST_MCP_PORT).
+# Use: set the domain and the certificate paths (or delete the `tls` line and Caddy gets and renews
+# a certificate for a public domain by itself), then `caddy run --config Caddyfile` or `caddy reload`.
+# The daemon stays bound to loopback (WHATSRUST_MCP_BIND=127.0.0.1, the default); this proxy rewrites
+# Host to 127.0.0.1, so no WHATSRUST_ALLOWED_HOSTS is needed. Tested by scripts/mcp-proxy-smoke.sh.
+
+mcp.example.com {
+	tls /path/to/cert.pem /path/to/key.pem
+
+	# 10MiB is the largest request the listener accepts (Caddy's "MB" would be 10^6 bytes).
+	request_body {
+		max_size 10MiB
+	}
+
+	# Only /mcp is forwarded; the listener serves nothing else.
+	handle /mcp {
+		reverse_proxy 127.0.0.1:7271 {
+			header_up Host 127.0.0.1
+		}
+	}
+
+	handle {
+		respond 404
+	}
+}
