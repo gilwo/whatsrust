@@ -365,7 +365,111 @@ CLI's connection-refused message in §3.
 
 ---
 
-## 5a. Embedder sidecar (optional semantic search)
+## 5a. MCP over HTTP (opt-in listener)
+
+**Goal:** serve MCP tools over HTTP instead of stdio, enabling clients like
+Claude Code, MCP Inspector, and official SDK clients (tested: Python SDK
+1.30.0, Rust rmcp 3.5.1) to connect over HTTP. The listener is off by
+default; enable it with its own port, token, and bind address. TLS is added
+through a reverse proxy.
+
+**Enable:** set `WHATSRUST_MCP_PORT` (e.g. 7271; unset or 0 = off),
+`WHATSRUST_MCP_TOKEN` (required; at least 22 characters; generate with
+`openssl rand -base64 32`; must differ from `WHATSRUST_API_TOKEN`), and
+`WHATSRUST_MCP_BIND` (default 127.0.0.1). To bind to a non-loopback address
+(e.g. 0.0.0.0), set `WHATSRUST_MCP_ALLOW_REMOTE=1` (the token and messages
+travel in cleartext unless a TLS proxy is in front; the daemon logs a
+warning). Read-only mode: `WHATSRUST_MCP_READ_ONLY=1` offers only the 6 read
+tools; write tools are refused with JSON-RPC `-32600`.
+
+**Startup refusals (daemon exits):** unparseable port, remote bind without
+`WHATSRUST_MCP_ALLOW_REMOTE=1`, missing or short token (under 22 characters),
+token equal to `WHATSRUST_API_TOKEN`, or MCP port equal to the REST port. The
+daemon prints the exact fix before exiting.
+
+**.env loading:** the daemon reads `.env` only in daemon mode; the CLI and
+`whatsrust mcp` (stdio) read tokens from the process environment.
+
+**Endpoint:** `POST /mcp` only; other paths get 404, other methods 405 + `Allow: POST`. Stateless (no `Mcp-Session-Id` ever issued). Dual-era: modern (2026-07-28: `server/discover`, request-metadata headers `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, plus `_meta` version key) and legacy (2025-11-25 / 2025-06-18: `initialize` handshake). 34 tools, same validation as stdio.
+
+**Claude Code config:** the official Claude Code MCP docs (https://code.claude.com/docs/en/mcp.md) support `${VAR}` / `${VAR:-default}` expansion in `url` and `headers`, and a per-server `timeout` (ms) that overrides `MCP_TOOL_TIMEOUT`. Recommended config (keeps the token out of argv and the config file):
+```json
+{ "mcpServers": { "whatsrust": { "type": "http", "url": "http://127.0.0.1:7271/mcp",
+    "headers": { "Authorization": "Bearer ${WHATSRUST_MCP_TOKEN}" }, "timeout": 120000 } } }
+```
+or `claude mcp add-json whatsrust '{"type":"http","url":"http://127.0.0.1:7271/mcp","headers":{"Authorization":"Bearer ${WHATSRUST_MCP_TOKEN}"},"timeout":120000}'` (add `--scope user` for all projects).
+
+**Warning:** `claude mcp add --header "Authorization: Bearer $TOKEN"` with double quotes puts the token in argv and stores it in plain text in `~/.claude.json`.
+
+**Timeout:** why 120000 ms: the listener sends nothing until the tool finishes; the tool budget is 40 s from the moment the request body is complete, and a body may take up to min(60 s, 20 s + 4 s per MiB) to arrive, so a slow 10 MiB upload can approach 100 s. Any generic MCP HTTP client should allow at least 50 s plus its upload time.
+
+**curl test (zsh/bash safe, token not in argv):** write the header to a mode-600 file and pass it through `@`:
+```bash
+umask 077
+printf 'Authorization: Bearer %s\n' "$WHATSRUST_MCP_TOKEN" > ~/.whatsrust-mcp.hdr
+
+# Legacy initialize handshake
+curl -s -X POST http://127.0.0.1:7271/mcp \
+  -H 'Content-Type: application/json' \
+  -H @"$HOME/.whatsrust-mcp.hdr" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}'
+
+# Legacy tools/list (note: header must be sent for legacy after initialize)
+curl -s -X POST http://127.0.0.1:7271/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
+  -H @"$HOME/.whatsrust-mcp.hdr" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+# Modern server/discover (no initialize): MCP-Protocol-Version and Mcp-Method headers plus the _meta
+# version key; a modern tools/call also needs Mcp-Name: <tool name>
+curl -s -X POST http://127.0.0.1:7271/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: server/discover' \
+  -H @"$HOME/.whatsrust-mcp.hdr" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}'
+```
+
+**Reverse proxy:** use `deploy/proxy/nginx-mcp.conf` or `deploy/proxy/Caddyfile` as production templates. They add TLS, forward only `/mcp` (other paths 404), rewrite Host to 127.0.0.1 (so the loopback gate passes without `WHATSRUST_ALLOWED_HOSTS`), and cap the body at 10 MiB. nginx needs version 1.25.1 or newer for `http2 on;`. Caddy's `MB` is 10^6 bytes, so the file uses `10MiB`. nginx always buffers the request body and sends a Content-Length; Caddy forwards a chunked HTTP/1.1 upload as chunked, which the listener answers with 411. ngrok: not used for testing (it would expose the listener publicly and tests ngrok's edge); if someone uses it anyway, it forwards the public Host unless run with `--host-header=rewrite`.
+
+**Proxy playbook:** `scripts/mcp-proxy-smoke.sh` runs real `nginx:alpine` and `caddy:2-alpine` in Docker in front of a running listener on 127.0.0.1:18443 / 18444 with self-signed certs in a temp dir; needs docker, openssl, curl; reads `WHATSRUST_MCP_TOKEN` and `MCP_UPSTREAM_PORT` (default 7271); cleans up on exit. Run it against your own daemon with the listener on, or as `cargo test proxy_smoke_docker -- --ignored --nocapture` (test listener, no WhatsApp contact). Checks per proxy (8): initialize, tools/list 34, tools/call status, modern server/discover with Mcp-* headers, /api/status → 404, 10.4 MB body passes, >10 MiB → 413, no token → 401. Verified 2026-10-19: 16/16 PASS (nginx 1.31.7, Caddy 2.11.7, Docker Desktop 29.8.2).
+
+**Logging:** every request gets one log line in one of four `whatsrust::mcp::*` targets, so `RUST_LOG` can filter each. Targets: `whatsrust::mcp::call` (tools/call; info ok, warn otherwise), `whatsrust::mcp::infra` (listener start, initialize/server/discover with peer, tools/list, ping, notifications; accept/close at debug; 503 at warn), `whatsrust::mcp::reject` (pre-dispatch refusals: routing, framing, 415 content type, parse/batch/envelope, -32022, -32020; debug), `whatsrust::mcp::auth` (401 token, 403 Origin/Host gate, with peer; warn). One line per request (message "mcp request" / "mcp request rejected"); never arguments, bodies, tokens, the JSON-RPC id or raw header values; unknown method/tool/version strings are masked. Example lines:
+```
+INFO whatsrust::mcp::call: mcp request method="tools/call" tool="whatsrust_status" era="legacy" outcome="ok" status=200 duration_ms=0
+WARN whatsrust::mcp::auth: mcp request rejected outcome="rejected" status=401 reason="token" peer=127.0.0.1:51652 duration_ms=1
+```
+
+**RUST_LOG filter examples:** `RUST_LOG=whatsrust=info,whatsrust::mcp::infra=warn` (quiet list/ping polling), `RUST_LOG=whatsrust=info,whatsrust::mcp::reject=debug` (see refusals).
+
+**Note:** modern clients may skip `server/discover`, so not every client gets an "initialization" line with its IP.
+
+**fail2ban:** filter on `whatsrust::mcp::auth` lines (`status=401 ... peer=<HOST>:<port>`). The daemon logs to stdout and colours its output unless `NO_COLOR` is set to a non-empty value (tracing-subscriber 0.3.23), so write a plain log file for fail2ban, e.g. `NO_COLOR=1 whatsrust >> /var/log/whatsrust.log 2>&1` (or match the escape codes). Two files:
+```ini
+# /etc/fail2ban/filter.d/whatsrust-mcp.conf
+[Definition]
+failregex = whatsrust::mcp::auth: mcp request rejected .*status=401 .*peer=<HOST>:\d+
+```
+```ini
+# /etc/fail2ban/jail.d/whatsrust-mcp.conf
+[whatsrust-mcp]
+enabled  = true
+filter   = whatsrust-mcp
+port     = 7271
+logpath  = /var/log/whatsrust.log
+maxretry = 5
+bantime  = 600
+```
+Behind a proxy the peer is the proxy's address, so fail2ban belongs on the proxy's access log in that setup.
+
+**Metrics:** `/api/status` (and `/health`, `/`) now has `"mcp_http"`: `null` when the listener is off, otherwise an object with: `requests_total` (requests whose head was read, whatever became of them), `tools_called_total` (tools/call requests that ran a REST call), `errors_total` (dispatched requests that ended in a JSON-RPC error or an isError result), `rejects_total` (requests refused before dispatch: routing, token, gate, framing, unreadable body, bad envelope/id/era/version/headers), `timeouts_total` (tool calls that outlasted the 40 s budget), `unavailable_503_total` (responses with status 503: no connection slot or no lane permit), `tasks_outlived_response` (gauge: tool tasks still running after their timeout response was sent), `in_flight` (read/write/large_body: permits in use), `available_permits` (read/write/large_body: permits free). Visible through `whatsrust status` and the `whatsrust_status` MCP tool. This is a deliberate REST change (one golden fixture updated).
+
+**Verification:** see the test counts and ignored tests in §6.
+
+---
+
+## 5b. Embedder sidecar (optional semantic search)
 
 **Goal:** enable semantic (embedding-based) search on top of the always-on
 FTS5 lexical search, with **hybrid recall** (ADR 0041): paraphrase and
@@ -613,9 +717,9 @@ do, via the Makefile.
 
 **Steps:**
 ```bash
-make test        # cargo test — default suite (592 lib + 586 bin tests, 2 ignored per target, verified 2026-10-19)
+make test        # cargo test — default suite (616 lib + 610 bin tests, 3 ignored per target, verified 2026-10-19)
 make test-all     # cargo test --features fake-embedder — also runs the
-                   # fake-embedder sidecar round-trip tests (601 lib + 595 bin;
+                   # fake-embedder sidecar round-trip tests (625 lib + 619 bin;
                    # 9 extra tests per target vs `make test`, gated behind the
                    # non-default `fake-embedder` Cargo feature so a plain
                    # `cargo build`/`cargo test` never touches that sidecar
@@ -643,16 +747,16 @@ make fmt          # cargo fmt — reformats the codebase in place. Not run as
 - `make help` — lists all targets with one-line descriptions, default target.
 - `make build` — `Finished \`dev\` profile [unoptimized + debuginfo] target(s)`, exit 0.
 - `make lint` — `whatsrust (bin "whatsrust") generated 48 warnings`, exit 0 (non-fatal).
-- `make test` — `test result: ok. 592 passed; 0 failed; 2 ignored ...` (lib) and
-  `test result: ok. 586 passed; 0 failed; 2 ignored ...` (bin), exit 0 (verified 2026-10-19).
-- `make test-all` — `test result: ok. 601 passed; 0 failed; 2 ignored ...` (lib, includes
-  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 595 passed; 0 failed; 2 ignored ...` (bin), exit 0 (verified 2026-10-19).
+- `make test` — `test result: ok. 616 passed; 0 failed; 3 ignored ...` (lib) and
+  `test result: ok. 610 passed; 0 failed; 3 ignored ...` (bin), exit 0 (verified 2026-10-19).
+- `make test-all` — `test result: ok. 625 passed; 0 failed; 3 ignored ...` (lib, includes
+  the 9 extra fake-embedder-gated tests per target) and `test result: ok. 619 passed; 0 failed; 3 ignored ...` (bin), exit 0 (verified 2026-10-19).
 
 `CONTRIBUTING.md` asks contributors to run `cargo test` and `cargo clippy`
 before submitting a PR — `make test` and `make lint` are equivalent to that,
 plus `make test-all` for full coverage of the embedder sidecar path.
 
-**Ignored tests (MCP SDK smokes):** The test suite includes two ignored tests per target that run official MCP SDKs against a test MCP listener. Neither contacts WhatsApp; both pass their test token through `WHATSRUST_MCP_TOKEN`.
+**Ignored tests (MCP SDK smokes + proxy smoke):** The test suite includes three ignored tests per target. `sdk_smoke_python` and `sdk_smoke_rmcp` run official MCP SDKs (Python 1.30.0, Rust rmcp 3.5.1) against a test MCP listener. `proxy_smoke_docker` runs `scripts/mcp-proxy-smoke.sh`: real nginx and Caddy in Docker in front of a test listener. None contact WhatsApp; all pass their test token through `WHATSRUST_MCP_TOKEN`.
 - `sdk_smoke_python`: The official Python MCP SDK (mcp<2, Streamable HTTP client). Run with `cargo test sdk_smoke_python -- --ignored --nocapture`. Needs `uv` (Python package manager) and downloads `mcp<2` from PyPI. Verifies the legacy handshake and tools/call.
 - `sdk_smoke_rmcp`: The official Rust MCP SDK `rmcp` =3.5.1 (client + transport-streamable-http-client-reqwest) from a standalone crate (`tools/mcp-smoke-rs/`). Run with `cargo test sdk_smoke_rmcp -- --ignored --nocapture`. The first build downloads crates. Supports three modes: `--mode modern` (server/discover), `--mode auto` (probe server/discover, fallback to initialize), `--mode legacy` (initialize). Verifies dual-era support and modern request handling.
 

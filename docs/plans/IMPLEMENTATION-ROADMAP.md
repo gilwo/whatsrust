@@ -177,7 +177,7 @@ against a *trusted* sidecar or rare inputs. Fix opportunistically or during a la
 
 ---
 
-## F3 — MCP Streamable HTTP listener (in progress: Phases 0a–4 done 2026-10-19; Phase 5 open)
+## F3 — MCP Streamable HTTP listener (done 2026-10-19)
 
 **Goal:** Dedicated `/mcp` HTTP listener inside the daemon for MCP clients, alongside the existing stdio transport.
 
@@ -189,7 +189,7 @@ against a *trusted* sidecar or rare inputs. Fix opportunistically or during a la
 - Phase 2: `/mcp` skeleton (opt-in, separate bind, routing, era detection, read-only switch) — done 2026-10-18 (initialize, ping, tools/list live; tools/call stubbed)
 - Phase 3: Legacy request handling (tools/call live, lanes, golden test, SDK test) — done 2026-10-18 (tools/call in-process via registry, permit lanes split by stage, 40 s tool budget from body completion; SDK gate passed; proxy test moved to Phase 5)
 - Phase 4: Modern request handling (dual-era, modern SDK gate) — done 2026-10-19
-- Phase 5: Polish, logging, metrics, documentation
+- Phase 5: Polish, logging, metrics, documentation — done 2026-10-19 (four log targets, `/api/status` mcp_http snapshot, Docker proxy playbook, docs/HOWTO.md §5a, ADR 0045 amendment)
 
 ---
 

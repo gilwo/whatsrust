@@ -2,6 +2,7 @@
 
 **Date:** 2026-10-15  
 **Version:** 5  
+**Status:** Implemented (2026-10-19)  
 **Related:** ADR 0045
 
 ## Spec References
@@ -668,15 +669,17 @@ The gate prevents CSRF, DNS rebinding, and simple cross-site requests.
 
 **Separate listener eliminates the shared-port risk.** The MCP listener serves only `/mcp`; REST routes do not exist there. A proxy pointed at `WHATSRUST_MCP_PORT` cannot reach REST by construction. Separate tokens ensure a leaked MCP token does not expose REST.
 
-**Documented proxy snippet (nginx + Caddy):** The off-machine recipe is a TLS proxy that rewrites `Host` to `127.0.0.1`. This keeps the daemon loopback-only, needs no allowlist, does not trigger the REST token rule, and leaves the CLI and stdio untouched. Tested against real nginx and Caddy before Phase exit. The snippet:
+**Documented proxy snippets (tested):** The off-machine recipe is a TLS proxy that rewrites `Host` to `127.0.0.1`. This keeps the daemon loopback-only, needs no allowlist, does not trigger the REST token rule, and leaves the CLI and stdio untouched. Tested against real nginx and Caddy before Phase exit — the production-ready configs live in `deploy/proxy/nginx-mcp.conf` and `deploy/proxy/Caddyfile`; the snippets below are summarised from those files.
 
+nginx (needs version 1.25.1 or newer for `http2 on;`; older versions use `listen 443 ssl http2;`):
 ```nginx
 upstream mcp_backend {
     server 127.0.0.1:7271;
 }
 
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    http2 on;
     server_name mcp.example.com;
 
     ssl_certificate /path/to/cert.pem;
@@ -698,19 +701,30 @@ server {
 }
 ```
 
-Caddy equivalent:
+Caddy (Caddy's `MB` is 10^6 bytes, so the file uses `10MiB`; also needs `handle { respond 404 }` to 404 other paths):
 ```
 mcp.example.com {
-    reverse_proxy /mcp 127.0.0.1:7271 {
-        header_up Host 127.0.0.1
-    }
+    tls /path/to/cert.pem /path/to/key.pem
+
     request_body {
-        max_size 10MB
+        max_size 10MiB
+    }
+
+    handle /mcp {
+        reverse_proxy 127.0.0.1:7271 {
+            header_up Host 127.0.0.1
+        }
+    }
+
+    handle {
+        respond 404
     }
 }
 ```
 
-**No `limit_req`.** A stateless endpoint receives discover, list, and each call as separate POSTs. A rate limit on all requests throttles legitimate sessions. Instead: rely on high-entropy token + document optional failure-based throttling (e.g. fail2ban on 401s). `client_max_body_size` set to envelope size (10 MB).
+**nginx buffers the body and always sends Content-Length; Caddy forwards a chunked HTTP/1.1 upload as chunked, which the listener answers with 411.** ngrok was not used for testing (it would expose the listener publicly and tests ngrok's edge); if someone uses it anyway, it forwards the public Host unless run with `--host-header=rewrite`.
+
+**No `limit_req`.** A stateless endpoint receives discover, list, and each call as separate POSTs. A rate limit on all requests throttles legitimate sessions. Instead: rely on high-entropy token + document optional failure-based throttling (e.g. fail2ban on 401s). `client_max_body_size` set to envelope size (10 MB). fail2ban belongs on the proxy's access log when a proxy is present (the listener sees only the proxy's IP).
 
 **Remaining risks documented:** None for the MCP listener itself (isolated). For users who expose REST through a separate proxy, `path` mode remains reachable with `WHATSRUST_API_TOKEN`; that is an accepted risk of the REST API's local-file feature.
 
@@ -871,33 +885,31 @@ The existing `http_response()` can generate 202 with no body. No new helper is n
 
 ## 12. Operability
 
-### Logging
+### Logging (as built)
 
-One log line per `/mcp` request (method + outcome + duration, never args or header values beyond the canned reason):
+One log line per `/mcp` request, in one of four `whatsrust::mcp::*` targets so `RUST_LOG` can filter each:
+- `whatsrust::mcp::call` (tools/call; info for ok, warn otherwise)
+- `whatsrust::mcp::infra` (listener start, initialize/server/discover with peer, tools/list, ping, notifications; accept/close at debug; 503 at warn)
+- `whatsrust::mcp::reject` (pre-dispatch refusals: routing, framing, 415 content type, parse/batch/envelope, -32022, -32020; debug)
+- `whatsrust::mcp::auth` (401 token, 403 Origin/Host gate, with peer; warn)
 
+One line per request (message "mcp request" / "mcp request rejected"); never arguments, bodies, tokens, the JSON-RPC id or raw header values; unknown method/tool/version strings are masked. The peer IP (with port) appears on auth failures and on initialize/server/discover. Modern clients may skip `server/discover`, so not every client gets an "initialization" line.
+
+Example lines (from tests):
 ```
-info!(method = "tools/call", tool = "whatsrust_send", outcome = "ok", duration_ms = 123, "mcp request");
-info!(method = "server/discover", outcome = "ok", duration_ms = 5, "mcp request");
-```
-
-Errors log the error type:
-
-```
-warn!(method = "tools/call", tool = "whatsrust_send", outcome = "error", error = "isError: true", duration_ms = 5, "mcp request");
-warn!(method = "tools/list", outcome = "error", error = "401", duration_ms = 2, "mcp request");
-```
-
-Rejections (era, version, client name):
-
-```
-debug!(era = "legacy", version = "2025-03-26", method = "initialize", outcome = "rejected", reason = "unsupported version", "mcp request");
+INFO whatsrust::mcp::call: mcp request method="tools/call" tool="whatsrust_status" era="legacy" outcome="ok" status=200 duration_ms=0
+WARN whatsrust::mcp::auth: mcp request rejected outcome="rejected" status=401 reason="token" peer=127.0.0.1:51652 duration_ms=1
 ```
 
-### Metrics
+RUST_LOG filter examples: `RUST_LOG=whatsrust=info,whatsrust::mcp::infra=warn` (quiet list/ping polling), `RUST_LOG=whatsrust=info,whatsrust::mcp::reject=debug` (see refusals).
 
-`/api/status` gains:
-- **Counters:** `mcp_http_requests_total`, `mcp_http_tools_called_total`, `mcp_http_errors_total`, `mcp_http_rejects_total` (era/version/method rejections), `mcp_http_timeouts_total`, `mcp_http_503_total`.
-- **Gauges:** `mcp_http_in_flight_read_lane`, `mcp_http_in_flight_write_lane`, `mcp_http_in_flight_large_body_lane`, `mcp_http_available_read_permits`, `mcp_http_available_write_permits`, `mcp_http_available_large_body_permits`, `mcp_http_tasks_outlived_response` (tasks still running after their response was sent).
+### Metrics (as built)
+
+`/api/status` (and `/health`, `/`) now has `"mcp_http"`: `null` when the listener is off, otherwise an object with:
+- **Counters:** `requests_total` (requests whose head was read, whatever became of them), `tools_called_total` (tools/call requests that ran a REST call), `errors_total` (dispatched requests that ended in a JSON-RPC error or an isError result), `rejects_total` (requests refused before dispatch: routing, token, gate, framing, unreadable body, bad envelope/id/era/version/headers), `timeouts_total` (tool calls that outlasted the 40 s budget), `unavailable_503_total` (responses with status 503: no connection slot or no lane permit), `tasks_outlived_response` (gauge: tool tasks still running after their timeout response was sent).
+- **Gauges:** `in_flight` (read/write/large_body: permits in use), `available_permits` (read/write/large_body: permits free).
+
+This is a deliberate REST change (one golden fixture updated). The metrics are visible through `whatsrust status` and the `whatsrust_status` MCP tool.
 
 **Kill switch and token rotation:** A kill switch exists (port 0 or unset, restart). Token rotation with two overlapping tokens is a planned follow-up (YAGNI for MVP; requires daemon restart today, which briefly drops the WhatsApp session).
 
@@ -1084,21 +1096,23 @@ That step updates the golden fixtures on purpose, so every changed byte shows up
 
 ### Phase 5: Polish and Documentation
 
-- Add logging (per-request line, method + outcome + duration, never args or full header values; rejections with era/version/method).
-- Add metrics (`/api/status` counters: `mcp_http_requests_total`, `mcp_http_tools_called_total`, `mcp_http_errors_total`, `mcp_http_rejects_total`).
-- Error-case tests (unknown tool, malformed JSON, gate, token, oversized body (413 from Content-Length), 504 timeout, undeclared keys, batching rejection, 405/411/413 with JSON-RPC error bodies, notifications accepted unconditionally).
-- Concurrency test: 10 parallel calls, verify no deadlock and permit release (permits held until tasks end).
-- **Proxy snippet testing (moved from Phase 3):** Test the documented nginx and Caddy snippets against real servers (`brew install nginx caddy` + self-signed TLS; ask owner before installing). Verify: TLS, `client_max_body_size` / `max_size`, Host rewrite to 127.0.0.1, POST forwarding. No `limit_req` in the snippet.
-- Update `.env.example` (document `WHATSRUST_MCP_PORT`, `WHATSRUST_MCP_TOKEN`, token rules, token must differ from REST token).
-- Update `README.md` (F3 feature, separate listener, off by default, separate token required, TLS recommended, target clients: Claude Code, MCP Inspector, official SDK clients).
-- Update `docs/HOWTO.md`:
-  - How to enable MCP listener (set `WHATSRUST_MCP_PORT`), configure `WHATSRUST_MCP_TOKEN`, test with curl.
-  - Proxy snippet (nginx + Caddy, tested), `WHATSRUST_ALLOWED_HOSTS` setting.
-  - **Minimum client timeout:** Third-party MCP clients should set their timeout ≥50 s plus their upload time to reliably receive the structured timeout response (daemon tool timeout is 40 s from body completion; worst-case response time ≈ body time + 40 s).
-  - `.env` loading: only in daemon mode; CLI and `whatsrust mcp` read tokens from process environment.
-  - Fail2ban example for 401 throttling (replaces `limit_req`).
-- Update `docs/plans/FEATURES.md` (F3 → ✅).
-- Add ADR 0045 to `docs/adr/0000-index.md`.
+**Implemented (2026-10-19).**
+
+**What shipped:**
+- **Logging:** Four scoped `whatsrust::mcp::*` targets (`call`, `infra`, `reject`, `auth`), so `RUST_LOG` can filter each. One line per request (message "mcp request" / "mcp request rejected"); never arguments, bodies, tokens, the JSON-RPC id or raw header values; unknown method/tool/version strings are masked. The peer IP (with port) appears on auth failures and on initialize/server/discover. Modern clients may skip `server/discover`, so not every client gets an "initialization" line. Examples: `INFO whatsrust::mcp::call: mcp request method="tools/call" tool="whatsrust_status" era="legacy" outcome="ok" status=200 duration_ms=0`, `WARN whatsrust::mcp::auth: mcp request rejected outcome="rejected" status=401 reason="token" peer=127.0.0.1:51652 duration_ms=1`.
+- **Metrics:** `/api/status` (and `/health`, `/`) now has `"mcp_http"`: `null` when the listener is off, otherwise an object with counters (`requests_total`, `tools_called_total`, `errors_total`, `rejects_total`, `timeouts_total`, `unavailable_503_total`, `tasks_outlived_response`) and gauges (`in_flight` and `available_permits` for read/write/large_body lanes). Definitions documented in §12. This is a deliberate REST change (one golden fixture updated).
+- **Proxy snippet testing:** `scripts/mcp-proxy-smoke.sh` runs real `nginx:alpine` and `caddy:2-alpine` in Docker in front of a running listener (needs docker, openssl, curl; env `WHATSRUST_MCP_TOKEN`, `MCP_UPSTREAM_PORT` default 7271; containers on 127.0.0.1:18443/18444; self-signed cert in a temp dir; token passed via a mode-600 header file; cleans up). Checks per proxy (8): initialize, tools/list 34, tools/call status, modern server/discover with Mcp-* headers, /api/status → 404, 10.4 MB body passes, >10 MiB → 413, no token → 401. Verified 2026-10-19: 16/16 PASS (nginx 1.31.7, Caddy 2.11.7, Docker Desktop 29.8.2). Also runs as ignored test `proxy_smoke_docker` in `cargo test`. (Owner decision: Docker instead of `brew install nginx caddy`, so it's a contained test that leaves the host untouched.)
+- **Documentation:** `.env.example` updated (five `WHATSRUST_MCP_*` variables with startup rules); `README.md` updated (MCP over HTTP paragraph, dual-era, tested clients, pointer to HOWTO §5a); `docs/HOWTO.md` updated (new section §5a "MCP over HTTP (opt-in listener)" covering enable, startup refusals, endpoint, Claude Code config, curl test, reverse proxy, logging, fail2ban, metrics, test counts updated to 616 lib + 610 bin, 3 ignored per target); `docs/plans/FEATURES.md` (F3 → ✅ Done 2026-10-19, Phase 5 done, follow-ups listed); `docs/plans/IMPLEMENTATION-ROADMAP.md` (F3 done 2026-10-19, Phase 5 done); design doc §8 proxy snippets updated (point to `deploy/proxy/`, Caddy `10MiB` correction, 404 handle, nginx 1.25.1 note, chunked-upload note); design doc §12 logging and metrics updated (as built); design doc §14 Phase 5 updated (this section); ADR 0045 amended (see below).
+- **Tests:** `make test` 616 lib + 610 bin (3 ignored each); `make test-all` 625 + 619 (3 ignored each); `make lint` 36 lib / 48 bin unchanged. Verified 2026-10-19.
+
+**Owner decisions:**
+1. **Full metrics:** All proposed counters and gauges shipped, grouped in one `/api/status` `mcp_http` object (not flat top-level keys). This is a deliberate REST change.
+2. **Four log scopes:** `call`, `infra`, `reject`, `auth` as four `whatsrust::mcp::*` targets, so `RUST_LOG` can filter each independently. The peer IP (with port) appears on auth failures and on initialize/server/discover (not on every request).
+3. **Docker proxy playbook instead of brew/ngrok:** The proxy smoke test runs real nginx and Caddy in Docker containers in front of the listener, with self-signed TLS in a temp dir. Verified against both proxies. This avoids installing nginx/caddy on the host or exposing the listener through ngrok.
+
+**ADR 0045 amendment (2026-10-19):** Documents the four log scopes, masking and peer-IP rule, metrics in `/api/status` (REST change), proxy configs tested in Docker (results), the Caddy `MiB` correction and chunked-upload limitation. Appended as a separate section at the end of ADR 0045 (the ADR is accepted, so amendments follow the original text).
+
+**Exit criteria:** Met. Logging implemented with four scoped targets. Metrics in `/api/status`. Proxy snippet tested in Docker (16/16 PASS). Documentation updated (HOWTO §5a, README, .env.example, FEATURES.md, IMPLEMENTATION-ROADMAP.md, design doc §8/12/14, ADR 0045 amendment). Test counts: 616 lib + 610 bin (3 ignored each).
 
 **Exit criteria:** Feature documented. Token policy enforced. HOWTO updated with minimum client timeout and proxy snippets. Manual verification with MCP clients (done in Phase 3 SDK test).
 
