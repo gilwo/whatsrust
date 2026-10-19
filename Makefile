@@ -10,7 +10,7 @@
 # Model for the Rust embedder sidecar: bge-m3 (default, stronger multilingual/cross-language
 # recall) or minilm (lighter, faster). Override on the command line, e.g.:
 #   make run-semantic EMBED_MODEL=minilm
-# See docs/HOWTO.md #5a "Choosing a model" and docs/adr/0041-hybrid-recall-bounded-vector-scan.md.
+# See docs/HOWTO.md #5b "Choosing a model" and docs/adr/0041-hybrid-recall-bounded-vector-scan.md.
 EMBED_MODEL ?= bge-m3
 
 # Optional per-run device name override for `run`/`run-semantic` (device-name-at-pairing
@@ -67,7 +67,7 @@ dist: release-all ## Collect the release binaries (daemon + embedder sidecar) in
 # with WHATSRUST_EMBEDDER_ARGS="--model $(EMBED_MODEL)" selecting the model).
 # Requires a linked account. On first run, the sidecar downloads model weights
 # to ~/.cache/huggingface (lazy, on first embed): ~0.46 GB for minilm, ~2.2 GB
-# for bge-m3. No Python/venv. See docs/HOWTO.md #5a for the full walkthrough.
+# for bge-m3. No Python/venv. See docs/HOWTO.md #5b for the full walkthrough.
 run-semantic: embedder-build ## Run the daemon with Rust embedder sidecar enabled (EMBED_MODEL=bge-m3|minilm, default bge-m3; optional DEVICE_NAME=<name>; e.g. make run-semantic EMBED_MODEL=minilm)
 	WHATSRUST_EMBEDDER_CMD=$(CURDIR)/embedder-rs/target/release/whatsrust-embedder \
 	WHATSRUST_EMBEDDER_ARGS="--model $(EMBED_MODEL)" \
