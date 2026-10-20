@@ -181,8 +181,13 @@ Keep each debug/live run's state out of the project root (added 2026-10-19).
   pre-migration `.bak` files) and runs are started from the repo root, so the root collects DBs,
   backups and logs from every run.
 - **As built:** one gitignored folder per profile, `runs/<profile>/`, with its own `.env`, DB and
-  `logs/`. `scripts/run-profile.sh` (`new`, `list [--tmux]`, `daemon`, `attach`, `cli`, `mcp`, `env`) and
-  `make new-profile` / `make run-profile` / `make attach-profile`; no Rust change. `daemon` runs in the
+  `logs/`. `scripts/run-profile.sh` (`new [--semantic] [--mcp]`, `list [--tmux]`, `daemon`, `attach`, `cli`,
+  `mcp`, `env`, `mcp-on`, `mcp-off`, `mcp-client`) and `make new-profile` (`SEMANTIC=1`, `MCP=1`) /
+  `make run-profile` / `make attach-profile`; no Rust change. `mcp-on` / `mcp-off` switch the profile's HTTP MCP
+  listener (§5a) in its `.env`: port = the reserved one, else REST+1, else the next free; token = kept, else
+  the exported `WHATSRUST_MCP_TOKEN` (validated), else `openssl rand -base64 32`; the `.env` is rewritten with
+  bash builtins only (token never printed, never in argv, file stays mode 600); `mcp-off` keeps the token line;
+  `mcp-client` prints the URL and a Claude Code config using `${WHATSRUST_MCP_TOKEN}` (2026-10-20). `daemon` runs in the
   current terminal by default; `--tmux` (`USE_TMUX=1` for make) opts in to session `whatsrust-<profile>`
   (attach when interactive; an exit note keeps the pane open until Enter) and `--detach` implies `--tmux`;
   with tmux missing, `--tmux` is an error, never a silent fallback. `list` shows every profile with a TMUX

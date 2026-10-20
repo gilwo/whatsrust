@@ -77,9 +77,9 @@ run-semantic: embedder-build ## Run the daemon with Rust embedder sidecar enable
 # Dev run profiles (F9): each run keeps its state (DB, backups, instance lock, logs, .env) in
 # runs/<profile>/ instead of the project root; see scripts/run-profile.sh and docs/HOWTO.md #3
 # "Run profiles". P is read from the environment inside the recipe (no re-parsing as shell code).
-new-profile: ## Create runs/<profile>/ with logs/ and a .env (make new-profile P=<name> [SEMANTIC=1])
+new-profile: ## Create runs/<profile>/ with logs/ and a .env; MCP=1 also switches its HTTP MCP listener on (make new-profile P=<name> [SEMANTIC=1] [MCP=1])
 	@test -n "$$P" || { echo "Error: set P=<profile>, e.g. make new-profile P=dev" >&2; exit 1; }
-	scripts/run-profile.sh new "$$P" $(if $(SEMANTIC),--semantic)
+	scripts/run-profile.sh new "$$P" $(if $(SEMANTIC),--semantic) $(if $(MCP),--mcp)
 
 run-profile: ## Run the daemon with state in runs/<profile>/, in this terminal; USE_TMUX=1 runs it in a tmux session (make run-profile P=<name> [RELEASE=1] [USE_TMUX=1])
 	@test -n "$$P" || { echo "Error: set P=<profile>, e.g. make run-profile P=dev (create it first: make new-profile P=dev)" >&2; exit 1; }

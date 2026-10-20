@@ -219,7 +219,7 @@ and `logs/`. The launcher `scripts/run-profile.sh` just starts the daemon with t
 directory; there is no Rust change.
 
 ```bash
-scripts/run-profile.sh new dev              # create runs/dev/ (logs/ + .env); --semantic enables the embedder sidecar
+scripts/run-profile.sh new dev              # create runs/dev/ (logs/ + .env); --semantic enables the embedder sidecar, --mcp switches the HTTP MCP listener on
 scripts/run-profile.sh daemon dev           # build once (--release for the release binary), run in runs/dev/ in THIS terminal; Ctrl+C stops it
 scripts/run-profile.sh daemon dev --tmux    # same, but in tmux session whatsrust-dev (opt-in); attaches when run from a terminal
 scripts/run-profile.sh daemon dev --detach  # implies --tmux; leave it running in the background (prints how to attach)
@@ -228,9 +228,12 @@ scripts/run-profile.sh list                 # every profile: REST/MCP port, DB p
 scripts/run-profile.sh list --tmux          # only the profiles whose daemon runs in a tmux session
 scripts/run-profile.sh cli dev status       # `whatsrust status` against dev's daemon
 scripts/run-profile.sh mcp dev              # `whatsrust mcp` (stdio) against dev's daemon, for an MCP client config
-scripts/run-profile.sh env dev              # port/bind and whether a token is set (the token is never shown)
+scripts/run-profile.sh env dev              # port/bind, whether a token is set, whether the MCP listener is on (tokens are never shown)
+scripts/run-profile.sh mcp-on dev           # switch the HTTP MCP listener (§5a) on: port + token go into the .env, the token is never shown
+scripts/run-profile.sh mcp-off dev          # switch it off again (the token line stays)
+scripts/run-profile.sh mcp-client dev       # URL, Claude Code config (token as ${WHATSRUST_MCP_TOKEN}) and how to export the token
 scripts/run-profile.sh --help               # all commands, options, environment variables, examples, exit codes
-make new-profile P=dev [SEMANTIC=1]                 # same as `new`
+make new-profile P=dev [SEMANTIC=1] [MCP=1]         # same as `new` (MCP=1 adds --mcp)
 make run-profile P=dev [RELEASE=1] [USE_TMUX=1]     # same as `daemon` (USE_TMUX=1 adds --tmux)
 make attach-profile P=dev                           # same as `attach`
 ```
@@ -242,10 +245,9 @@ make attach-profile P=dev                           # same as `attach`
 - **`.env`:** generated from `.env.example` (every example line stays commented) with an active block on top:
   `WHATSRUST_PORT`, `WHATSRUST_DEVICE_NAME=whatsrust-<profile>` (each profile is its own linked device, so
   each shows up under its own name) and `RUST_LOG`. With `--semantic` it also sets
-  `WHATSRUST_EMBEDDER_CMD`/`WHATSRUST_EMBEDDER_ARGS` (run `make embedder-build` once). The MCP listener
-  (§5a) is off: to enable it, uncomment `WHATSRUST_MCP_PORT` and `WHATSRUST_MCP_TOKEN` in the profile's
-  `.env` and paste a token you generate with `openssl rand -base64 32`. The script never generates or prints
-  a token. Profile names use letters, digits, `.`, `_`, `-`.
+  `WHATSRUST_EMBEDDER_CMD`/`WHATSRUST_EMBEDDER_ARGS` (run `make embedder-build` once). The HTTP MCP
+  listener (§5a) starts off, with its port reserved as a commented `# WHATSRUST_MCP_PORT=<port>` line: switch it
+  on with `mcp-on` (below) or create the profile with `new --mcp`. Profile names use letters, digits, `.`, `_`, `-`.
 - **Default: this terminal.** `daemon` builds once (build errors show right there), then runs the daemon in the
   current terminal with `runs/<profile>/` as its working directory. The REPL on stdin works as usual and **Ctrl+C**
   is the normal graceful stop. It ends with `daemon exited with code <n> (log: ...)`. Closing the terminal stops
@@ -291,7 +293,48 @@ make attach-profile P=dev                           # same as `attach`
 - **Testing/advanced:** `RUN_PROFILE_TMUX_SOCKET=<name>` makes every tmux call of the script use the private
   server `tmux -L <name>` instead of your default one (used by the script's own checks).
 
-**Demo playbook.** Two short flows with a throwaway profile named `demo`. Paths are shown as `<repo>/...`; the
+**MCP listener (HTTP) of a profile.** `mcp-on`, `mcp-off` and `mcp-client` switch and use the opt-in HTTP listener of §5a
+for one profile, so you never edit the `.env` by hand or paste a token. `new <profile> --mcp` (`make new-profile P=<profile> MCP=1`,
+combinable with `SEMANTIC=1`) does the `mcp-on` step while creating the profile.
+
+- **`mcp-on <profile>`** writes two active lines to the profile's `.env`, replacing the commented placeholders so there is
+  exactly one active line per key (the `.env.example` part is only touched if a placeholder is missing: the first commented
+  line of that key is used, else a line is appended):
+  - *Port:* the one reserved for the profile (its commented `WHATSRUST_MCP_PORT`), else the REST port + 1 when no other
+    profile mentions it, else the next port that is neither the profile's REST port nor mentioned in another profile's
+    `.env`. The daemon refuses an MCP port equal to the REST port.
+  - *Token:* (1) an active `WHATSRUST_MCP_TOKEN` already in the `.env` is **kept** (`token: kept`); (2) else a
+    `WHATSRUST_MCP_TOKEN` exported in your shell is used (`token: from your environment`): it must be at least 22
+    characters (after trimming), differ from the profile's `WHATSRUST_API_TOKEN` and consist of `A-Z a-z 0-9 + / = _ . ~ -`
+    (so it stays intact in an unquoted `.env` value); otherwise `mcp-on` stops with the reason and changes nothing, it does
+    not fall back to generating one; (3) else it **generates** one with `openssl rand -base64 32` (`token: generated`, 44
+    characters; without `openssl` it stops and says how to install it or to export your own token). A token already in the
+    `.env` that the daemon would refuse (too short, equal to the API token) also stops `mcp-on` instead of being replaced.
+  - The token is never printed, never on any command line, and the `.env` stays mode 600: the file is rewritten with bash
+    builtins into a mode-600 temp file next to it and moved over the original.
+  - Already on: `MCP listener already enabled on port <n>`, exit 0, the file is not rewritten (a missing token is added).
+- **`mcp-off <profile>`** comments out `WHATSRUST_MCP_PORT` and **keeps the token line**, so a later `mcp-on` reuses the same
+  token (`token: kept`) and clients that already hold it keep working. Already off: `MCP listener is already off for <profile>`.
+- **Restart:** the daemon reads its `.env` only at start. When the profile's daemon is running (its instance lock is held, or
+  a `whatsrust-<profile>` tmux session exists) both commands add `restart the daemon to apply`.
+- **`mcp-client <profile>`** prints the URL (`http://<WHATSRUST_MCP_BIND or 127.0.0.1>:<port>/mcp`), the Claude Code
+  config as a `.mcp.json` snippet and as a `claude mcp add-json` line (both as in §5a, with `"timeout": 120000`; the token is
+  only the text `${WHATSRUST_MCP_TOKEN}`, so Claude Code expands it from its environment), and an `export` line that reads the
+  token from the `.env` into your shell without printing it. With the listener off it prints
+  `MCP listener is off for <profile> (enable it with: scripts/run-profile.sh mcp-on <profile>)` and exits 1. A non-loopback
+  `WHATSRUST_MCP_BIND` (which the daemon accepts only with `WHATSRUST_MCP_ALLOW_REMOTE=1`, set by hand in the `.env`) gets a
+  note that a TLS reverse proxy is required (§5a).
+- **One variable, one profile:** Claude Code reads `${WHATSRUST_MCP_TOKEN}` when it starts, so start it from a shell where the
+  variable is exported, and note that one variable holds one token. To use several profiles at once, give each its own
+  variable: `mcp-client` also shows the snippet's variable renamed (for profile `demo`: `${WHATSRUST_MCP_TOKEN_DEMO}`) and the
+  matching `export`.
+- **Do not export `WHATSRUST_MCP_TOKEN` in the shell that starts the daemon:** an exported variable beats the profile's
+  `.env` (see Environment above), so that daemon would use the exported token instead of the `.env` one. Export it in the
+  shell for Claude Code (a daemon in a tmux session never sees it).
+- `env <profile>` shows `WHATSRUST_MCP_PORT=<n>` or `<off>` and `WHATSRUST_MCP_TOKEN=<set>` or `<unset>`; `list` shows the
+  active port, or `off (<reserved port>)`.
+
+**Demo playbook.** Three short flows with a throwaway profile named `demo`. Paths are shown as `<repo>/...`; the
 port pair is the next free one (`9270/9271` when `demo` is your first profile). The daemon's own lines are
 summarised as `...`; the `run-profile:` lines are the launcher's.
 
@@ -303,7 +346,7 @@ summarised as `...`; the `run-profile:` lines are the launcher's.
    ```
    ```
    created profile 'demo' in <repo>/runs/demo
-     REST port 9270, MCP port 9271 (off: enable it in <repo>/runs/demo/.env), device name whatsrust-demo
+     REST port 9270, MCP port 9271 (off: switch it on with: scripts/run-profile.sh mcp-on demo), device name whatsrust-demo
    next: scripts/run-profile.sh daemon demo
    ```
 2. Start it (the default is this terminal; no tmux involved):
@@ -369,6 +412,72 @@ summarised as `...`; the `run-profile:` lines are the launcher's.
    ```
 6. Press **Enter**. The session closes and you are back in your shell (`[exited]`). `scripts/run-profile.sh list --tmux`
    now prints `no run-profile daemons in tmux (scripts/run-profile.sh list shows every profile)`.
+
+*(c) Enable the HTTP MCP listener and connect Claude Code* (needs the `demo` profile from (a), and the `claude` CLI):
+
+1. Switch the listener on:
+   ```bash
+   scripts/run-profile.sh mcp-on demo
+   ```
+   ```
+   MCP listener enabled on port 9271 (token: generated)
+   ```
+   (`new demo --mcp` does this while creating the profile. If `demo`'s daemon is already running you also get
+   `  the daemon of 'demo' is running: restart the daemon to apply`: stop it with Ctrl+C and start it again in step 2.)
+2. Start the daemon (this terminal stays busy: use a second terminal for the rest, or add `--detach` to run it in tmux in the background):
+   ```bash
+   scripts/run-profile.sh daemon demo
+   ```
+   Among the startup output (abbreviated here) the daemon logs that the listener is up:
+   ```
+   ... INFO whatsrust::mcp::infra: mcp listener started bind=127.0.0.1 port=9271 read_only=false
+   ```
+   `scripts/run-profile.sh list` now shows `9271` in the MCP column. If the daemon exits instead, it prints the exact fix
+   (§5a, "Startup refusals").
+3. In a second terminal, ask for the client setup:
+   ```bash
+   scripts/run-profile.sh mcp-client demo
+   ```
+   ```
+   MCP listener of profile demo: http://127.0.0.1:9271/mcp
+
+   Claude Code config, as a project .mcp.json (the token is not in it, only ${WHATSRUST_MCP_TOKEN}):
+   {"mcpServers":{"whatsrust-demo":{"type":"http","url":"http://127.0.0.1:9271/mcp","headers":{"Authorization":"Bearer ${WHATSRUST_MCP_TOKEN}"},"timeout":120000}}}
+
+   or add it with the claude CLI (add --scope user to use it in all projects):
+   claude mcp add-json whatsrust-demo '{"type":"http","url":"http://127.0.0.1:9271/mcp","headers":{"Authorization":"Bearer ${WHATSRUST_MCP_TOKEN}"},"timeout":120000}'
+
+   Export the token in the shell you start Claude Code from (this does not print it):
+   export WHATSRUST_MCP_TOKEN="$(sed -n 's/^WHATSRUST_MCP_TOKEN=//p' "<repo>/runs/demo/.env")"
+
+   Notes:
+     ... (one variable per profile, the Claude Code start-up rule, and the warning about `--header`)
+   ```
+4. Export the token in the shell you will start Claude Code from: copy the `export ...` line from the output and run it. Check
+   it worked without printing the token:
+   ```bash
+   echo ${#WHATSRUST_MCP_TOKEN}
+   ```
+   ```
+   44
+   ```
+5. Add the server: either put the `{"mcpServers":...}` snippet in a `.mcp.json` in your project, or run the printed
+   `claude mcp add-json whatsrust-demo '...'` line. Both store only `${WHATSRUST_MCP_TOKEN}`, never the token.
+6. Start Claude Code **from that same shell** (`claude`) and type `/mcp`. It lists `whatsrust-demo` as connected, with the 34
+   tools of §5a (the exact layout depends on your Claude Code version). If it shows the server as failed, check that the
+   variable is exported in the shell that started Claude Code (step 4), that the daemon was restarted after `mcp-on` (step 2)
+   and was not started from a shell with another `WHATSRUST_MCP_TOKEN` exported; `scripts/run-profile.sh cli demo status`
+   reports an `mcp_http` object (instead of `null`) when the listener is up.
+7. Undo it:
+   ```bash
+   scripts/run-profile.sh mcp-off demo
+   ```
+   ```
+   MCP listener switched off for demo (the token line stays in the .env, so mcp-on keeps the same token)
+   ```
+   (plus the restart note when the daemon is running; the change applies at its next start). `scripts/run-profile.sh list`
+   then shows `off (9271)`. A later `mcp-on demo` prints `MCP listener enabled on port 9271 (token: kept)`, so the Claude
+   Code config keeps working. To remove the server from Claude Code: `claude mcp remove whatsrust-demo`.
 
 *Clean up.* A throwaway profile that was never paired holds nothing worth keeping: `rm -rf runs/demo`. Never do that
 for a paired profile, because its `whatsapp.db` is a linked WhatsApp device; move it aside instead.
@@ -569,6 +678,9 @@ through a reverse proxy.
 travel in cleartext unless a TLS proxy is in front; the daemon logs a
 warning). Read-only mode: `WHATSRUST_MCP_READ_ONLY=1` offers only the 6 read
 tools; write tools are refused with JSON-RPC `-32600`.
+
+**Run profiles:** `scripts/run-profile.sh mcp-on <profile>` does this enable step for a profile's `.env` (port, a token kept,
+taken from your environment or generated), `mcp-client <profile>` prints the Claude Code config; see §3, "Run profiles".
 
 **Startup refusals (daemon exits):** unparseable port, remote bind without
 `WHATSRUST_MCP_ALLOW_REMOTE=1`, missing or short token (under 22 characters),

@@ -10,6 +10,8 @@ DIR="" # set by require_profile
 BIN="" # set by find_bin
 PANE_SESSION="" # set by cmd_pane: the tmux session this process runs in as the daemon's pane
 PANE_LOG=""     # set by cmd_pane: the log file the daemon output goes to
+MCP_TOKEN=""     # set by choose_token: the MCP token about to be written to a .env (cleared right after)
+MCP_TOKEN_SRC="" # set by choose_token / enable_mcp: generated, from your environment or kept
 # Every tmux call goes through tmx; RUN_PROFILE_TMUX_SOCKET (testing/advanced) selects a private server.
 TMUX_CMD=(tmux)
 if [ -n "${RUN_PROFILE_TMUX_SOCKET:-}" ]; then
@@ -24,8 +26,10 @@ Dev run profiles: each run keeps its state (whatsapp.db, backups, instance lock,
 runs/<profile>/ instead of the project root. Profile names: letters, digits, '.', '_', '-'.
 
 Commands:
-  new <profile> [--semantic]    create runs/<profile>/ (logs/ + a .env from .env.example) with the
-                                next free port pair; --semantic enables the embedder sidecar
+  new <profile> [--semantic] [--mcp]
+                                create runs/<profile>/ (logs/ + a .env from .env.example) with the
+                                next free port pair; --semantic enables the embedder sidecar; --mcp
+                                also switches the HTTP MCP listener on (like mcp-on)
   list [--tmux]                 show every profile: REST port, MCP port, DB present, instance lock,
                                 tmux (running, or -). --tmux shows only the profiles whose daemon
                                 runs in a tmux session: REST, MCP, start time, attached (needs tmux
@@ -43,19 +47,45 @@ Commands:
   attach <profile>              attach to the profile's tmux session (detach again with Ctrl-b d)
   cli <profile> <args...>       run `whatsrust <args...>` against that profile's daemon
   mcp <profile>                 run `whatsrust mcp` (stdio) against that profile's daemon
-  env <profile>                 show the environment cli/mcp export (the token is never shown)
+  env <profile>                 show the environment cli/mcp export and whether the HTTP MCP listener
+                                is on (tokens are never shown)
+  mcp-on <profile>              switch the profile's HTTP MCP listener on: sets WHATSRUST_MCP_PORT and
+                                WHATSRUST_MCP_TOKEN in its .env (details below)
+  mcp-off <profile>             switch it off: comments out WHATSRUST_MCP_PORT, keeps the token line
+  mcp-client <profile>          print the URL, a Claude Code config snippet (the token only as
+                                ${WHATSRUST_MCP_TOKEN}, never its value) and how to export the token
 
-Ports: the first profile gets REST 9270 / MCP 9271, then 9280/9281, 9290/9291, ... The MCP
-listener is off until you enable it in the profile's .env (WHATSRUST_MCP_PORT + a token you generate).
+Ports: the first profile gets REST 9270 / MCP 9271, then 9280/9281, 9290/9291, ... The HTTP MCP
+listener is off until you switch it on (mcp-on, or new --mcp).
+
+MCP listener (docs/HOWTO.md section 5a): mcp-on sets two active lines in the profile's .env.
+  Port   the one reserved for the profile (its commented WHATSRUST_MCP_PORT), else REST port + 1,
+         else the next port that is not the profile's REST port or any port another profile uses.
+  Token  1. an active WHATSRUST_MCP_TOKEN already in the .env is kept          (token: kept)
+         2. else WHATSRUST_MCP_TOKEN exported in your shell is used            (token: from your environment)
+            it must be at least 22 characters of A-Z a-z 0-9 + / = _ . ~ - and differ from the
+            profile's WHATSRUST_API_TOKEN; if not, mcp-on stops and changes nothing
+         3. else a new one from `openssl rand -base64 32` (needs openssl)      (token: generated)
+  A token is never printed and never put on a command line; the .env stays mode 600. Already on:
+  nothing is rewritten (a missing token is added). A port or a token already in the .env that the
+  daemon would refuse (token under 22 characters or equal to WHATSRUST_API_TOKEN, port equal to the
+  REST port) stops mcp-on with the reason and changes nothing. mcp-off keeps the token line, so a
+  later mcp-on reuses the same token and the clients keep working. The daemon reads the .env only at
+  start: when the profile's daemon runs (instance lock held, or its tmux session exists) both
+  commands add "restart the daemon to apply".
 
 Examples:
-  scripts/run-profile.sh new dev                 create runs/dev/
+  scripts/run-profile.sh new dev                 create runs/dev/ (new dev --mcp: with the MCP listener on)
   scripts/run-profile.sh daemon dev              run in this terminal; Ctrl+C to stop
   scripts/run-profile.sh daemon dev --tmux       run in tmux session whatsrust-dev (Ctrl-b d detaches)
   scripts/run-profile.sh daemon dev --detach     same, but stay in the background
   scripts/run-profile.sh list                    every profile; add --tmux for the tmux ones only
   scripts/run-profile.sh attach dev              attach to the session again
   scripts/run-profile.sh cli dev status          `whatsrust status` against dev's daemon
+  scripts/run-profile.sh mcp-on dev              switch dev's HTTP MCP listener on (restart a running daemon)
+  scripts/run-profile.sh mcp-client dev          URL, Claude Code config and token export hint for it
+  scripts/run-profile.sh mcp-off dev             switch it off again (the token stays)
+  make new-profile P=dev [SEMANTIC=1] [MCP=1]        same as new (MCP=1 adds --mcp)
   make run-profile P=dev [RELEASE=1] [USE_TMUX=1]    same as daemon (USE_TMUX=1 adds --tmux)
 
 Environment:
@@ -66,11 +96,15 @@ Environment:
   Variables exported in your shell (WHATSRUST_*, WHATSAPP_*, HEALTH_PORT, BACKUP_DIR, RUST_LOG)
   beat the profile's .env when the daemon runs in this terminal; daemon names them (never their
   values) when it starts. With --tmux they are NOT applied (see the tmux note).
+  WHATSRUST_MCP_TOKEN   mcp-on / new --mcp use it as the token when the .env has none (see above).
+                        Exported in the shell that starts the daemon it also overrides the .env
+                        token, so for a Claude Code client export it in another terminal.
 
 Exit codes:
   0  done
   1  failed: no such profile, the profile already exists, tmux not found (daemon --tmux/--detach,
-     attach, list --tmux), tmux session already exists, no built binary, ...
+     attach, list --tmux), tmux session already exists, no built binary, an unusable token or
+     missing openssl (mcp-on, new --mcp), mcp-client while the listener is off, ...
   2  usage error (unknown command or option, missing argument)
   daemon in this terminal exits with the daemon's own exit code; a failed build exits with cargo's.
   cli and mcp exit with whatsrust's exit code.
@@ -207,15 +241,17 @@ env_get() {
 
 # commented_port <env-file> <KEY>: digits of the first commented-out "# KEY=<digits>" line.
 commented_port() {
-  sed -n -E "/^#[[:space:]]*${2}[[:space:]]*=[[:space:]]*[0-9]/{s/^[^=]*=[[:space:]]*([0-9]+).*/\1/p;q;}" "$1"
+  sed -n -E "/^#[[:space:]]*(export[[:space:]]+)?${2}[[:space:]]*=[[:space:]]*[0-9]/{s/^[^=]*=[[:space:]]*([0-9]+).*/\1/p;q;}" "$1"
 }
 
-# ports_in_use: every WHATSRUST_PORT / WHATSRUST_MCP_PORT number in any profile's .env, including
-# commented-out lines, so the MCP port reserved by `new` stays reserved after the owner enables it.
+# ports_in_use [skip-profile-dir]: every WHATSRUST_PORT / WHATSRUST_MCP_PORT number in any profile's
+# .env, including commented-out lines, so the MCP port reserved by `new` stays reserved after the
+# owner enables it. The skipped profile's own .env is left out.
 ports_in_use() {
   local f
   for f in "$RUNS"/*/.env; do
     [ -f "$f" ] || continue
+    [ "${f%/.env}" != "${1:-}" ] || continue
     sed -n -E 's/^[#[:space:]]*(export[[:space:]]+)?WHATSRUST_(MCP_)?PORT[[:space:]]*=[[:space:]]*([0-9]+).*/\3/p' "$f"
   done
 }
@@ -236,11 +272,247 @@ next_port_pair() {
   printf '%s\n' "$p"
 }
 
+# valid_port <text>: true for a TCP port number, 1-65535 (digits only).
+valid_port() {
+  case $1 in '' | *[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 5 ] && [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 65535 ]
+}
+
+# trim <text>: the text without leading and trailing whitespace (bash builtins only: it may be a token).
+trim() {
+  local v=$1
+  v=${v#"${v%%[![:space:]]*}"}
+  v=${v%"${v##*[![:space:]]}"}
+  printf '%s\n' "$v"
+}
+
+# lock_state <profile-dir>: HELD while a process has the instance lock open (lsof), else free;
+# unknown when lsof is missing.
+lock_state() {
+  if [ ! -e "$1/whatsapp.db.instance.lock" ]; then
+    echo free
+  elif ! command -v lsof >/dev/null 2>&1; then
+    echo unknown
+  elif lsof -t -- "$1/whatsapp.db.instance.lock" >/dev/null 2>&1; then
+    echo HELD
+  else
+    echo free
+  fi
+}
+
+# daemon_running <profile> <profile-dir>: true while the profile's daemon seems to run: its instance
+# lock is held, or its tmux session exists.
+daemon_running() {
+  [ "$(lock_state "$2")" = HELD ] && return 0
+  have_tmux && has_session "$(session_name "$1")"
+}
+
+# restart_note <profile>: the daemon reads its .env only at start, so say so when it is running.
+restart_note() {
+  if daemon_running "$1" "$DIR"; then
+    echo "  the daemon of '$1' is running: restart the daemon to apply"
+  fi
+}
+
+# rest_port_of <env-file>: the profile's REST port (the daemon's default 7270 when the .env has none).
+rest_port_of() {
+  local v
+  v=$(env_get "$1" WHATSRUST_PORT)
+  v=${v:-7270}
+  valid_port "$v" || die "WHATSRUST_PORT=$v in $1 is not a valid port number"
+  printf '%s\n' "$((10#$v))"
+}
+
+# pick_mcp_port <profile-dir>: the MCP port mcp-on should use: the port reserved in the .env (the
+# commented WHATSRUST_MCP_PORT), else REST port + 1, else the next port above that. Never the
+# profile's REST port, 7270/7271, or a port that another profile's .env mentions (commented lines count).
+pick_mcp_port() {
+  local file="$1/.env" rest used p
+  rest=$(rest_port_of "$file")
+  # 7270/7271 are the daemon's own defaults (and .env.example mentions them): never for a profile.
+  used="7270 7271 $(ports_in_use "$1" | tr '\n' ' ')"
+  p=$(commented_port "$file" WHATSRUST_MCP_PORT 2>/dev/null || true)
+  if valid_port "$p" && [ "$((10#$p))" -ne "$rest" ] && ! in_list "$((10#$p))" "$used"; then
+    printf '%s\n' "$((10#$p))"
+    return 0
+  fi
+  p=$((rest + 1))
+  while [ "$p" -eq "$rest" ] || in_list "$p" "$used"; do
+    p=$((p + 1))
+  done
+  [ "$p" -le 65535 ] || die "no free port left above $rest for the MCP listener"
+  printf '%s\n' "$p"
+}
+
+# token_problem <token> <api-token> [strict]: why the daemon would refuse this MCP token (nothing
+# printed when it is fine): fewer than 22 characters after trimming, or equal to the API token.
+# strict (a token that will be written to a .env): also only characters that stay intact in an
+# unquoted .env value.
+token_problem() {
+  local t api
+  t=$(trim "$1")
+  api=$(trim "$2")
+  if [ "${#t}" -lt 22 ]; then
+    printf 'is too short (%s characters after trimming; the daemon needs at least 22)\n' "${#t}"
+  elif [ -n "$api" ] && [ "$t" = "$api" ]; then
+    printf 'is the same as WHATSRUST_API_TOKEN (the daemon refuses that, so that a leaked MCP token cannot open the REST API)\n'
+  elif [ "${3:-}" = strict ]; then
+    case $t in
+      *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_.~-]*)
+        printf 'has characters that do not survive in an unquoted .env value (allowed: A-Z a-z 0-9 + / = _ . ~ -)\n'
+        ;;
+    esac
+  fi
+}
+
+# choose_token <api-token>: set MCP_TOKEN and MCP_TOKEN_SRC for a profile that has no token yet: the
+# one exported in the caller's environment (validated), else a new one from openssl. Dies, with the
+# reason, instead of falling back when the exported token is unusable.
+choose_token() {
+  local reason
+  if [ -n "${WHATSRUST_MCP_TOKEN:-}" ]; then
+    MCP_TOKEN=$(trim "$WHATSRUST_MCP_TOKEN")
+    reason=$(token_problem "$MCP_TOKEN" "$1" strict)
+    [ -z "$reason" ] || die "WHATSRUST_MCP_TOKEN in your environment $reason
+  nothing was changed; unset it to get a generated token, or export a valid one"
+    MCP_TOKEN_SRC="from your environment"
+    return 0
+  fi
+  command -v openssl >/dev/null 2>&1 ||
+    die "openssl not found, it generates the MCP token (install: brew install openssl, or apt install openssl);
+  or export your own WHATSRUST_MCP_TOKEN (at least 22 characters) and run again"
+  MCP_TOKEN=$(openssl rand -base64 32) || die "openssl could not generate a token"
+  reason=$(token_problem "$MCP_TOKEN" "$1" strict)
+  [ -z "$reason" ] || die "openssl produced a token that $reason"
+  MCP_TOKEN_SRC=generated
+}
+
+# The two .env keys the MCP commands manage, as active ("KEY=...") and commented ("# KEY=...") lines.
+MCP_KEY_ACTIVE='^[[:space:]]*(export[[:space:]]+)?(WHATSRUST_MCP_PORT|WHATSRUST_MCP_TOKEN)[[:space:]]*='
+MCP_KEY_COMMENTED='^#[[:space:]]*(export[[:space:]]+)?(WHATSRUST_MCP_PORT|WHATSRUST_MCP_TOKEN)[[:space:]]*='
+LK_STATE="" # set by mcp_key_line: active, commented or other
+LK_KEY=""   # set by mcp_key_line: the key of an active or commented line
+ENV_TMP=""  # the temp file env_edit is writing (removed on exit unless moved into place)
+
+# mcp_key_line <line>: classify a .env line (LK_STATE, LK_KEY).
+mcp_key_line() {
+  LK_STATE=other
+  LK_KEY=""
+  if [[ $1 =~ $MCP_KEY_ACTIVE ]]; then
+    LK_STATE=active
+    LK_KEY=${BASH_REMATCH[2]}
+  elif [[ $1 =~ $MCP_KEY_COMMENTED ]]; then
+    LK_STATE=commented
+    LK_KEY=${BASH_REMATCH[2]}
+  fi
+}
+
+# env_edit <env-file> <spec>...: rewrite the .env with bash builtins only, so a token in a spec never
+# reaches the argument list of a command. A spec is KEY=VALUE or -KEY (KEY: WHATSRUST_MCP_PORT or
+# WHATSRUST_MCP_TOKEN).
+#   KEY=VALUE  the first active KEY line becomes KEY=VALUE; when there is none, the first commented
+#              "# KEY=..." line does; with neither, KEY=VALUE is appended. Further active KEY lines
+#              are commented out (the daemon would use only the first one anyway).
+#   -KEY       every active KEY line is commented out.
+# The result is written next to the original as a mode-600 temp file and moved over it.
+env_edit() {
+  local file=$1 line out spec key value done_keys=" " active_keys=" "
+  shift
+  while IFS= read -r line || [ -n "$line" ]; do
+    mcp_key_line "$line"
+    if [ "$LK_STATE" = active ]; then active_keys="$active_keys$LK_KEY "; fi
+  done <"$file"
+
+  trap '[ -z "$ENV_TMP" ] || rm -f -- "$ENV_TMP"' EXIT
+  ENV_TMP=$(mktemp "${file%/*}/.env.XXXXXX") || die "could not create a temp file next to $file"
+  {
+    while IFS= read -r line || [ -n "$line" ]; do
+      mcp_key_line "$line"
+      out=$line
+      if [ "$LK_STATE" != other ]; then
+        for spec in "$@"; do
+          case $spec in
+            -*)
+              key=${spec#-}
+              value=""
+              ;;
+            *)
+              key=${spec%%=*}
+              value=${spec#*=}
+              ;;
+          esac
+          [ "$key" = "$LK_KEY" ] || continue
+          if [ "$LK_STATE" = active ]; then
+            if [ "$spec" != "-$key" ] && ! in_list "$key" "$done_keys"; then
+              out="$key=$value"
+              done_keys="$done_keys$key "
+            else
+              out="# $line"
+            fi
+          elif [ "$spec" != "-$key" ] && ! in_list "$key" "$active_keys" && ! in_list "$key" "$done_keys"; then
+            out="$key=$value"
+            done_keys="$done_keys$key "
+          fi
+          break
+        done
+      fi
+      printf '%s\n' "$out"
+    done <"$file"
+    for spec in "$@"; do
+      key=${spec%%=*}
+      case $spec in -*) continue ;; esac
+      in_list "$key" "$done_keys" || printf '%s\n' "$spec"
+    done
+  } >"$ENV_TMP"
+  mv -f -- "$ENV_TMP" "$file"
+  ENV_TMP=""
+  trap - EXIT
+}
+
+# enable_mcp <profile> (DIR is the profile folder): make the profile's .env turn the HTTP MCP listener
+# on, see the "MCP listener" section of --help for the rules. Prints one status line, never the token.
+enable_mcp() {
+  local name=$1 file="$DIR/.env" rest api port tok reason edits=()
+  [ -f "$file" ] || die "$file not found (a profile needs its .env)"
+  rest=$(rest_port_of "$file")
+  api=$(env_get "$file" WHATSRUST_API_TOKEN)
+  port=$(env_get "$file" WHATSRUST_MCP_PORT)
+  tok=$(env_get "$file" WHATSRUST_MCP_TOKEN)
+
+  if [ -n "$port" ] && [ "$port" != 0 ]; then
+    valid_port "$port" || die "WHATSRUST_MCP_PORT=$port in $file is not a valid port number; fix or remove that line, then run mcp-on again"
+    [ "$((10#$port))" -ne "$rest" ] || die "WHATSRUST_MCP_PORT=$port in $file is the profile's REST port (WHATSRUST_PORT); the daemon refuses that. Fix or remove that line, then run mcp-on again"
+    port=$((10#$port))
+  else
+    port=$(pick_mcp_port "$DIR")
+    edits+=("WHATSRUST_MCP_PORT=$port")
+  fi
+  if [ -n "$tok" ]; then
+    reason=$(token_problem "$tok" "$api")
+    [ -z "$reason" ] || die "WHATSRUST_MCP_TOKEN in $file $reason
+  fix or remove that line, then run mcp-on again"
+    MCP_TOKEN_SRC=kept
+  else
+    choose_token "$api"
+    edits+=("WHATSRUST_MCP_TOKEN=$MCP_TOKEN")
+  fi
+
+  if [ "${#edits[@]}" -eq 0 ]; then
+    echo "MCP listener already enabled on port $port"
+    return 0
+  fi
+  env_edit "$file" "${edits[@]}"
+  MCP_TOKEN=""
+  echo "MCP listener enabled on port $port (token: $MCP_TOKEN_SRC)"
+  restart_note "$name"
+}
+
 cmd_new() {
-  local name="" semantic=0 arg
+  local name="" semantic=0 mcp=0 arg
   for arg in "$@"; do
     case $arg in
       --semantic) semantic=1 ;;
+      --mcp) mcp=1 ;;
       -*) usage_err "new: unknown option: $arg" ;;
       *)
         [ -z "$name" ] || usage_err "new: unexpected argument: $arg"
@@ -253,6 +525,12 @@ cmd_new() {
   [ -f "$ROOT/.env.example" ] || die "missing $ROOT/.env.example"
   local dir="$RUNS/$name"
   [ ! -e "$dir" ] || die "profile '$name' already exists: $dir"
+  if [ "$mcp" -eq 1 ]; then
+    # Fail before anything is created: an unusable exported token, or no openssl. The token chosen
+    # here is dropped; enable_mcp chooses again once the profile exists.
+    choose_token ""
+    MCP_TOKEN=""
+  fi
 
   local rest_port mcp_port embedder="$ROOT/embedder-rs/target/release/whatsrust-embedder"
   rest_port=$(next_port_pair)
@@ -277,9 +555,10 @@ EOF
     fi
     cat <<EOF
 
-# MCP listener over HTTP is OFF. Its port is reserved for this profile. To enable it, generate a
-# token yourself with: openssl rand -base64 32   (it must differ from WHATSRUST_API_TOKEN), then
-# uncomment both lines below and paste the token.
+# MCP listener over HTTP (docs/HOWTO.md section 5a): on while WHATSRUST_MCP_PORT below is active
+# (no leading '#'). Switch it with: scripts/run-profile.sh mcp-on|mcp-off $name
+# The port is reserved for this profile. A token you set by hand needs at least 22 characters and
+# must differ from WHATSRUST_API_TOKEN (generate one with: openssl rand -base64 32).
 # WHATSRUST_MCP_PORT=$mcp_port
 # WHATSRUST_MCP_TOKEN=<paste the generated token here>
 
@@ -291,11 +570,21 @@ EOF
   } >"$dir/.env"
 
   echo "created profile '$name' in $dir"
-  echo "  REST port $rest_port, MCP port $mcp_port (off: enable it in $dir/.env), device name whatsrust-$name"
+  if [ "$mcp" -eq 1 ]; then
+    echo "  REST port $rest_port, device name whatsrust-$name"
+  else
+    echo "  REST port $rest_port, MCP port $mcp_port (off: switch it on with: scripts/run-profile.sh mcp-on $name), device name whatsrust-$name"
+  fi
   if [ "$semantic" -eq 1 ] && [ ! -x "$embedder" ]; then
     echo "  embedder sidecar not built yet: run 'make embedder-build' before starting the daemon"
   fi
-  echo "next: scripts/run-profile.sh daemon $name"
+  if [ "$mcp" -eq 1 ]; then
+    DIR=$dir
+    enable_mcp "$name"
+    echo "next: scripts/run-profile.sh daemon $name, then scripts/run-profile.sh mcp-client $name"
+  else
+    echo "next: scripts/run-profile.sh daemon $name"
+  fi
 }
 
 # profile_ports <profile-dir>: set P_REST and P_MCP (what the list views show for the two ports).
@@ -303,7 +592,7 @@ profile_ports() {
   P_REST=$(env_get "$1/.env" WHATSRUST_PORT)
   P_REST=${P_REST:-default}
   P_MCP=$(env_get "$1/.env" WHATSRUST_MCP_PORT)
-  if [ -z "$P_MCP" ]; then
+  if [ -z "$P_MCP" ] || [ "$P_MCP" = 0 ]; then
     P_MCP=$(commented_port "$1/.env" WHATSRUST_MCP_PORT 2>/dev/null || true)
     if [ -n "$P_MCP" ]; then P_MCP="off ($P_MCP)"; else P_MCP="off"; fi
   fi
@@ -318,15 +607,7 @@ list_all() {
     name=${d##*/}
     profile_ports "$d"
     if [ -e "$d/whatsapp.db" ]; then db=yes; else db=no; fi
-    if [ ! -e "$d/whatsapp.db.instance.lock" ]; then
-      lock=free
-    elif ! command -v lsof >/dev/null 2>&1; then
-      lock=unknown
-    elif lsof -t -- "$d/whatsapp.db.instance.lock" >/dev/null 2>&1; then
-      lock=HELD
-    else
-      lock=free
-    fi
+    lock=$(lock_state "$d")
     if session_row "$1" "$(session_name "$name")" >/dev/null; then tm=running; else tm=-; fi
     if [ "$found" -eq 0 ]; then
       printf '%-20s %-7s %-12s %-4s %-7s %s\n' PROFILE REST MCP DB LOCK TMUX
@@ -462,6 +743,116 @@ cmd_env() {
     echo "WHATSRUST_API_TOKEN=<set>"
   else
     echo "WHATSRUST_API_TOKEN=<unset>"
+  fi
+  # The HTTP MCP listener is read by the daemon only; cli and mcp do not export these two.
+  local mcp_port
+  mcp_port=$(env_get "$DIR/.env" WHATSRUST_MCP_PORT)
+  if [ -n "$mcp_port" ] && [ "$mcp_port" != 0 ]; then
+    echo "WHATSRUST_MCP_PORT=$mcp_port"
+  else
+    echo "WHATSRUST_MCP_PORT=<off>"
+  fi
+  if [ -n "$(env_get "$DIR/.env" WHATSRUST_MCP_TOKEN)" ]; then
+    echo "WHATSRUST_MCP_TOKEN=<set>"
+  else
+    echo "WHATSRUST_MCP_TOKEN=<unset>"
+  fi
+}
+
+cmd_mcp_on() {
+  [ $# -eq 1 ] || usage_err "mcp-on: usage: mcp-on <profile>"
+  require_profile "$1"
+  enable_mcp "$1"
+}
+
+cmd_mcp_off() {
+  [ $# -eq 1 ] || usage_err "mcp-off: usage: mcp-off <profile>"
+  require_profile "$1"
+  local file="$DIR/.env" port
+  [ -f "$file" ] || die "$file not found (a profile needs its .env)"
+  port=$(env_get "$file" WHATSRUST_MCP_PORT)
+  if [ -z "$port" ] || [ "$port" = 0 ]; then
+    echo "MCP listener is already off for $1"
+    return 0
+  fi
+  env_edit "$file" -WHATSRUST_MCP_PORT
+  if [ -n "$(env_get "$file" WHATSRUST_MCP_TOKEN)" ]; then
+    echo "MCP listener switched off for $1 (the token line stays in the .env, so mcp-on keeps the same token)"
+  else
+    echo "MCP listener switched off for $1"
+  fi
+  restart_note "$1"
+}
+
+# export_hint <variable> <env-file>: the shell line that exports the .env's token without printing it
+# (the value goes from sed's output straight into the variable; it is on no command line).
+export_hint() {
+  printf "export %s=\"\$(sed -n 's/^WHATSRUST_MCP_TOKEN=//p' \"%s\")\"\n" "$1" "$2"
+}
+
+# cmd_mcp_client: what a Claude Code user needs to connect to the profile's listener. The snippets
+# carry the token only as ${VAR}; the token itself is never printed.
+cmd_mcp_client() {
+  [ $# -eq 1 ] || usage_err "mcp-client: usage: mcp-client <profile>"
+  require_profile "$1"
+  local name=$1 file="$DIR/.env" port tok bind host lower url server tokvar altvar json plain
+  port=$(env_get "$file" WHATSRUST_MCP_PORT)
+  if [ -z "$port" ] || [ "$port" = 0 ]; then
+    die "MCP listener is off for $name (enable it with: scripts/run-profile.sh mcp-on $name)"
+  fi
+  valid_port "$port" || die "WHATSRUST_MCP_PORT=$port in $file is not a valid port number"
+  tok=$(env_get "$file" WHATSRUST_MCP_TOKEN)
+  [ -n "$tok" ] || die "the MCP listener is on (port $port) but $file has no WHATSRUST_MCP_TOKEN, so the daemon would refuse to start (add one with: scripts/run-profile.sh mcp-on $name)"
+
+  bind=$(env_get "$file" WHATSRUST_MCP_BIND)
+  bind=${bind:-127.0.0.1}
+  host=${bind#[}
+  host=${host%]}
+  case $host in
+    *[!A-Za-z0-9.:_-]*) die "WHATSRUST_MCP_BIND=$bind in $file does not look like a host or IP address" ;;
+  esac
+  lower=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+  # A wildcard bind is reached through loopback from this machine (the daemon's own CLI does the same).
+  case $host in
+    0.0.0.0) host=127.0.0.1 ;;
+    ::) host=::1 ;;
+  esac
+  case $host in *:*) url="http://[$host]:$((10#$port))/mcp" ;; *) url="http://$host:$((10#$port))/mcp" ;; esac
+  server="whatsrust-$name"
+  tokvar=WHATSRUST_MCP_TOKEN
+  altvar=${tokvar}_$(printf '%s' "${name//[!A-Za-z0-9]/_}" | tr '[:lower:]' '[:upper:]')
+
+  echo "MCP listener of profile $name: $url"
+  case $lower in
+    localhost | 127.* | ::1) ;;
+    *)
+      echo "  WHATSRUST_MCP_BIND=$bind is not a loopback address: put a TLS reverse proxy in front and give clients its https URL"
+      echo "  (the token and all messages are cleartext otherwise; see docs/HOWTO.md section 5a and deploy/proxy/)"
+      ;;
+  esac
+  echo
+  echo "Claude Code config, as a project .mcp.json (the token is not in it, only \${$tokvar}):"
+  # shellcheck disable=SC2016 # the ${...} must reach the output as written
+  json=$(printf '{"type":"http","url":"%s","headers":{"Authorization":"Bearer ${%s}"},"timeout":120000}' "$url" "$tokvar")
+  printf '{"mcpServers":{"%s":%s}}\n' "$server" "$json"
+  echo
+  echo "or add it with the claude CLI (add --scope user to use it in all projects):"
+  printf "claude mcp add-json %s '%s'\n" "$server" "$json"
+  echo
+  echo "Export the token in the shell you start Claude Code from (this does not print it):"
+  export_hint "$tokvar" "$file"
+  echo
+  echo "Notes:"
+  echo "  - Claude Code reads \${$tokvar} when it starts, so start it from a shell where the variable is exported; /mcp then lists $server."
+  echo "  - One $tokvar variable holds one token, so it serves one profile at a time. To use several profiles at once,"
+  echo "    give each its own variable: write \${$altvar} instead of \${$tokvar} in the snippet and export that name:"
+  printf '    '
+  export_hint "$altvar" "$file"
+  echo "  - Do not put the token in a command line (claude mcp add --header \"Authorization: Bearer <token>\" would, and stores it in ~/.claude.json)."
+  plain=$(sed -n -E '/^[[:space:]]*(export[[:space:]]+)?WHATSRUST_MCP_TOKEN[[:space:]]*=/{p;q;}' "$file")
+  if [ "$plain" != "WHATSRUST_MCP_TOKEN=$tok" ]; then
+    echo "  - The token line in the .env is not in the plain WHATSRUST_MCP_TOKEN=<value> form (export, spaces, quotes or a comment),"
+    echo "    so the export line above would not give the exact token: rewrite that line in the plain form."
   fi
 }
 
@@ -682,6 +1073,18 @@ main() {
     env)
       shift
       cmd_env "$@"
+      ;;
+    mcp-on)
+      shift
+      cmd_mcp_on "$@"
+      ;;
+    mcp-off)
+      shift
+      cmd_mcp_off "$@"
+      ;;
+    mcp-client)
+      shift
+      cmd_mcp_client "$@"
       ;;
     -h | --help | help) usage ;;
     '') usage_err "missing command" ;;
