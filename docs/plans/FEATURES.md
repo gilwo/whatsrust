@@ -181,11 +181,13 @@ Keep each debug/live run's state out of the project root (added 2026-10-19).
   pre-migration `.bak` files) and runs are started from the repo root, so the root collects DBs,
   backups and logs from every run.
 - **As built:** one gitignored folder per profile, `runs/<profile>/`, with its own `.env`, DB and
-  `logs/`. `scripts/run-profile.sh` (`new`, `list [--all]`, `daemon`, `attach`, `cli`, `mcp`, `env`) and
-  `make new-profile` / `make run-profile` / `make attach-profile`; no Rust change. With tmux installed,
-  `daemon` runs in session `whatsrust-<profile>` (attach when interactive, `--detach`, `--foreground`;
-  an exit note keeps the pane open until Enter); without tmux it runs in the foreground (2026-10-19).
-  Docs: HOWTO §3 "Run profiles".
+  `logs/`. `scripts/run-profile.sh` (`new`, `list [--tmux]`, `daemon`, `attach`, `cli`, `mcp`, `env`) and
+  `make new-profile` / `make run-profile` / `make attach-profile`; no Rust change. `daemon` runs in the
+  current terminal by default; `--tmux` (`USE_TMUX=1` for make) opts in to session `whatsrust-<profile>`
+  (attach when interactive; an exit note keeps the pane open until Enter) and `--detach` implies `--tmux`;
+  with tmux missing, `--tmux` is an error, never a silent fallback. `list` shows every profile with a TMUX
+  column, `list --tmux` only those running in a session (2026-10-19, tmux made opt-in 2026-10-20).
+  Docs: HOWTO §3 "Run profiles" (incl. a demo playbook).
 - [x] Approach decision — A: profile folders + launcher script (owner, 2026-10-19)
 - [x] Script + Makefile target + docs — done 2026-10-19
 - [ ] Move existing root run state into `runs/main/` (owner, daemon stopped; HOWTO checklist)
