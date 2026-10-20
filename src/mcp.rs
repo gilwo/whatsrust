@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::bridge::SYNC_CLIENT_TIMEOUT;
-use crate::mcp_registry::{rest_tool_result, tool_error, validated_args, ArgsError, REGISTRY};
+use crate::mcp_registry::{
+    initialize_result, negotiated_version, rest_tool_result, tool_error, validated_args, ArgsError, REGISTRY,
+};
 
 /// Run the MCP server on stdin/stdout. Blocks until EOF.
 pub fn run_mcp_server(port: u16) {
@@ -85,14 +87,17 @@ fn json_rpc_error(id: Value, code: i32, msg: &str) -> JsonRpcResponse {
 
 fn handle_rpc(req: &JsonRpcRequest, port: u16) -> JsonRpcResponse {
     match req.method.as_str() {
-        "initialize" => json_rpc_ok(req.id.clone(), json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": "whatsrust",
-                "version": env!("CARGO_PKG_VERSION")
+        "initialize" => {
+            let requested = req.params.as_ref().and_then(|p| p.get("protocolVersion")).and_then(Value::as_str);
+            match requested {
+                Some(requested) => json_rpc_ok(
+                    req.id.clone(),
+                    initialize_result(negotiated_version(requested), REGISTRY.tool_definitions().len()),
+                ),
+                None => json_rpc_error(req.id.clone(), -32602, "protocolVersion is required"),
             }
-        })),
+        }
+        "ping" => json_rpc_ok(req.id.clone(), json!({})),
         "notifications/initialized" => json_rpc_ok(req.id.clone(), json!({})),
         "tools/list" => json_rpc_ok(req.id.clone(), json!({ "tools": REGISTRY.tool_definitions() })),
         "tools/call" => {
@@ -252,6 +257,70 @@ mod tests {
             desc_lower.contains("paced") || desc_lower.contains("clamp") || desc_lower.contains("background"),
             "description must mention pacing/limits (paced/clamp/background); got: {desc}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // The stdio handshake: `initialize` negotiates the legacy versions (shared with the HTTP
+    // listener) and `ping` answers an empty result.
+    // -------------------------------------------------------------------------
+
+    /// The JSON-RPC response of `handle_rpc` to request 1 as it goes on the wire. The handshake
+    /// methods never reach the daemon, so the port is unused.
+    fn answer(method: &str, params: Option<Value>) -> Value {
+        let req = JsonRpcRequest { jsonrpc: Some("2.0".to_string()), id: json!(1), method: method.to_string(), params };
+        serde_json::to_value(handle_rpc(&req, 0)).expect("a serialisable response")
+    }
+
+    /// `initialize` asking for protocol version `requested`: the `result`, after checking the
+    /// response is a success.
+    fn initialize_result_for(requested: &str) -> Value {
+        let reply = answer("initialize", Some(json!({"protocolVersion": requested, "capabilities": {}})));
+        assert_eq!(reply["id"], 1, "{requested:?}");
+        assert!(reply.get("error").is_none(), "{requested:?}: {reply}");
+        reply["result"].clone()
+    }
+
+    #[test]
+    fn test_initialize_echoes_a_legacy_version() {
+        for version in ["2025-11-25", "2025-06-18"] {
+            assert_eq!(initialize_result_for(version)["protocolVersion"], version);
+        }
+    }
+
+    #[test]
+    fn test_initialize_counter_offers_the_newest_legacy_version() {
+        for requested in ["2024-11-05", "2025-03-26", "2026-07-28", "garbage", ""] {
+            assert_eq!(initialize_result_for(requested)["protocolVersion"], "2025-11-25", "{requested:?}");
+        }
+    }
+
+    #[test]
+    fn test_initialize_without_a_string_protocol_version_is_invalid_params() {
+        for params in [
+            Some(json!({"capabilities": {}})),
+            Some(json!({"protocolVersion": 5})),
+            Some(json!({"protocolVersion": null})),
+            None,
+        ] {
+            let reply = answer("initialize", params.clone());
+            assert_eq!(reply["id"], 1, "{params:?}");
+            assert!(reply.get("result").is_none(), "{params:?}: {reply}");
+            assert_eq!(reply["error"], json!({"code": -32602, "message": "protocolVersion is required"}), "{params:?}");
+        }
+    }
+
+    #[test]
+    fn test_initialize_result_has_capabilities_server_info_and_instructions() {
+        let result = initialize_result_for("2025-11-25");
+        assert!(result["capabilities"]["tools"].is_object(), "{result}");
+        assert_eq!(result["serverInfo"]["name"], "whatsrust");
+        assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(result["instructions"], crate::mcp_registry::instructions(REGISTRY.tool_definitions().len()));
+    }
+
+    #[test]
+    fn test_ping_returns_an_empty_result() {
+        assert_eq!(answer("ping", None), json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
     }
 
     // -------------------------------------------------------------------------
@@ -1028,9 +1097,15 @@ mod tests {
 
     /// `tools/call` over HTTP against the MCP listener at `port`; returns the JSON-RPC `result`.
     async fn mcp_listener_call(port: u16, token: &str, name: &str, args: &Value) -> Value {
+        mcp_listener_rpc(port, token, "tools/call", &json!({"name": name, "arguments": args})).await
+    }
+
+    /// A legacy-era JSON-RPC request over HTTP against the MCP listener at `port`; returns its
+    /// `result`.
+    async fn mcp_listener_rpc(port: u16, token: &str, method: &str, params: &Value) -> Value {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}).to_string();
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
         let request = format!(
             "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer {token}\r\n\
              MCP-Protocol-Version: 2025-06-18\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1042,9 +1117,9 @@ mod tests {
         stream.read_to_end(&mut raw).await.unwrap();
         let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("a response head");
         let head = String::from_utf8_lossy(&raw[..split]);
-        assert!(head.starts_with("HTTP/1.1 200 "), "{name}: {head}");
+        assert!(head.starts_with("HTTP/1.1 200 "), "{method} {params}: {head}");
         let reply: Value = serde_json::from_slice(&raw[split + 4..]).expect("a JSON-RPC response");
-        assert!(reply.get("error").is_none(), "{name} {args}: a JSON-RPC error: {reply}");
+        assert!(reply.get("error").is_none(), "{method} {params}: a JSON-RPC error: {reply}");
         reply["result"].clone()
     }
 
@@ -1095,6 +1170,33 @@ mod tests {
         for db in [stdio_db, mcp_db] {
             let _ = std::fs::remove_file(db);
         }
+    }
+
+    #[tokio::test]
+    async fn test_initialize_and_ping_match_the_mcp_listener_legacy_handshake() {
+        const MCP_TOKEN: &str = "parity-token-0123456789";
+        let (bridge, db) = parity_bridge("handshake").await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = mcp.local_addr().unwrap().port();
+        let server = tokio::spawn(crate::mcp_http::serve_for_test(bridge, mcp, MCP_TOKEN, cancel.clone()));
+
+        // The listener under test is read-write, so it lists every tool, as stdio does.
+        for requested in ["2025-11-25", "2025-06-18", "2024-11-05", "2026-07-28", "garbage", ""] {
+            let params = json!({"protocolVersion": requested, "capabilities": {}});
+            let http = tokio::time::timeout(Duration::from_secs(10), mcp_listener_rpc(port, MCP_TOKEN, "initialize", &params))
+                .await
+                .unwrap_or_else(|_| panic!("{requested:?}: the MCP initialize did not finish in 10 s"));
+            assert_eq!(initialize_result_for(requested), http, "{requested:?}");
+        }
+        let http_ping = tokio::time::timeout(Duration::from_secs(10), mcp_listener_rpc(port, MCP_TOKEN, "ping", &json!({})))
+            .await
+            .expect("the MCP ping did not finish in 10 s");
+        assert_eq!(answer("ping", None)["result"], http_ping);
+
+        cancel.cancel();
+        let _ = server.await;
+        let _ = std::fs::remove_file(db);
     }
 
     #[test]
