@@ -55,7 +55,7 @@ The daemon already has a hand-rolled HTTP server (`src/api.rs`) with 59 REST end
 
 - **Process model:** `whatsrust mcp` spawns a separate process from the daemon.
 - **File:** `src/mcp.rs:run_mcp_server()` (stdio JSON-RPC loop, lines 16–49).
-- **Protocol version:** Advertises `"2024-11-05"` (line 88), uses `initialize` handshake.
+- **Protocol version:** Advertises `"2024-11-05"` (line 88), uses `initialize` handshake. (Amended 2026-10-20: stdio now negotiates `2025-11-25` / `2025-06-18`; see §5.)
 - **Tool registry (since Phase 1):** `REGISTRY` in `src/mcp_registry.rs` holds the 34 tools (schema, annotations, access class, REST mapping); `tools/list` returns `REGISTRY.tool_definitions()`.
 - **Tool dispatch:** `call_tool()` in `src/mcp.rs` validates the call, builds the request from the tool's `RestMapping`, and executes it via blocking `http_get()`/`http_post()` over TCP to the daemon.
 - **Argument validation:** `validated_args()` (ADR 0046, amended 2026-10-18) rejects unknown tools and undeclared, mistyped or missing arguments before any request, so `path` (local-file read) is unreachable via MCP.
@@ -382,6 +382,8 @@ The `/mcp` endpoint serves both eras from one endpoint, fully stateless:
 **Why `2025-06-18` and `2025-11-25` are treated identically:** Per the MCP changelogs (spec: Changelogs), 2025-06-18 removed batching and introduced the `MCP-Protocol-Version` header. 2025-11-25 added icons (optional), tasks (experimental, not implemented), guidance on tool names, SSE polling (not used here), and OAuth clarifications. None of these requires a stateless, tools-only server to behave differently. Both versions use the same `initialize` handshake, both send `MCP-Protocol-Version` on subsequent requests (spec-compliant clients), and both expect the same responses. Therefore, this design treats them as one legacy era.
 
 Stdio's advertised version remains `2024-11-05` (unchanged) — an acceptable inconsistency.
+
+Amended 2026-10-20: stdio now negotiates the same legacy set (`2025-11-25`, `2025-06-18`; any other request is counter-offered `2025-11-25`), adds `instructions` and `ping`, and answers a missing or non-string `protocolVersion` with `-32602`. Both transports use the helpers in `src/mcp_registry.rs`.
 
 ### Era Detection (Fixed Precedence)
 

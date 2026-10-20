@@ -54,6 +54,7 @@ can connect over HTTP (remote/multiplexed) in addition to spawn-as-child stdio.
 - [x] Phase 3: Legacy request handling (tools/call live, lanes, golden test, official SDK test) — done 2026-10-18 (tools/call in-process via registry, permit lanes split by stage, 40 s tool budget from body completion; SDK gate passed; proxy test moved to Phase 5)
 - [x] Phase 4: Modern request handling (dual-era staging) — done 2026-10-19 (dual-era live; rmcp 3.5.1 modern gate passed)
 - [x] Phase 5: Polish, logging, metrics, documentation — done 2026-10-19 (four log targets, `/api/status` mcp_http snapshot, Docker proxy playbook, docs/HOWTO.md §5a, ADR 0045 amendment)
+- [x] Known nit: stdio `initialize` advertised `2024-11-05` with no `instructions` and had no `ping` — done 2026-10-20 (stdio negotiates 2025-11-25 / 2025-06-18 through the shared helpers in `src/mcp_registry.rs`, returns `instructions`, answers `ping`; 858de51; ADR 0045 amendment)
 - **Follow-ups (planned, not in MVP):**
   - ADR 0047 job_id cell (a spawned enqueue publishes job_id, so the rare MCP tool-budget timeout that stalls before the bridge's own 30 s wait can still report it)
   - Native TLS for the MCP listener (first release uses a reverse proxy for HTTPS)
