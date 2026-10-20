@@ -211,7 +211,7 @@ starts or lands; re-rank with the owner.
 | P0 | Supervisor restart (launchd/systemd) documented | S | Q-PANIC | nothing restarted the daemon after the crash | ⚪ (with F8 operational guide) |
 | P0 | Lint guard against byte-index string slicing | S | Q-SLICE | prevents a repeat of the crash | 🟢 done (219697d) |
 | P1 | Dev run profiles (`runs/<profile>/`) | S | F9 | protects the main DB while experimenting | 🟢 done (f953948); 👤 move root state into `runs/main/` |
-| P1 | Stdio `initialize`: answer 2025-11-25/2025-06-18 and add instructions | S | F3 known nit | stdio is the main local path and still advertises 2024-11-05, which predates tool annotations | ⚪ |
+| P1 | Stdio `initialize`: answer 2025-11-25/2025-06-18 and add instructions | S | F3 known nit | stdio is the main local path and still advertises 2024-11-05, which predates tool annotations | 🟢 done (858de51) |
 | P1 | Rate limiting for network-touching reads (`groups`, `group_info` cache misses) and chat-management via MCP | M | follow-up above | an LLM loop can hammer WhatsApp; anti-ban is a core promise | ⚪ |
 | P1 | wa-rs upgrade check | M | Q-WARS | pin is from 2026-07-01 and upstream has moved | ⚪ |
 | P1 | README (the what) + fork notice + operational guide (the how) | M | F8 | README still carries the build section and how-to detail | ⚪ |
