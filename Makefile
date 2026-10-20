@@ -81,9 +81,9 @@ new-profile: ## Create runs/<profile>/ with logs/ and a .env (make new-profile P
 	@test -n "$$P" || { echo "Error: set P=<profile>, e.g. make new-profile P=dev" >&2; exit 1; }
 	scripts/run-profile.sh new "$$P" $(if $(SEMANTIC),--semantic)
 
-run-profile: ## Run the daemon with state in runs/<profile>/, in a tmux session when tmux exists (make run-profile P=<name> [RELEASE=1])
+run-profile: ## Run the daemon with state in runs/<profile>/, in this terminal; USE_TMUX=1 runs it in a tmux session (make run-profile P=<name> [RELEASE=1] [USE_TMUX=1])
 	@test -n "$$P" || { echo "Error: set P=<profile>, e.g. make run-profile P=dev (create it first: make new-profile P=dev)" >&2; exit 1; }
-	scripts/run-profile.sh daemon "$$P" $(if $(RELEASE),--release)
+	scripts/run-profile.sh daemon "$$P" $(if $(RELEASE),--release) $(if $(USE_TMUX),--tmux)
 
 attach-profile: ## Attach to the tmux session of a profile's daemon (make attach-profile P=<name>)
 	@test -n "$$P" || { echo "Error: set P=<profile>, e.g. make attach-profile P=dev" >&2; exit 1; }

@@ -26,15 +26,20 @@ runs/<profile>/ instead of the project root. Profile names: letters, digits, '.'
 Commands:
   new <profile> [--semantic]    create runs/<profile>/ (logs/ + a .env from .env.example) with the
                                 next free port pair; --semantic enables the embedder sidecar
-  list [--all]                  show the profiles whose daemon runs in a tmux session: REST port, MCP
-                                port, start time, attached; --all shows every profile: REST, MCP,
-                                DB present, instance lock, tmux
-  daemon <profile> [--release] [--detach] [--foreground]
-                                build once, then run the daemon inside runs/<profile>/ in the tmux
-                                session whatsrust-<profile>; output goes to the session and to
-                                logs/<UTC time>.log (no colours). From a terminal it attaches right
-                                away; --detach leaves it running in the background. --foreground
-                                (or no tmux) runs it in this terminal instead.
+  list [--tmux]                 show every profile: REST port, MCP port, DB present, instance lock,
+                                tmux (running, or -). --tmux shows only the profiles whose daemon
+                                runs in a tmux session: REST, MCP, start time, attached (needs tmux
+                                installed). (--all is accepted and means the default view.)
+  daemon <profile> [--release] [--tmux] [--detach]
+                                build once, then run the daemon inside runs/<profile>/ in THIS
+                                terminal; output goes to the terminal and, without colours, to
+                                logs/<UTC time>.log. Ctrl+C stops it gracefully. Options:
+                                  --release  build and run the release binary (default: debug)
+                                  --tmux     opt in to tmux: run it in the tmux session
+                                             whatsrust-<profile>; from a terminal it attaches
+                                             right away
+                                  --detach   implies --tmux; leave the session running in the
+                                             background and print how to attach
   attach <profile>              attach to the profile's tmux session (detach again with Ctrl-b d)
   cli <profile> <args...>       run `whatsrust <args...>` against that profile's daemon
   mcp <profile>                 run `whatsrust mcp` (stdio) against that profile's daemon
@@ -43,23 +48,50 @@ Commands:
 Ports: the first profile gets REST 9270 / MCP 9271, then 9280/9281, 9290/9291, ... The MCP
 listener is off until you enable it in the profile's .env (WHATSRUST_MCP_PORT + a token you generate).
 
+Examples:
+  scripts/run-profile.sh new dev                 create runs/dev/
+  scripts/run-profile.sh daemon dev              run in this terminal; Ctrl+C to stop
+  scripts/run-profile.sh daemon dev --tmux       run in tmux session whatsrust-dev (Ctrl-b d detaches)
+  scripts/run-profile.sh daemon dev --detach     same, but stay in the background
+  scripts/run-profile.sh list                    every profile; add --tmux for the tmux ones only
+  scripts/run-profile.sh attach dev              attach to the session again
+  scripts/run-profile.sh cli dev status          `whatsrust status` against dev's daemon
+  make run-profile P=dev [RELEASE=1] [USE_TMUX=1]    same as daemon (USE_TMUX=1 adds --tmux)
+
+Environment:
+  RUN_PROFILE_TMUX_SOCKET=<name>   testing/advanced: every tmux call uses the private server
+                                   `tmux -L <name>` instead of the default one
+  CARGO_TARGET_DIR                 where cargo builds (default: <repo>/target); daemon, cli and mcp
+                                   look for the binary there
+  Variables exported in your shell (WHATSRUST_*, WHATSAPP_*, HEALTH_PORT, BACKUP_DIR, RUST_LOG)
+  beat the profile's .env when the daemon runs in this terminal; daemon names them (never their
+  values) when it starts. With --tmux they are NOT applied (see the tmux note).
+
+Exit codes:
+  0  done
+  1  failed: no such profile, the profile already exists, tmux not found (daemon --tmux/--detach,
+     attach, list --tmux), tmux session already exists, no built binary, ...
+  2  usage error (unknown command or option, missing argument)
+  daemon in this terminal exits with the daemon's own exit code; a failed build exits with cargo's.
+  cli and mcp exit with whatsrust's exit code.
+
 Notes:
   - cli and mcp read only WHATSRUST_PORT, WHATSRUST_BIND and WHATSRUST_API_TOKEN from the profile's
     .env (nothing else is sourced) and use the newest built target/{release,debug}/whatsrust.
   - cli --rollback / --migrate run inside runs/<profile>/ because they act on its whatsapp.db.
   - list: LOCK is "HELD" when a process has runs/<profile>/whatsapp.db.instance.lock open (checked
     with lsof; "unknown" if lsof is missing). The lock file itself stays behind after a stop.
-    Without tmux, list shows the --all view.
-  - tmux (3.2 or newer): a session does not inherit your shell's environment. Only
-    WHATSRUST_ENV_FILE is passed in; variables exported in your shell (WHATSRUST_*, RUST_LOG, ...)
-    are NOT applied inside the session: put them in the profile's .env. A '.' in a profile name
-    becomes '_' in the session name.
+    TMUX is "running" while the profile's session exists (also while its pane waits for Enter).
+  - tmux is opt-in and needs tmux 3.2 or newer. A session does not inherit your shell's
+    environment: only WHATSRUST_ENV_FILE is passed in, so variables exported in your shell
+    (WHATSRUST_*, RUST_LOG, ...) are NOT applied inside the session: put them in the profile's
+    .env. A '.' in a profile name becomes '_' in the session name. A second daemon --tmux for a
+    profile whose session exists is refused.
   - When the daemon ends inside tmux (exit, Ctrl+C, a signal, a crash), the pane prints the exit
     code (and the signal name for codes above 128) and waits for Enter before the session closes.
-  - Without tmux on PATH, daemon prints a note and runs in this terminal.
-  - Testing/advanced: RUN_PROFILE_TMUX_SOCKET=<name> makes every tmux call use the private server
-    `tmux -L <name>` instead of the default one.
   - Never run two copies of the same paired DB at once; each profile is its own linked device.
+
+More: docs/HOWTO.md section 3, "Run profiles" (includes a demo playbook with expected output).
 EOF
 }
 
@@ -327,30 +359,30 @@ list_tmux() {
     printf '%-24s %-16s %-7s %-12s %-19s %s\n' "$(session_name "$name")" "$name" "$P_REST" "$P_MCP" "$(fmt_epoch "$created")" "$att"
   done
   if [ "$found" -eq 0 ]; then
-    echo "no run-profile daemons in tmux (scripts/run-profile.sh list --all shows every profile)"
+    echo "no run-profile daemons in tmux (scripts/run-profile.sh list shows every profile)"
   fi
 }
 
+# list: every profile (--all is an alias of that view); --tmux: only the profiles with a tmux session.
 cmd_list() {
-  local all=0 arg rows=""
+  local all=0 only_tmux=0 arg rows=""
   for arg in "$@"; do
     case $arg in
       --all) all=1 ;;
+      --tmux) only_tmux=1 ;;
       -*) usage_err "list: unknown option: $arg" ;;
       *) usage_err "list: unexpected argument: $arg" ;;
     esac
   done
-  if have_tmux; then
-    rows=$(tmux_sessions)
-  elif [ "$all" -eq 0 ]; then
-    note "note: tmux not found; showing all profiles"
-    all=1
+  [ "$all$only_tmux" != 11 ] || usage_err "list: --all and --tmux exclude each other"
+  if [ "$only_tmux" -eq 1 ]; then
+    need_tmux
+    list_tmux "$(tmux_sessions)"
+    return 0
   fi
-  if [ "$all" -eq 1 ]; then
-    list_all "$rows"
-  else
-    list_tmux "$rows"
-  fi
+  # Without tmux there are no sessions, so every TMUX cell is "-" (no note).
+  if have_tmux; then rows=$(tmux_sessions); fi
+  list_all "$rows"
 }
 
 cmd_attach() {
@@ -359,7 +391,7 @@ cmd_attach() {
   require_profile "$1"
   local sess
   sess=$(session_name "$1")
-  has_session "$sess" || die "no tmux session for profile $1 (start it with: scripts/run-profile.sh daemon $1)"
+  has_session "$sess" || die "no tmux session for profile $1 (start it with: scripts/run-profile.sh daemon $1 --tmux)"
   attach_session "$sess"
 }
 
@@ -542,13 +574,17 @@ start_session() {
   note "attach with: scripts/run-profile.sh attach $name   (detach again with Ctrl-b d)"
 }
 
+# daemon: run in this terminal; --tmux (or --detach, which implies it) opts in to a tmux session.
 cmd_daemon() {
-  local name="" release=0 detach=0 foreground=0 arg
+  local name="" release=0 detach=0 use_tmux=0 arg
   for arg in "$@"; do
     case $arg in
       --release) release=1 ;;
-      --detach) detach=1 ;;
-      --foreground) foreground=1 ;;
+      --tmux) use_tmux=1 ;;
+      --detach)
+        detach=1
+        use_tmux=1
+        ;;
       -*) usage_err "daemon: unknown option: $arg" ;;
       *)
         [ -z "$name" ] || usage_err "daemon: unexpected argument: $arg"
@@ -557,19 +593,13 @@ cmd_daemon() {
     esac
   done
   [ -n "$name" ] || usage_err "daemon: missing <profile>"
-  [ "$detach$foreground" != 11 ] || usage_err "daemon: --detach and --foreground exclude each other"
   require_profile "$name"
   [ -f "$DIR/.env" ] || note "warning: $DIR/.env is missing; the daemon runs with built-in defaults"
   check_embedder
 
-  local use_tmux=1 sess=""
-  if [ "$foreground" -eq 1 ]; then
-    use_tmux=0
-  elif ! have_tmux; then
-    note "note: tmux not found; running in the foreground (install: brew install tmux)"
-    use_tmux=0
-  fi
+  local sess=""
   if [ "$use_tmux" -eq 1 ]; then
+    have_tmux || die "tmux not found (install: brew install tmux); run without --tmux to use this terminal"
     sess=$(session_name "$name")
     if has_session "$sess"; then
       die "session $sess already exists; attach with: scripts/run-profile.sh attach $name"
@@ -608,7 +638,7 @@ cmd_daemon() {
 # start_session): the foreground logging pipeline, then a note and a wait for Enter. The EXIT trap
 # covers every way this process can end, including a failed start.
 cmd_pane() {
-  [ $# -eq 3 ] || usage_err "_pane is internal (use: daemon <profile>)"
+  [ $# -eq 3 ] || usage_err "_pane is internal (use: daemon <profile> --tmux)"
   PANE_LOG=$2
   PANE_SESSION=$(session_name "$1")
   BIN=$3
