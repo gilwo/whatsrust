@@ -38,3 +38,13 @@ Runtime cap enforced via parameter. Resumable continuation via persisted per-cha
 **Alternatives rejected:**
 - Full auto-sync on connect: unpredictable data usage, no user control
 - Arbitrary time-range windows: complex state (multiple gaps), unclear UX
+
+## Amendment (2026-10-20)
+
+A fetch needs a usable anchor. The phone ignores a request with an empty anchor: it acknowledges the request and never answers (seen in a live run, where the job failed after 60 s on a fetch timeout). The earlier assumption that an empty anchor "returns the most-recent history chunk" was wrong and is removed.
+
+The anchor is, in order: the cursor's own anchor (a non-empty `oldest_msg_id` and a timestamp), else the oldest stored message of the chat. With neither, `POST /api/history-fetch` returns `409` with `code: "no_anchor"` and creates no cursor and no job, and the worker fails a job that reaches that state at once with a `no_anchor:` reason, without calling the phone. The worker covers jobs queued before the upgrade and chats whose messages were deleted.
+
+A cursor an older version left with an empty anchor (`oldest_msg_id = ''`, NULL timestamp) is re-seeded from the oldest stored message on the next trigger; it no longer blocks the chat for good.
+
+Messages sent through whatsrust are not stored, so they never become anchors. A chat that has only such messages has no anchor: receive a message in it, or send one from the phone, then retry.

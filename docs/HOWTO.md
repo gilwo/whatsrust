@@ -599,6 +599,14 @@ JID format (from the daemon's own `--help`): a bare phone number
 (`15551234567`) or the full JID (`15551234567@s.whatsapp.net`); groups use
 `<id>@g.us`.
 
+**`fetch-history` needs a message to start from.** WhatsApp pages history
+backwards from a known message, so the chat must have at least one stored
+message. Without one, the call fails with HTTP 409 and `"code": "no_anchor"`
+(the CLI prints that body and exits 1; the MCP tool returns `isError: true`), and
+no job is queued. To fix it, receive a message in the chat, or send one **from
+the phone**, then retry. Messages sent through whatsrust are not stored, so they
+do not count.
+
 **Verification:** `whatsrust <cmd> ... ` prints a JSON object to stdout and
 exits non-zero on failure (`{"ok": false, ...}` or an HTTP error status).
 Run `whatsrust --help` (or `whatsrust help`) at any time for the authoritative,
