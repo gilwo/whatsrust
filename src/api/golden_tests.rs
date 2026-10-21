@@ -1177,6 +1177,18 @@ fn corpus() -> Vec<Case> {
                 \r\n\
                 {\"code\":\"bad_request\",\"error\":\"mode 'count' requires a positive target_value\",\"ok\":false}",
         ),
+        // No message is stored for 1@g.us on this bridge, so there is nothing to start from.
+        case(
+            "fetch_trigger_no_anchor",
+            Cfg::Loopback,
+            json_post("/api/history-fetch", r#"{"chat_jid":"1@g.us","mode":"all"}"#),
+            "HTTP/1.1 409 Conflict\r\n\
+                Content-Type: application/json\r\n\
+                Content-Length: 305\r\n\
+                Connection: close\r\n\
+                \r\n\
+                {\"chat_jid\":\"1@g.us\",\"code\":\"no_anchor\",\"message\":\"no stored message in this chat to start from: WhatsApp pages history backwards from a known message. Receive a message in the chat, or send one from the phone (messages sent through whatsrust are not stored), then retry.\",\"ok\":false,\"status\":\"no_anchor\"}",
+        ),
         case(
             "fetch_cancel_without_job_id",
             Cfg::Loopback,
@@ -1264,16 +1276,18 @@ fn stateful_corpus() -> Vec<Case> {
                 \r\n\
                 {\"job_id\":6,\"ok\":true,\"scheduled_at\":4102444800}",
         ),
+        // Changed 2026-10-20 (ADR 0003 amendment): an accepted fetch always has an anchor, here
+        // the message the test seeds (1_700_000_000 s), so `resume_anchor` is no longer null.
         case(
             "fetch_trigger_accepted",
             Cfg::Loopback,
             json_post("/api/history-fetch", r#"{"chat_jid":"1@g.us","mode":"all"}"#),
             "HTTP/1.1 200 OK\r\n\
                 Content-Type: application/json\r\n\
-                Content-Length: 173\r\n\
+                Content-Length: 182\r\n\
                 Connection: close\r\n\
                 \r\n\
-                {\"accepted\":null,\"chat_jid\":\"1@g.us\",\"job_id\":1,\"more_remain\":true,\"ok\":true,\"requested\":null,\"resume_anchor\":null,\"status\":\"queued\",\"target_kind\":\"all\",\"target_value\":null}",
+                {\"accepted\":null,\"chat_jid\":\"1@g.us\",\"job_id\":1,\"more_remain\":true,\"ok\":true,\"requested\":null,\"resume_anchor\":1700000000000,\"status\":\"queued\",\"target_kind\":\"all\",\"target_value\":null}",
         ),
         case(
             "fetch_trigger_already_active",
@@ -1323,6 +1337,12 @@ async fn test_rest_wire_golden_corpus() {
 #[tokio::test]
 async fn test_rest_wire_golden_stateful_corpus() {
     let (bridge, db_path) = test_bridge("stateful").await;
+    // The fetch cases need a stored message in 1@g.us to start from (else 409 no_anchor).
+    bridge
+        .store()
+        .insert_inbound("1@g.us", "2@s.whatsapp.net", "ANCHOR1", "text", Some("hi"), 1_700_000_000, "pending")
+        .await
+        .unwrap();
     assert_golden(run_cases(&bridge, stateful_corpus()).await);
     let _ = std::fs::remove_file(&db_path);
 }
@@ -1653,6 +1673,7 @@ fn test_rest_response_helpers_golden() {
         (403, "HTTP/1.1 403 Forbidden"),
         (404, "HTTP/1.1 404 Not Found"),
         (405, "HTTP/1.1 405 Method Not Allowed"),
+        (409, "HTTP/1.1 409 Conflict"),
         (411, "HTTP/1.1 411 Length Required"),
         (415, "HTTP/1.1 415 Unsupported Media Type"),
         (417, "HTTP/1.1 417 Expectation Failed"),

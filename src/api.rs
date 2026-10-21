@@ -168,6 +168,7 @@ impl ApiResponse {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            409 => "Conflict",
             411 => "Length Required",
             413 => "Content Too Large",
             415 => "Unsupported Media Type",
@@ -1432,8 +1433,21 @@ fn enqueue_outcome_to_response(
     }
 }
 
+/// 409 for a fetch of a chat with no usable anchor (no cursor anchor, no stored message).
+/// Pure function — no side effects — so it can be unit-tested without a bridge.
+fn no_anchor_response(chat_jid: &str) -> ApiResponse {
+    json_response(409, &json!({
+        "ok": false,
+        "code": "no_anchor",
+        "status": "no_anchor",
+        "chat_jid": chat_jid,
+        "message": crate::backfill::NO_ANCHOR_GUIDANCE,
+    }).to_string())
+}
+
 /// POST /api/history-fetch — trigger a backfill job for a chat.
 async fn handle_history_fetch_trigger(bridge: &WhatsAppBridge, body: &[u8]) -> ApiResponse {
+    use crate::backfill::AnchorResolution;
     let req: HistoryFetchReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
 
     // chat_jid is required
@@ -1471,34 +1485,31 @@ async fn handle_history_fetch_trigger(bridge: &WhatsAppBridge, body: &[u8]) -> A
         }));
     }
 
-    // Cursor seed/resume: if no cursor exists, seed it from the oldest message.
-    // If a cursor exists and is not exhausted, leave it untouched (resume from where it is).
-
-    let resume_anchor_ts = if cursor_opt.is_none() {
-        // Seed cursor from the oldest stored message (mirrors the smoke-test hook exactly)
-        let oldest = match store.get_oldest_message(&chat_jid).await {
-            Ok(o) => o,
-            Err(e) => return json_err(500, &format!("storage error: {e}")),
-        };
-        let anchor = crate::backfill::initial_anchor(oldest);
-        let anchor_ts = if anchor.oldest_msg_timestamp_ms == 0 { None } else { Some(anchor.oldest_msg_timestamp_ms) };
-        if let Err(e) = store.upsert_backfill_cursor(
-            &chat_jid,
-            Some(&anchor.oldest_msg_id),
-            Some(anchor.oldest_msg_from_me),
-            anchor_ts,
-            true,
-            false,
-            None,
-        ).await {
-            return json_err(500, &format!("storage error: {e}"));
-        }
-        anchor_ts
-    } else {
-        cursor_opt.as_ref().and_then(|c| c.oldest_msg_timestamp_ms)
-    };
-
     let more_remain = cursor_opt.as_ref().map(|c| c.more_remain).unwrap_or(true);
+
+    // Anchor: the cursor's own if usable (left untouched: resume from where it is), else the
+    // oldest stored message, which (re)seeds the cursor. This also heals rows older versions
+    // left with an empty anchor. With neither there is nothing to page back from: 409, and
+    // neither the cursor nor the queue is touched.
+    let resume_anchor_ts = match crate::backfill::resolve_anchor(store, &chat_jid, cursor_opt.as_ref()).await {
+        Err(e) => return json_err(500, &format!("storage error: {e}")),
+        Ok(AnchorResolution::NoAnchor) => return no_anchor_response(&chat_jid),
+        Ok(AnchorResolution::Cursor(anchor)) => anchor.oldest_msg_timestamp_ms,
+        Ok(AnchorResolution::OldestStored(anchor)) => {
+            if let Err(e) = store.upsert_backfill_cursor(
+                &chat_jid,
+                Some(&anchor.oldest_msg_id),
+                Some(anchor.oldest_msg_from_me),
+                Some(anchor.oldest_msg_timestamp_ms),
+                more_remain,
+                false,
+                None,
+            ).await {
+                return json_err(500, &format!("storage error: {e}"));
+            }
+            anchor.oldest_msg_timestamp_ms
+        }
+    };
 
     // Enqueue the job
     let (cooldown_secs, queue_depth, max_messages) = bridge.backfill_config();
@@ -1527,7 +1538,7 @@ async fn handle_history_fetch_trigger(bridge: &WhatsAppBridge, body: &[u8]) -> A
         &chat_jid,
         &mode,
         req.target_value,
-        resume_anchor_ts,
+        Some(resume_anchor_ts),
         more_remain,
     )
 }
@@ -2592,6 +2603,7 @@ mod tests {
             (202, "Accepted"),
             (400, "Bad Request"),
             (405, "Method Not Allowed"),
+            (409, "Conflict"),
             (411, "Length Required"),
             (413, "Content Too Large"),
             (415, "Unsupported Media Type"),
@@ -2734,6 +2746,127 @@ mod tests {
         // Confirm no job was enqueued (this mirrors what the handler does: fast-path returns without enqueueing)
         let jobs = store.list_backfill_jobs(false).await.unwrap();
         assert!(jobs.is_empty(), "no job should have been enqueued for an exhausted cursor");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // -------------------------------------------------------------------------
+    // POST /api/history-fetch: a fetch needs a usable anchor
+    // -------------------------------------------------------------------------
+
+    const FETCH_CHAT: &str = "5551234@s.whatsapp.net";
+    const FETCH_BODY: &[u8] = br#"{"chat_jid":"5551234@s.whatsapp.net","mode":"all"}"#;
+
+    /// Store one message in `FETCH_CHAT` (timestamp in seconds).
+    async fn store_fetch_chat_message(bridge: &WhatsAppBridge, message_id: &str, ts_secs: i64) {
+        bridge
+            .store()
+            .insert_inbound(FETCH_CHAT, "5551234@s.whatsapp.net", message_id, "text", Some("hello"), ts_secs, "pending")
+            .await
+            .unwrap();
+    }
+
+    async fn trigger_fetch(bridge: &WhatsAppBridge) -> (u16, serde_json::Value) {
+        let raw = handle_history_fetch_trigger(bridge, FETCH_BODY).await.into_bytes();
+        (http_status_of(&raw), parse_response_json(&raw))
+    }
+
+    #[tokio::test]
+    async fn test_history_fetch_empty_chat_returns_409_no_anchor() {
+        let (bridge, db_path) = test_bridge_for_serve("hf-no-anchor").await;
+
+        let (status, body) = trigger_fetch(&bridge).await;
+
+        assert_eq!(status, 409);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "no_anchor");
+        assert_eq!(body["status"], "no_anchor");
+        assert_eq!(body["chat_jid"], FETCH_CHAT);
+        assert_eq!(body["message"], crate::backfill::NO_ANCHOR_GUIDANCE);
+        let store = bridge.store();
+        assert!(store.get_backfill_cursor(FETCH_CHAT).await.unwrap().is_none(), "no cursor row is created");
+        assert!(store.list_backfill_jobs(false).await.unwrap().is_empty(), "nothing is enqueued");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_history_fetch_empty_cursor_without_message_returns_409_and_keeps_cursor() {
+        let (bridge, db_path) = test_bridge_for_serve("hf-empty-cursor-no-msg").await;
+        let store = bridge.store();
+        // The row older versions left for an empty chat.
+        store.upsert_backfill_cursor(FETCH_CHAT, Some(""), Some(false), None, true, false, None).await.unwrap();
+
+        let (status, body) = trigger_fetch(&bridge).await;
+
+        assert_eq!(status, 409);
+        assert_eq!(body["code"], "no_anchor");
+        let cursor = store.get_backfill_cursor(FETCH_CHAT).await.unwrap().unwrap();
+        assert_eq!(cursor.oldest_msg_id.as_deref(), Some(""));
+        assert_eq!(cursor.oldest_msg_timestamp_ms, None);
+        assert!(store.list_backfill_jobs(false).await.unwrap().is_empty(), "nothing is enqueued");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_history_fetch_stored_message_seeds_cursor_and_queues() {
+        let (bridge, db_path) = test_bridge_for_serve("hf-seed").await;
+        store_fetch_chat_message(&bridge, "oldest-msg", 1_700_000_000).await;
+        store_fetch_chat_message(&bridge, "newer-msg", 1_700_000_500).await;
+
+        let (status, body) = trigger_fetch(&bridge).await;
+
+        assert_eq!(status, 200);
+        assert_eq!(body["status"], "queued");
+        assert_eq!(body["resume_anchor"], 1_700_000_000_000_i64);
+        let store = bridge.store();
+        let cursor = store.get_backfill_cursor(FETCH_CHAT).await.unwrap().unwrap();
+        assert_eq!(cursor.oldest_msg_id.as_deref(), Some("oldest-msg"));
+        assert_eq!(cursor.oldest_msg_from_me, Some(false));
+        assert_eq!(cursor.oldest_msg_timestamp_ms, Some(1_700_000_000_000));
+        assert!(cursor.more_remain && !cursor.exhausted);
+        assert_eq!(store.list_backfill_jobs(false).await.unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_history_fetch_empty_cursor_with_stored_message_is_reseeded() {
+        let (bridge, db_path) = test_bridge_for_serve("hf-reseed").await;
+        let store = bridge.store();
+        store.upsert_backfill_cursor(FETCH_CHAT, Some(""), Some(false), None, true, false, None).await.unwrap();
+        store_fetch_chat_message(&bridge, "oldest-msg", 1_700_000_000).await;
+
+        let (status, body) = trigger_fetch(&bridge).await;
+
+        assert_eq!(status, 200);
+        assert_eq!(body["status"], "queued");
+        assert_eq!(body["resume_anchor"], 1_700_000_000_000_i64);
+        let cursor = store.get_backfill_cursor(FETCH_CHAT).await.unwrap().unwrap();
+        assert_eq!(cursor.oldest_msg_id.as_deref(), Some("oldest-msg"));
+        assert_eq!(cursor.oldest_msg_timestamp_ms, Some(1_700_000_000_000));
+        assert_eq!(store.list_backfill_jobs(false).await.unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_history_fetch_usable_cursor_is_left_untouched() {
+        let (bridge, db_path) = test_bridge_for_serve("hf-cursor-kept").await;
+        let store = bridge.store();
+        store.upsert_backfill_cursor(FETCH_CHAT, Some("paged-msg"), Some(true), Some(1_600_000_000_000), true, false, None).await.unwrap();
+        store_fetch_chat_message(&bridge, "oldest-msg", 1_700_000_000).await;
+
+        let (status, body) = trigger_fetch(&bridge).await;
+
+        assert_eq!(status, 200);
+        assert_eq!(body["status"], "queued");
+        assert_eq!(body["resume_anchor"], 1_600_000_000_000_i64, "resumes from the cursor, not the stored message");
+        let cursor = store.get_backfill_cursor(FETCH_CHAT).await.unwrap().unwrap();
+        assert_eq!(cursor.oldest_msg_id.as_deref(), Some("paged-msg"));
+        assert_eq!(cursor.oldest_msg_from_me, Some(true));
+        assert_eq!(cursor.oldest_msg_timestamp_ms, Some(1_600_000_000_000));
 
         let _ = std::fs::remove_file(&db_path);
     }
