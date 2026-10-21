@@ -9,6 +9,7 @@
 //!   - `HistoryBatch`     — one page of fetched messages
 //!   - `HistorySource`    — async trait seam; real impl (Wave B2) wraps `Client`
 //!   - `FakeHistorySource`— scripted canned responses for tests
+//!   - `resolve_anchor`   — the usable starting anchor: cursor, else oldest stored message
 //!   - `FetchTarget`      — contained-C target model (ADR 0033)
 //!   - `BackfillStep`     — pure stop-condition output
 //!   - `evaluate_target`  — pure, total stop-condition function
@@ -158,6 +159,8 @@ pub enum FakeResponse {
 ///
 /// Responses are consumed in order (FIFO). After all scripted responses are
 /// exhausted, subsequent calls return an error ("no more scripted responses").
+/// Every call is recorded as `(chat_jid, anchor)`, so tests can assert which anchor was
+/// sent (or that nothing was).
 ///
 /// This lets Wave B's worker tests exercise:
 ///   - Normal pagination (sequences of `Batch` entries)
@@ -166,6 +169,7 @@ pub enum FakeResponse {
 ///   - Connection-gating: call `set_ready(false)` to simulate a disconnected source.
 pub struct FakeHistorySource {
     responses: std::sync::Mutex<std::collections::VecDeque<FakeResponse>>,
+    calls: std::sync::Mutex<Vec<(String, Anchor)>>,
     /// Simulated connection readiness. Default: `true` (ready). Use `set_ready(false)` in
     /// tests that exercise the ADR 0026 connection-gate path.
     ready: std::sync::atomic::AtomicBool,
@@ -176,8 +180,14 @@ impl FakeHistorySource {
     pub fn new(responses: Vec<FakeResponse>) -> Self {
         Self {
             responses: std::sync::Mutex::new(responses.into()),
+            calls: std::sync::Mutex::new(Vec::new()),
             ready: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Return the recorded `fetch_older` calls as `(chat_jid, anchor)` (snapshot).
+    pub fn recorded_calls(&self) -> Vec<(String, Anchor)> {
+        self.calls.lock().expect("FakeHistorySource calls mutex poisoned").clone()
     }
 
     /// Convenience: a source that returns one empty exhausted batch.
@@ -210,10 +220,14 @@ impl HistorySource for FakeHistorySource {
 
     async fn fetch_older(
         &self,
-        _chat_jid: &str,
-        _anchor: &Anchor,
+        chat_jid: &str,
+        anchor: &Anchor,
         _count: i32,
     ) -> anyhow::Result<HistoryBatch> {
+        self.calls
+            .lock()
+            .expect("FakeHistorySource calls mutex poisoned")
+            .push((chat_jid.to_owned(), anchor.clone()));
         let mut queue = self.responses.lock().expect("FakeHistorySource mutex poisoned");
         match queue.pop_front() {
             Some(FakeResponse::Batch { messages, more_remain, progress }) => {
@@ -701,27 +715,93 @@ pub fn drain_history_sync(hs: &wa::HistorySync, accepted_ids: &[String]) -> Hist
 }
 
 // ---------------------------------------------------------------------------
-// initial_anchor — seed the starting anchor from the oldest stored message
+// resolve_anchor — the usable starting anchor for a fetch
 // ---------------------------------------------------------------------------
 
-/// Seed the starting anchor for a chat from its oldest already-stored message
-/// ("older than what I have", ADR 0003).
+/// Why a fetch cannot start, and what to do about it. Shared by the REST `409 no_anchor`
+/// body and the worker's `no_anchor:` failure reason so the two never drift apart.
+pub const NO_ANCHOR_GUIDANCE: &str = "no stored message in this chat to start from: WhatsApp pages history backwards from a known message. Receive a message in the chat, or send one from the phone (messages sent through whatsrust are not stored), then retry.";
+
+/// Where a fetch starts, and which source supplied it (ADR 0003).
 ///
-/// - `Some(row)` → anchor at that message (seconds → milliseconds via `saturating_mul(1000)`).
-/// - `None` → empty anchor (phone returns most-recent history chunk).
-pub fn initial_anchor(oldest: Option<crate::storage::OldestMessageRow>) -> Anchor {
-    match oldest {
-        Some(row) => Anchor {
-            oldest_msg_id: row.message_id,
-            oldest_msg_from_me: row.from_me,
-            oldest_msg_timestamp_ms: row.timestamp_secs.saturating_mul(1000),
-        },
-        None => Anchor {
-            oldest_msg_id: String::new(),
-            oldest_msg_from_me: false,
-            oldest_msg_timestamp_ms: 0,
-        },
+/// The phone ignores a request with an empty anchor (it acknowledges and never answers),
+/// so there is no "no anchor" fetch: a chat without a usable anchor cannot be fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorResolution {
+    /// The cursor row's own anchor: a non-empty `oldest_msg_id` and a non-NULL
+    /// `oldest_msg_timestamp_ms`.
+    Cursor(Anchor),
+    /// The oldest stored message of the chat: there is no cursor, or its anchor is unusable.
+    OldestStored(Anchor),
+    /// No cursor anchor and no stored message.
+    NoAnchor,
+}
+
+impl AnchorResolution {
+    /// The source label used in logs: `cursor`, `oldest_stored` or `none`.
+    pub fn source(&self) -> &'static str {
+        match self {
+            Self::Cursor(_) => "cursor",
+            Self::OldestStored(_) => "oldest_stored",
+            Self::NoAnchor => "none",
+        }
     }
+
+    /// The anchor, if there is one.
+    pub fn anchor(&self) -> Option<&Anchor> {
+        match self {
+            Self::Cursor(a) | Self::OldestStored(a) => Some(a),
+            Self::NoAnchor => None,
+        }
+    }
+}
+
+/// The cursor's anchor, if usable: it needs both a non-empty id and a timestamp. Rows left
+/// by older versions hold `''` with a NULL timestamp (an empty chat's placeholder).
+fn cursor_anchor(cursor: &crate::storage::BackfillCursorRow) -> Option<Anchor> {
+    let id = cursor.oldest_msg_id.as_deref().filter(|id| !id.is_empty())?;
+    let ts = cursor.oldest_msg_timestamp_ms?;
+    Some(Anchor {
+        oldest_msg_id: id.to_owned(),
+        oldest_msg_from_me: cursor.oldest_msg_from_me.unwrap_or(false),
+        oldest_msg_timestamp_ms: ts,
+    })
+}
+
+/// Anchor at a stored message ("older than what I have", ADR 0003); seconds become
+/// milliseconds via `saturating_mul(1000)`.
+fn oldest_stored_anchor(row: crate::storage::OldestMessageRow) -> Anchor {
+    Anchor {
+        oldest_msg_id: row.message_id,
+        oldest_msg_from_me: row.from_me,
+        oldest_msg_timestamp_ms: row.timestamp_secs.saturating_mul(1000),
+    }
+}
+
+/// Resolve the usable anchor for a fetch of `chat_jid`. `cursor` is the chat's cursor row
+/// as the caller already read it.
+///
+/// 1. the cursor's anchor, if it has a non-empty id and a timestamp;
+/// 2. else the oldest stored message of the chat;
+/// 3. else [`AnchorResolution::NoAnchor`].
+///
+/// Read-only: the caller decides whether to persist an `OldestStored` anchor as the cursor.
+pub async fn resolve_anchor(
+    store: &crate::storage::Store,
+    chat_jid: &str,
+    cursor: Option<&crate::storage::BackfillCursorRow>,
+) -> anyhow::Result<AnchorResolution> {
+    if let Some(anchor) = cursor.and_then(cursor_anchor) {
+        return Ok(AnchorResolution::Cursor(anchor));
+    }
+    let oldest = store
+        .get_oldest_message(chat_jid)
+        .await
+        .map_err(|e| anyhow::anyhow!("get_oldest_message failed: {e}"))?;
+    Ok(match oldest {
+        Some(row) => AnchorResolution::OldestStored(oldest_stored_anchor(row)),
+        None => AnchorResolution::NoAnchor,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -730,12 +810,11 @@ pub fn initial_anchor(oldest: Option<crate::storage::OldestMessageRow>) -> Ancho
 
 /// Run one backfill job to completion (or until cancelled/parked/failed).
 ///
-/// # Missing-cursor anchor handling
-/// If the DB has no cursor for this chat, we start with an empty "sentinel"
-/// anchor (`oldest_msg_id = ""`, `oldest_msg_timestamp_ms = 0`). The real
-/// initial anchor (seeded from the most-recent live message) is set up by
-/// the Wave B2 caller before enqueuing the job. In fake-driven unit tests
-/// this default is sufficient — `FakeHistorySource` ignores the anchor value.
+/// # Anchor resolution
+/// The job starts from [`resolve_anchor`]: the cursor's anchor, else the oldest stored
+/// message of the chat. With neither, the job fails at once with a `no_anchor:` reason and
+/// `fetch_older` is never called — the phone ignores an empty anchor, so there is nothing
+/// to send. This covers jobs queued by an older version and chats whose messages were deleted.
 ///
 /// # Cancel semantics (ADR 0026)
 /// In B1, `cancel` is the **single shutdown token** (passed through from
@@ -780,22 +859,20 @@ pub async fn process_job(
         }
     }
 
-    let mut anchor = cursor
-        .as_ref()
-        .and_then(|c| {
-            let id = c.oldest_msg_id.clone()?;
-            let ts = c.oldest_msg_timestamp_ms?;
-            Some(Anchor {
-                oldest_msg_id: id,
-                oldest_msg_from_me: c.oldest_msg_from_me.unwrap_or(false),
-                oldest_msg_timestamp_ms: ts,
-            })
-        })
-        .unwrap_or_else(|| Anchor {
-            oldest_msg_id: String::new(),
-            oldest_msg_from_me: false,
-            oldest_msg_timestamp_ms: 0,
-        });
+    let resolution = resolve_anchor(store, &job.chat_jid, cursor.as_ref()).await?;
+    tracing::info!(
+        job_id = job.id,
+        chat_jid = %job.chat_jid,
+        anchor_source = resolution.source(),
+        anchor_ts_ms = resolution.anchor().map(|a| a.oldest_msg_timestamp_ms),
+        "backfill job: anchor resolved",
+    );
+    let mut anchor = match resolution {
+        AnchorResolution::Cursor(a) | AnchorResolution::OldestStored(a) => a,
+        AnchorResolution::NoAnchor => {
+            return Ok(JobEnd::Failed(format!("no_anchor: {NO_ANCHOR_GUIDANCE}")));
+        }
+    };
 
     // Running fetched tally (resume from what's already stored)
     let mut fetched: u32 = job.fetched.max(0) as u32;
@@ -876,11 +953,6 @@ pub async fn process_job(
         fetched = fetched.saturating_add(batch_msg_count as u32);
 
         // 3e. Compute new anchor from the oldest message in this batch.
-        //
-        // NOTE (Wave B2): before calling process_job the caller must seed a real
-        // initial anchor from the live message frontier. The sentinel anchor
-        // ("", ts 0) used when no cursor exists is only safe for FakeHistorySource
-        // tests where the anchor value is ignored.
         let new_anchor = oldest_anchor(&batch);
 
         // 3e-i. No-progress terminal: if the batch yielded no derivable anchor
@@ -1616,6 +1688,7 @@ mod tests {
             },
         ]);
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "chat@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
@@ -1670,6 +1743,7 @@ mod tests {
             },
         ]);
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "count-chat@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "count-chat@s.whatsapp.net", "count", Some(5)).await;
         let cancel = CancellationToken::new();
 
@@ -1707,6 +1781,7 @@ mod tests {
             },
         ]);
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "since-chat@s.whatsapp.net").await;
         // Since target value is milliseconds: 1000 secs × 1000 = 1_000_000 ms
         let job = enqueue_and_claim(&store, "since-chat@s.whatsapp.net", "since", Some(1_000_000)).await;
         let cancel = CancellationToken::new();
@@ -1756,6 +1831,7 @@ mod tests {
             },
         ]);
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "park-chat@g.us").await;
         let job = enqueue_and_claim(&store, "park-chat@g.us", "all", None).await;
         let cancel = CancellationToken::new();
 
@@ -1821,6 +1897,7 @@ mod tests {
             cancel: cancel_clone,
         };
 
+        seed_anchor_message(&store, "cancel-chat@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "cancel-chat@s.whatsapp.net", "all", None).await;
 
         let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
@@ -1848,6 +1925,7 @@ mod tests {
             progress: None,
         }]);
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "pre-cancel@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "pre-cancel@s.whatsapp.net", "all", None).await;
 
         let cancel = CancellationToken::new();
@@ -1891,6 +1969,7 @@ mod tests {
             },
         ]);
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "stuck-chat@g.us").await;
         let job = enqueue_and_claim(&store, "stuck-chat@g.us", "all", None).await;
         let cancel = CancellationToken::new();
 
@@ -1915,6 +1994,7 @@ mod tests {
         let (store, dir) = open_b1_store("fetch-error");
         let source = FakeHistorySource::error("network timeout");
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "err-chat@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "err-chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
@@ -1954,6 +2034,7 @@ mod tests {
             base_delay: Duration::from_millis(200),
             jitter_frac: 0.0,
         };
+        seed_anchor_message(&store, "pacer-chat@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "pacer-chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -1992,6 +2073,7 @@ mod tests {
         let notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
 
+        seed_anchor_message(&store, "driver-chat@s.whatsapp.net").await;
         // Enqueue a job BEFORE starting the loop
         store.enqueue_backfill_job("driver-chat@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await.unwrap();
@@ -2058,6 +2140,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel2 = cancel.clone();
 
+        seed_anchor_message(&store, "shutdown-chat@g.us").await;
         store.enqueue_backfill_job("shutdown-chat@g.us", "all", None, 0, 0, 0, None).await.unwrap();
 
         let store2 = store.clone();
@@ -2129,6 +2212,7 @@ mod tests {
             progress: None,
         }]);
         let sink = FakeBatchSink::error("disk full");
+        seed_anchor_message(&store, "sink-err@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "sink-err@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
@@ -2229,6 +2313,7 @@ mod tests {
             progress: None,
         }]);
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "count-cool@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "count-cool@s.whatsapp.net", "count", Some(2)).await;
         let cancel = CancellationToken::new();
 
@@ -2276,6 +2361,7 @@ mod tests {
             progress: None,
         }]);
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "noanchor-chat@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "noanchor-chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
@@ -2378,7 +2464,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Wave B2a tests — drain_history_sync, initial_anchor
+    // Wave B2a tests — drain_history_sync, anchor resolution
     // =========================================================================
 
     use crate::storage::OldestMessageRow;
@@ -2562,29 +2648,219 @@ mod tests {
         assert!(batch.messages.is_empty(), "empty HistorySync → empty batch");
     }
 
-    // --- initial_anchor: Some(row) → scaled anchor ---
+    // --- oldest_stored_anchor: stored row → scaled anchor ---
 
     #[test]
-    fn test_initial_anchor_some_row_scales_to_ms() {
+    fn test_oldest_stored_anchor_scales_to_ms() {
         let row = OldestMessageRow {
             message_id: "m1".to_owned(),
             from_me: true,
             timestamp_secs: 1_000,
         };
-        let anchor = initial_anchor(Some(row));
+        let anchor = oldest_stored_anchor(row);
         assert_eq!(anchor.oldest_msg_id, "m1");
         assert!(anchor.oldest_msg_from_me);
         assert_eq!(anchor.oldest_msg_timestamp_ms, 1_000_000, "seconds must be scaled ×1000 to ms");
     }
 
-    // --- initial_anchor: None → empty anchor ---
+    // --- cursor_anchor / resolve_anchor: which anchor a fetch may start from ---
+
+    fn cursor_row(id: Option<&str>, from_me: Option<bool>, ts_ms: Option<i64>) -> crate::storage::BackfillCursorRow {
+        crate::storage::BackfillCursorRow {
+            chat_jid: "chat@s.whatsapp.net".to_owned(),
+            oldest_msg_id: id.map(str::to_owned),
+            oldest_msg_from_me: from_me,
+            oldest_msg_timestamp_ms: ts_ms,
+            more_remain: true,
+            exhausted: false,
+            last_backfill_at: None,
+        }
+    }
 
     #[test]
-    fn test_initial_anchor_none_returns_empty() {
-        let anchor = initial_anchor(None);
-        assert_eq!(anchor.oldest_msg_id, "", "empty anchor id");
-        assert!(!anchor.oldest_msg_from_me);
-        assert_eq!(anchor.oldest_msg_timestamp_ms, 0, "empty anchor ts_ms = 0");
+    fn test_cursor_anchor_needs_non_empty_id_and_a_timestamp() {
+        let usable = cursor_anchor(&cursor_row(Some("c1"), Some(true), Some(5_000))).expect("usable");
+        assert_eq!(
+            usable,
+            Anchor { oldest_msg_id: "c1".to_owned(), oldest_msg_from_me: true, oldest_msg_timestamp_ms: 5_000 }
+        );
+        // A missing from_me flag reads as false.
+        assert!(!cursor_anchor(&cursor_row(Some("c1"), None, Some(5_000))).unwrap().oldest_msg_from_me);
+        // The empty-chat placeholder older versions stored: '' with a NULL timestamp.
+        assert!(cursor_anchor(&cursor_row(Some(""), Some(false), None)).is_none());
+        assert!(cursor_anchor(&cursor_row(Some(""), Some(false), Some(5_000))).is_none(), "empty id");
+        assert!(cursor_anchor(&cursor_row(None, None, Some(5_000))).is_none(), "NULL id");
+        assert!(cursor_anchor(&cursor_row(Some("c1"), Some(false), None)).is_none(), "NULL timestamp");
+    }
+
+    #[test]
+    fn test_anchor_resolution_labels() {
+        let a = Anchor { oldest_msg_id: "m".to_owned(), oldest_msg_from_me: false, oldest_msg_timestamp_ms: 7 };
+        assert_eq!(AnchorResolution::Cursor(a.clone()).source(), "cursor");
+        assert_eq!(AnchorResolution::OldestStored(a.clone()).source(), "oldest_stored");
+        assert_eq!(AnchorResolution::NoAnchor.source(), "none");
+        assert_eq!(AnchorResolution::Cursor(a.clone()).anchor(), Some(&a));
+        assert_eq!(AnchorResolution::OldestStored(a.clone()).anchor(), Some(&a));
+        assert_eq!(AnchorResolution::NoAnchor.anchor(), None);
+    }
+
+    /// Store one message so the chat has a usable anchor (timestamp 10_000 s = 10_000_000 ms).
+    async fn seed_anchor_message(store: &Store, chat_jid: &str) {
+        store
+            .insert_inbound(chat_jid, "sender@s.whatsapp.net", "seed-msg", "text", Some("seed"), 10_000, "pending")
+            .await
+            .unwrap();
+    }
+
+    /// The anchor `seed_anchor_message` makes available.
+    fn seed_anchor() -> Anchor {
+        Anchor { oldest_msg_id: "seed-msg".to_owned(), oldest_msg_from_me: false, oldest_msg_timestamp_ms: 10_000_000 }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_anchor_no_cursor_no_message_is_no_anchor() {
+        let (store, dir) = open_b1_store("resolve-none");
+        let chat = "empty-chat@s.whatsapp.net";
+
+        let none = resolve_anchor(&store, chat, None).await.unwrap();
+        assert_eq!(none, AnchorResolution::NoAnchor);
+
+        // An empty-chat placeholder cursor does not count as an anchor either.
+        store.upsert_backfill_cursor(chat, Some(""), Some(false), None, true, false, None).await.unwrap();
+        let cursor = store.get_backfill_cursor(chat).await.unwrap().unwrap();
+        let still_none = resolve_anchor(&store, chat, Some(&cursor)).await.unwrap();
+        assert_eq!(still_none, AnchorResolution::NoAnchor);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_anchor_falls_back_to_oldest_stored_message() {
+        let (store, dir) = open_b1_store("resolve-oldest");
+        let chat = "oldest-chat@s.whatsapp.net";
+        seed_anchor_message(&store, chat).await;
+        // A newer message must not win over the oldest one.
+        store
+            .insert_inbound(chat, "sender@s.whatsapp.net", "newer-msg", "text", Some("newer"), 20_000, "pending")
+            .await
+            .unwrap();
+
+        // No cursor row.
+        let no_cursor = resolve_anchor(&store, chat, None).await.unwrap();
+        assert_eq!(no_cursor, AnchorResolution::OldestStored(seed_anchor()));
+
+        // A cursor row without a usable anchor (empty id, NULL timestamp).
+        store.upsert_backfill_cursor(chat, Some(""), Some(false), None, true, false, None).await.unwrap();
+        let cursor = store.get_backfill_cursor(chat).await.unwrap().unwrap();
+        let empty_cursor = resolve_anchor(&store, chat, Some(&cursor)).await.unwrap();
+        assert_eq!(empty_cursor, AnchorResolution::OldestStored(seed_anchor()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_anchor_prefers_usable_cursor() {
+        let (store, dir) = open_b1_store("resolve-cursor");
+        let chat = "cursor-chat@s.whatsapp.net";
+        seed_anchor_message(&store, chat).await;
+        store.upsert_backfill_cursor(chat, Some("cursor-msg"), Some(true), Some(5_000), true, false, None).await.unwrap();
+        let cursor = store.get_backfill_cursor(chat).await.unwrap().unwrap();
+
+        let resolved = resolve_anchor(&store, chat, Some(&cursor)).await.unwrap();
+        assert_eq!(
+            resolved,
+            AnchorResolution::Cursor(Anchor {
+                oldest_msg_id: "cursor-msg".to_owned(),
+                oldest_msg_from_me: true,
+                oldest_msg_timestamp_ms: 5_000,
+            })
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- process_job: no usable anchor fails fast, a resolved anchor is what the phone gets ---
+
+    #[tokio::test]
+    async fn test_process_job_no_anchor_fails_fast_without_fetching() {
+        let (store, dir) = open_b1_store("no-anchor");
+        let chat = "no-anchor-chat@s.whatsapp.net";
+        let source = FakeHistorySource::new(vec![FakeResponse::Batch {
+            messages: vec![make_msg("m1", false, 1_000)],
+            more_remain: true,
+            progress: None,
+        }]);
+        let sink = FakeBatchSink::always_ok();
+        let job = enqueue_and_claim(&store, chat, "all", None).await;
+        let cancel = CancellationToken::new();
+
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
+            .await
+            .unwrap();
+
+        match end {
+            JobEnd::Failed(reason) => {
+                assert!(reason.starts_with("no_anchor:"), "reason: {reason}");
+                assert!(reason.contains(NO_ANCHOR_GUIDANCE), "reason repeats the guidance: {reason}");
+            }
+            other => panic!("expected Failed(no_anchor: ...), got {other:?}"),
+        }
+        assert!(source.recorded_calls().is_empty(), "fetch_older must not be called");
+        assert!(sink.recorded_calls().is_empty());
+        assert!(store.get_backfill_cursor(chat).await.unwrap().is_none(), "no cursor is written");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_process_job_empty_cursor_starts_from_oldest_stored_message() {
+        let (store, dir) = open_b1_store("empty-cursor");
+        let chat = "empty-cursor-chat@s.whatsapp.net";
+        // The row an older version left behind for a chat that had no message yet.
+        store.upsert_backfill_cursor(chat, Some(""), Some(false), None, true, false, None).await.unwrap();
+        seed_anchor_message(&store, chat).await;
+        let source = FakeHistorySource::exhausted();
+        let sink = FakeBatchSink::always_ok();
+        let job = enqueue_and_claim(&store, chat, "all", None).await;
+        let cancel = CancellationToken::new();
+
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
+            .await
+            .unwrap();
+
+        assert_eq!(end, JobEnd::Done);
+        let calls = source.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, chat);
+        assert_eq!(calls[0].1, seed_anchor(), "the stored message is the anchor, not an empty one");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_process_job_prefers_usable_cursor_over_oldest_stored_message() {
+        let (store, dir) = open_b1_store("prefer-cursor");
+        let chat = "prefer-cursor-chat@s.whatsapp.net";
+        seed_anchor_message(&store, chat).await;
+        store.upsert_backfill_cursor(chat, Some("cursor-msg"), Some(true), Some(5_000), true, false, None).await.unwrap();
+        let source = FakeHistorySource::exhausted();
+        let sink = FakeBatchSink::always_ok();
+        let job = enqueue_and_claim(&store, chat, "all", None).await;
+        let cancel = CancellationToken::new();
+
+        let end = process_job(&job, &source, &sink, &store, &no_pacer(), 10, 0, &cancel, None)
+            .await
+            .unwrap();
+
+        assert_eq!(end, JobEnd::Done);
+        let calls = source.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            Anchor { oldest_msg_id: "cursor-msg".to_owned(), oldest_msg_from_me: true, oldest_msg_timestamp_ms: 5_000 }
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // =========================================================================
@@ -2683,6 +2959,7 @@ mod tests {
         source.set_ready(false);
 
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "gate-chat@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "gate-chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
@@ -2733,6 +3010,7 @@ mod tests {
         let source = DisconnectOnFetch { inner };
 
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "gate-mid@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "gate-mid@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
@@ -2759,6 +3037,7 @@ mod tests {
         // ready is true by default
 
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "ready-err@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "ready-err@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
@@ -2790,6 +3069,7 @@ mod tests {
         let notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
 
+        seed_anchor_message(&store, "gate-driver@s.whatsapp.net").await;
         // Enqueue a job
         store.enqueue_backfill_job("gate-driver@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await.unwrap();
@@ -2885,6 +3165,7 @@ mod tests {
         let notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
 
+        seed_anchor_message(&store, "deferred-driver@s.whatsapp.net").await;
         // Enqueue a job
         let outcome = store.enqueue_backfill_job("deferred-driver@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await.unwrap();
@@ -2944,6 +3225,7 @@ mod tests {
             },
         ]);
         let sink = FakeBatchSink::always_ok();
+        seed_anchor_message(&store, "sse-chat@s.whatsapp.net").await;
         let job = enqueue_and_claim(&store, "sse-chat@s.whatsapp.net", "all", None).await;
         let cancel = CancellationToken::new();
 
@@ -3044,6 +3326,7 @@ mod tests {
         // Set up an event channel to capture SSE events
         let (tx, mut rx) = crate::bridge_events::new_event_bus();
 
+        seed_anchor_message(&store, "fix1-chat@s.whatsapp.net").await;
         store.enqueue_backfill_job("fix1-chat@s.whatsapp.net", "all", None, 0, 0, 0, None)
             .await.unwrap();
 
