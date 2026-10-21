@@ -54,6 +54,15 @@ Commands:
   mcp-off <profile>             switch it off: comments out WHATSRUST_MCP_PORT, keeps the token line
   mcp-client <profile>          print the URL, a Claude Code config snippet (the token only as
                                 ${WHATSRUST_MCP_TOKEN}, never its value) and how to export the token
+  clear-data <profile> [--all] [--dry-run] [--yes]
+                                empty the profile's message data and keep its pairing, so history
+                                fetches can be retested without deleting whatsapp.db (deleting it
+                                forces a re-pair: new QR code, new linked device). Refuses while the
+                                daemon runs; shows the plan and the exact SQL; asks twice; backs the
+                                DB up first (details below). Options:
+                                  --all      also clear outbound_queue and sent_messages
+                                  --dry-run  show the plan and the SQL, change nothing
+                                  --yes      skip the first question (y/N); not the second one
 
 Ports: the first profile gets REST 9270 / MCP 9271, then 9280/9281, 9290/9291, ... The HTTP MCP
 listener is off until you switch it on (mcp-on, or new --mcp).
@@ -74,6 +83,30 @@ MCP listener (docs/HOWTO.md section 5a): mcp-on sets two active lines in the pro
   start: when the profile's daemon runs (instance lock held, or its tmux session exists) both
   commands add "restart the daemon to apply".
 
+clear-data (docs/HOWTO.md section 3): deletes rows in runs/<profile>/whatsapp.db and nothing else. It
+stops when the DB or sqlite3 is missing, or when the daemon seems to run (instance lock HELD, or its
+tmux session exists; lock state "unknown" because lsof is missing stops it unless --yes is given).
+Then it prints the DB path, the row count of every table it will clear and the exact SQL; --dry-run
+stops there with exit 0. Otherwise it asks (below), backs the DB up, runs the SQL in one transaction
+(sqlite3 -bail, then a WAL checkpoint and VACUUM), and reports the new row counts and how to restore.
+  Cleared  embeddings, media_refs, messages, backfill_jobs, backfill_cursor. The messages_fts search
+           index follows through the delete trigger of messages.
+  --all    also clears outbound_queue and sent_messages. Without sent_messages, messages sent earlier
+           can no longer be edited or revoked.
+  Never    poll_keys (needed to read votes on existing polls), device, identities, sessions, prekeys,
+           signed_prekeys, sender_keys, sender_key_devices, base_keys, device_registry, app_state_keys,
+           app_state_versions, app_state_mutation_macs, lid_pn_mapping, tc_tokens, metadata. They hold
+           the pairing, the encryption state, the app-state sync, the LID map, the DM delivery tokens
+           and the device name.
+  Asks     1. "y/N": only y or yes goes on, anything else aborts (exit 1); --yes skips it.
+           2. "Are you sure?": type the profile name, anything else aborts (exit 1). Only
+           RUN_PROFILE_SKIP_CLEAR_DB_VERIFICATION=true in the environment skips this one; --yes
+           does not. Without a terminal, a question that is not skipped is refused.
+  Backup   whatsapp.db.pre-clear-<UTC YYYYmmdd-HHMMSS>.bak in the profile folder (mode 600), next to
+           the pre-migration backups and not in whatsapp.db.backups/, which the daemon rotates. If the
+           backup fails nothing is deleted. Restore with the daemon stopped: copy the backup over
+           whatsapp.db and delete whatsapp.db-wal and whatsapp.db-shm.
+
 Examples:
   scripts/run-profile.sh new dev                 create runs/dev/ (new dev --mcp: with the MCP listener on)
   scripts/run-profile.sh daemon dev              run in this terminal; Ctrl+C to stop
@@ -85,12 +118,18 @@ Examples:
   scripts/run-profile.sh mcp-on dev              switch dev's HTTP MCP listener on (restart a running daemon)
   scripts/run-profile.sh mcp-client dev          URL, Claude Code config and token export hint for it
   scripts/run-profile.sh mcp-off dev             switch it off again (the token stays)
+  scripts/run-profile.sh clear-data dev          empty dev's message data, keep its pairing; stop the daemon
+                                                 first; add --dry-run to only look
   make new-profile P=dev [SEMANTIC=1] [MCP=1]        same as new (MCP=1 adds --mcp)
   make run-profile P=dev [RELEASE=1] [USE_TMUX=1]    same as daemon (USE_TMUX=1 adds --tmux)
 
 Environment:
   RUN_PROFILE_TMUX_SOCKET=<name>   testing/advanced: every tmux call uses the private server
                                    `tmux -L <name>` instead of the default one
+  RUN_PROFILE_SKIP_CLEAR_DB_VERIFICATION=true
+                                   clear-data: skip the second question ("Are you sure?", type the
+                                   profile name). Only the exact value `true` counts. --yes does not
+                                   skip that question; this variable does not skip the y/N one.
   CARGO_TARGET_DIR                 where cargo builds (default: <repo>/target); daemon, cli and mcp
                                    look for the binary there
   Variables exported in your shell (WHATSRUST_*, WHATSAPP_*, HEALTH_PORT, BACKUP_DIR, RUST_LOG)
@@ -104,7 +143,8 @@ Exit codes:
   0  done
   1  failed: no such profile, the profile already exists, tmux not found (daemon --tmux/--detach,
      attach, list --tmux), tmux session already exists, no built binary, an unusable token or
-     missing openssl (mcp-on, new --mcp), mcp-client while the listener is off, ...
+     missing openssl (mcp-on, new --mcp), mcp-client while the listener is off, clear-data refused
+     (no DB, no sqlite3, daemon running, no terminal for a question) or answered with no, ...
   2  usage error (unknown command or option, missing argument)
   daemon in this terminal exits with the daemon's own exit code; a failed build exits with cargo's.
   cli and mcp exit with whatsrust's exit code.
@@ -1039,6 +1079,178 @@ cmd_pane() {
   run_daemon "$PANE_LOG"
 }
 
+# The tables clear-data empties: message data only (the messages_fts index follows through the delete
+# trigger of messages). --all adds the outbound queue and the sent-message store.
+CLEAR_TABLES=(embeddings media_refs messages backfill_jobs backfill_cursor)
+CLEAR_TABLES_ALL=(outbound_queue sent_messages)
+ANSWER="" # set by ask: the line the user typed
+
+# ask <prompt>: print the prompt on stderr and read one line into ANSWER (empty on end of input).
+ask() {
+  printf '%s' "$1" >&2
+  IFS= read -r ANSWER || {
+    ANSWER=""
+    printf '\n' >&2
+  }
+}
+
+# table_count <db> <table>: the row count (table names come from CLEAR_TABLES*, never from the user).
+# No -readonly: sqlite3 cannot open a WAL-mode database read-only unless its -wal and -shm files
+# exist, which is not the case after a clean daemon stop. A plain open is what the daemon does too.
+table_count() {
+  local n
+  n=$(sqlite3 -bail "$1" "SELECT count(*) FROM $2;") ||
+    die "could not count the rows of $2 in $1 (is it a whatsrust database at schema v8?)"
+  printf '%s\n' "$n"
+}
+
+# print_counts <db> <table>...: one "  <table> <rows>" line per table.
+print_counts() {
+  local db=$1 t n
+  shift
+  for t in "$@"; do
+    n=$(table_count "$db" "$t") || exit 1 # table_count already said why
+    printf '  %-16s %s\n' "$t" "$n"
+  done
+}
+
+# refuse_while_running <profile> <yes 0|1>: stop when the daemon seems to run (lock_state / has_session, as
+# list does); an unknown lock state (no lsof) stops it unless --yes was given.
+refuse_while_running() {
+  local lock sess
+  lock=$(lock_state "$DIR")
+  sess=$(session_name "$1")
+  [ "$lock" != HELD ] ||
+    die "the daemon of '$1' is running (its instance lock is held): stop it first (Ctrl+C in its terminal, or quit in the REPL), then run clear-data again"
+  if have_tmux && has_session "$sess"; then
+    die "the daemon of '$1' seems to run: its tmux session $sess exists (attach with: scripts/run-profile.sh attach $1, stop the daemon, press Enter to close the session), then run clear-data again"
+  fi
+  if [ "$lock" = unknown ] && [ "$2" -ne 1 ]; then
+    die "cannot tell whether the daemon of '$1' runs: lsof is not installed, so the instance lock cannot be checked. Stop the daemon yourself, then run clear-data again with --yes"
+  fi
+}
+
+# confirm_clear <profile> <all 0|1> <yes 0|1>: the two questions before anything is deleted; exit 1 on
+# "no" or when a question cannot be asked. 1. y/N (skipped by --yes). 2. type the profile name (skipped
+# only by RUN_PROFILE_SKIP_CLEAR_DB_VERIFICATION=true in the environment).
+confirm_clear() {
+  local q="Delete these rows?"
+  if [ "$2" -eq 1 ]; then q="Delete these rows (messages sent earlier can then no longer be edited or revoked)?"; fi
+  if [ "$3" -ne 1 ]; then
+    [ -t 0 ] || die "no terminal to ask for confirmation: run clear-data in a terminal, or pass --yes"
+    ask "$q [y/N] "
+    case $ANSWER in
+      y | Y | yes) ;;
+      *)
+        note "aborted, nothing was changed"
+        exit 1
+        ;;
+    esac
+  fi
+  if [ "${RUN_PROFILE_SKIP_CLEAR_DB_VERIFICATION:-}" = true ]; then
+    note "second verification skipped (RUN_PROFILE_SKIP_CLEAR_DB_VERIFICATION=true)"
+    return 0
+  fi
+  [ -t 0 ] || die "no terminal for the second verification: run clear-data in a terminal, or set RUN_PROFILE_SKIP_CLEAR_DB_VERIFICATION=true (exactly that value) in the environment"
+  note "Second verification: this deletes the message history of '$1' from its database."
+  note "A backup is written first; the rows only come back by restoring it."
+  ask "Are you sure? Type the profile name ($1) to continue: "
+  if [ "$ANSWER" != "$1" ]; then
+    note "aborted, nothing was changed"
+    exit 1
+  fi
+}
+
+# print_restore <profile> <db> <backup>: how to put the backup back.
+print_restore() {
+  echo "restore (stop the daemon of '$1' first):"
+  printf '  cp %q %q\n' "$3" "$2"
+  printf '  rm -f %q %q\n' "$2-wal" "$2-shm"
+}
+
+# clear-data: empty the message tables of a profile's whatsapp.db and keep the pairing. See --help.
+cmd_clear_data() {
+  local name="" all=0 dry=0 yes=0 arg
+  for arg in "$@"; do
+    case $arg in
+      --all) all=1 ;;
+      --dry-run) dry=1 ;;
+      --yes) yes=1 ;;
+      -*) usage_err "clear-data: unknown option: $arg" ;;
+      *)
+        [ -z "$name" ] || usage_err "clear-data: unexpected argument: $arg"
+        name=$arg
+        ;;
+    esac
+  done
+  [ -n "$name" ] || usage_err "clear-data: missing <profile>"
+  require_profile "$name"
+  local db="$DIR/whatsapp.db"
+  [ -f "$db" ] || die "profile $name has no database: $db does not exist (nothing to clear)"
+  command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 not found (install: brew install sqlite, or apt install sqlite3)"
+  refuse_while_running "$name" "$yes"
+
+  local tables=("${CLEAR_TABLES[@]}") t sql
+  if [ "$all" -eq 1 ]; then tables+=("${CLEAR_TABLES_ALL[@]}"); fi
+  sql="BEGIN;"
+  for t in "${tables[@]}"; do sql="$sql"$'\n'"DELETE FROM $t;"; done
+  sql="$sql"$'\n'"COMMIT;"$'\n'"PRAGMA wal_checkpoint(TRUNCATE);"$'\n'"VACUUM;"
+
+  echo "clear-data plan for profile '$name'"
+  echo "database: $db"
+  echo
+  echo "rows to delete:"
+  print_counts "$db" "${tables[@]}"
+  echo
+  echo "SQL that will run (one sqlite3 -bail call; the deletes are one transaction):"
+  printf '%s\n' "$sql"
+  echo
+  echo "not touched: every other table (the pairing, the encryption state, the app-state sync, the LID map,"
+  echo "the DM delivery tokens, the device name, and poll_keys, which reads votes on existing polls)"
+  if [ "$all" -eq 1 ]; then
+    echo "WARNING: --all clears sent_messages, so messages sent earlier can no longer be edited or revoked"
+  else
+    echo "kept too: outbound_queue and sent_messages (--all clears them; without sent_messages, messages"
+    echo "sent earlier can no longer be edited or revoked)"
+  fi
+  echo
+  if [ "$dry" -eq 1 ]; then
+    echo "dry run: nothing was changed"
+    return 0
+  fi
+
+  confirm_clear "$name" "$all" "$yes"
+
+  umask 077 # the backup holds the whole database: mode 600
+  local bak
+  bak="$DIR/whatsapp.db.pre-clear-$(date -u +%Y%m%d-%H%M%S).bak"
+  case $bak in
+    *"'"* | *$'\n'*) die "the backup path contains a quote or a newline, which sqlite3's .backup cannot take: $bak" ;;
+  esac
+  [ ! -e "$bak" ] || die "backup file already exists: $bak (wait a second and run again)"
+  if ! sqlite3 -bail "$db" ".backup '$bak'"; then
+    rm -f -- "$bak"
+    die "the backup failed, so nothing was deleted"
+  fi
+  [ -s "$bak" ] || die "the backup file is missing or empty: $bak (nothing was deleted)"
+  note "backup written: $bak"
+
+  # The SQL goes in on stdin, not as an argument: with -bail only stdin stops at the first failing
+  # statement and rolls the open transaction back; a multi-statement argument can run on to COMMIT
+  # after a failed DELETE and leave a partial clear.
+  if ! sqlite3 -bail "$db" <<<"$sql" >/dev/null; then
+    note "sqlite3 stopped on an error (see above); rows are deleted only if it got past COMMIT"
+    print_restore "$name" "$db" "$bak" >&2
+    exit 1
+  fi
+
+  echo "cleared profile '$name'. Rows now:"
+  print_counts "$db" "${tables[@]}"
+  echo
+  echo "backup: $bak"
+  print_restore "$name" "$db" "$bak"
+}
+
 main() {
   local cmd=${1:-}
   case $cmd in
@@ -1085,6 +1297,10 @@ main() {
     mcp-client)
       shift
       cmd_mcp_client "$@"
+      ;;
+    clear-data)
+      shift
+      cmd_clear_data "$@"
       ;;
     -h | --help | help) usage ;;
     '') usage_err "missing command" ;;

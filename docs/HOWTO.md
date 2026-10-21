@@ -232,6 +232,7 @@ scripts/run-profile.sh env dev              # port/bind, whether a token is set,
 scripts/run-profile.sh mcp-on dev           # switch the HTTP MCP listener (§5a) on: port + token go into the .env, the token is never shown
 scripts/run-profile.sh mcp-off dev          # switch it off again (the token line stays)
 scripts/run-profile.sh mcp-client dev       # URL, Claude Code config (token as ${WHATSRUST_MCP_TOKEN}) and how to export the token
+scripts/run-profile.sh clear-data dev       # empty dev's message data and keep its pairing (daemon stopped; shows the SQL, asks twice, backs up first; --dry-run only looks, --all adds the send queue and sent store)
 scripts/run-profile.sh --help               # all commands, options, environment variables, examples, exit codes
 make new-profile P=dev [SEMANTIC=1] [MCP=1]         # same as `new` (MCP=1 adds --mcp)
 make run-profile P=dev [RELEASE=1] [USE_TMUX=1]     # same as `daemon` (USE_TMUX=1 adds --tmux)
@@ -334,9 +335,46 @@ combinable with `SEMANTIC=1`) does the `mcp-on` step while creating the profile.
 - `env <profile>` shows `WHATSRUST_MCP_PORT=<n>` or `<off>` and `WHATSRUST_MCP_TOKEN=<set>` or `<unset>`; `list` shows the
   active port, or `off (<reserved port>)`.
 
-**Demo playbook.** Three short flows with a throwaway profile named `demo`. Paths are shown as `<repo>/...`; the
-port pair is the next free one (`9270/9271` when `demo` is your first profile). The daemon's own lines are
-summarised as `...`; the `run-profile:` lines are the launcher's.
+**Empty a profile's message data (`clear-data`).** `clear-data <profile> [--all] [--dry-run] [--yes]` deletes the message
+rows in `runs/<profile>/whatsapp.db` and keeps the pairing, so you can retest history fetches without deleting the DB.
+Deleting `whatsapp.db` forces a re-pair (a new QR code and a new linked device). It needs `sqlite3` on the PATH.
+
+- **Cleared by default:** `embeddings`, `media_refs`, `messages`, `backfill_jobs`, `backfill_cursor`. The `messages_fts`
+  search index is emptied with `messages` by its delete trigger. **`--all`** also clears `outbound_queue` and
+  `sent_messages`; without `sent_messages`, messages sent earlier can no longer be edited or revoked.
+- **Never cleared:** `poll_keys` (needed to read votes on existing polls), `device`, `identities`, `sessions`, `prekeys`,
+  `signed_prekeys`, `sender_keys`, `sender_key_devices`, `base_keys`, `device_registry`, `app_state_keys`,
+  `app_state_versions`, `app_state_mutation_macs`, `lid_pn_mapping`, `tc_tokens`, `metadata`. They hold the pairing, the
+  encryption state, the app-state sync, the LID map, the DM delivery tokens and the device name.
+- **It refuses while the daemon runs:** the instance lock is held, or the `whatsrust-<profile>` tmux session exists. If
+  `lsof` is missing the lock state is `unknown` and it refuses unless you pass `--yes`.
+- **It shows the plan first:** the DB path, the row count of every table it will clear, and the exact SQL (below).
+  `--dry-run` stops there, exit 0.
+- **It asks twice** (exit 1 on "no"). (1) `y/N`, skipped by `--yes`. (2) "Are you sure?": you type the profile name;
+  anything else aborts. Only the environment variable `RUN_PROFILE_SKIP_CLEAR_DB_VERIFICATION=true` (exactly `true`)
+  skips the second question; `--yes` does not. Without a terminal, a question that is not skipped is refused, so a script
+  needs both: `RUN_PROFILE_SKIP_CLEAR_DB_VERIFICATION=true scripts/run-profile.sh clear-data dev --yes`.
+- **Backup, then delete:** `whatsapp.db.pre-clear-<UTC YYYYmmdd-HHMMSS>.bak` (mode 600) is written next to the
+  `whatsapp.db.pre-migration-*.bak` files, not into `whatsapp.db.backups/` (the daemon rotates that folder). If the backup
+  fails, nothing is deleted. The deletes run in one transaction; an error rolls them back.
+- **The SQL** (default; `--all` adds `DELETE FROM outbound_queue;` and `DELETE FROM sent_messages;` before `COMMIT;`):
+  ```sql
+  BEGIN;
+  DELETE FROM embeddings;
+  DELETE FROM media_refs;
+  DELETE FROM messages;
+  DELETE FROM backfill_jobs;
+  DELETE FROM backfill_cursor;
+  COMMIT;
+  PRAGMA wal_checkpoint(TRUNCATE);
+  VACUUM;
+  ```
+- **Side effect of looking:** like the daemon, `sqlite3` opens the DB in WAL mode, which can leave empty `whatsapp.db-wal` /
+  `whatsapp.db-shm` files behind, even for `--dry-run`. `whatsapp.db` itself is not changed by `--dry-run`.
+
+**Demo playbook.** Four short flows. (a) to (c) use a throwaway profile named `demo`; (d) needs a paired profile, here
+`dev`. Paths are shown as `<repo>/...`; the port pair is the next free one (`9270/9271` when `demo` is your first
+profile). The daemon's own lines are summarised as `...`; the `run-profile:` lines are the launcher's.
 
 *(a) Foreground, in this terminal:*
 
@@ -478,6 +516,82 @@ summarised as `...`; the `run-profile:` lines are the launcher's.
    (plus the restart note when the daemon is running; the change applies at its next start). `scripts/run-profile.sh list`
    then shows `off (9271)`. A later `mcp-on demo` prints `MCP listener enabled on port 9271 (token: kept)`, so the Claude
    Code config keeps working. To remove the server from Claude Code: `claude mcp remove whatsrust-demo`.
+
+*(d) Empty a paired profile's messages and retest history fetches* (needs a paired profile, here `dev`, and `sqlite3`;
+the row counts below are an example):
+
+1. Stop the daemon: **Ctrl+C** in its terminal. For a tmux daemon, `scripts/run-profile.sh attach dev`, Ctrl+C, then Enter
+   to close the session. `clear-data` refuses while the instance lock is held or the session exists.
+2. Look first. `--dry-run` prints the plan and the exact SQL and changes nothing:
+   ```bash
+   scripts/run-profile.sh clear-data dev --dry-run
+   ```
+   ```
+   clear-data plan for profile 'dev'
+   database: <repo>/runs/dev/whatsapp.db
+
+   rows to delete:
+     embeddings       3980
+     media_refs       412
+     messages         4210
+     backfill_jobs    6
+     backfill_cursor  14
+
+   SQL that will run (one sqlite3 -bail call; the deletes are one transaction):
+   BEGIN;
+   DELETE FROM embeddings;
+   DELETE FROM media_refs;
+   DELETE FROM messages;
+   DELETE FROM backfill_jobs;
+   DELETE FROM backfill_cursor;
+   COMMIT;
+   PRAGMA wal_checkpoint(TRUNCATE);
+   VACUUM;
+
+   not touched: every other table (the pairing, the encryption state, the app-state sync, the LID map,
+   the DM delivery tokens, the device name, and poll_keys, which reads votes on existing polls)
+   kept too: outbound_queue and sent_messages (--all clears them; without sent_messages, messages
+   sent earlier can no longer be edited or revoked)
+
+   dry run: nothing was changed
+   ```
+3. Do it. After the plan it asks `y/N`, then makes you type the profile name, writes the backup, runs the SQL and reports:
+   ```bash
+   scripts/run-profile.sh clear-data dev
+   ```
+   ```
+   ...the same plan...
+   Delete these rows? [y/N] y
+   run-profile: Second verification: this deletes the message history of 'dev' from its database.
+   run-profile: A backup is written first; the rows only come back by restoring it.
+   Are you sure? Type the profile name (dev) to continue: dev
+   run-profile: backup written: <repo>/runs/dev/whatsapp.db.pre-clear-20261021-210548.bak
+   cleared profile 'dev'. Rows now:
+     embeddings       0
+     media_refs       0
+     messages         0
+     backfill_jobs    0
+     backfill_cursor  0
+
+   backup: <repo>/runs/dev/whatsapp.db.pre-clear-20261021-210548.bak
+   restore (stop the daemon of 'dev' first):
+     cp <repo>/runs/dev/whatsapp.db.pre-clear-20261021-210548.bak <repo>/runs/dev/whatsapp.db
+     rm -f <repo>/runs/dev/whatsapp.db-wal <repo>/runs/dev/whatsapp.db-shm
+   ```
+4. Start the daemon again: `scripts/run-profile.sh daemon dev`.
+5. Expected result:
+   - The pairing is kept: it connects with the existing credentials and prints **no QR code**; the phone still lists the
+     same linked device.
+   - `scripts/run-profile.sh cli dev history 15551234567 20` returns 0 messages (the local history is empty).
+   - `scripts/run-profile.sh cli dev fetch-history 15551234567 all` fails with HTTP 409 and `"code": "no_anchor"` and queues
+     no job: the cursor and the stored messages that served as the starting point are gone. It works again once a message
+     arrives in that chat (or you send one from the phone), which becomes the new anchor (§4).
+6. Restore, if you want the old data back: stop the daemon, then run the two commands the report printed (copy the backup
+   over `whatsapp.db`, delete `whatsapp.db-wal` and `whatsapp.db-shm`) and start the daemon. The backup is a normal
+   file in `runs/dev/`: delete it when you no longer need it (it holds all messages and the session keys; keep it private).
+
+To script it, set `RUN_PROFILE_SKIP_CLEAR_DB_VERIFICATION=true` and pass `--yes` (there is no terminal to answer the two
+questions): `RUN_PROFILE_SKIP_CLEAR_DB_VERIFICATION=true scripts/run-profile.sh clear-data dev --yes`.
 
 *Clean up.* A throwaway profile that was never paired holds nothing worth keeping: `rm -rf runs/demo`. Never do that
 for a paired profile, because its `whatsapp.db` is a linked WhatsApp device; move it aside instead.
