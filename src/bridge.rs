@@ -3708,13 +3708,15 @@ async fn handle_event(
             debug!(jid = %update.jid, "chat mute state changed");
         }
         Event::ArchiveUpdate(update) => {
-            debug!(jid = %update.jid, "chat archive state changed");
+            let action = if update.action.archived == Some(true) { "archive" } else { "unarchive" };
+            log_message_range(action, &update.jid, update.action.message_range.as_ref(), update.from_full_sync);
         }
         Event::StarUpdate(_) => {
             debug!("message star state changed");
         }
         Event::MarkChatAsReadUpdate(update) => {
-            debug!(jid = %update.jid, "chat marked as read/unread");
+            let action = if update.action.read == Some(true) { "mark_read" } else { "mark_unread" };
+            log_message_range(action, &update.jid, update.action.message_range.as_ref(), update.from_full_sync);
         }
         Event::HistorySync(lazy) => {
             // Copy the session-id to an owned String before moving `lazy` into fulfill,
@@ -3762,6 +3764,31 @@ async fn handle_event(
             debug!(?event, "unhandled event");
         }
     }
+}
+
+/// Log what an archive or read-state sync says about the chat's last messages.
+/// The phone fills `messageRange` with the chat's last message key (seen 2026-10-21 on an
+/// archive/unarchive), so such a key can anchor a history fetch for a chat that has no
+/// stored message. Logs counts and timestamps only, never message ids or text.
+fn log_message_range(
+    action: &str,
+    jid: &Jid,
+    range: Option<&wa::sync_action_value::SyncActionMessageRange>,
+    from_full_sync: bool,
+) {
+    let messages = range.map_or(&[][..], |r| r.messages.as_slice());
+    let keys_with_id = messages.iter().filter(|m| m.key.as_ref().is_some_and(|k| k.id.is_some())).count();
+    debug!(
+        %jid,
+        action,
+        from_full_sync,
+        has_range = range.is_some(),
+        messages = messages.len(),
+        keys_with_id,
+        last_message_ts = range.and_then(|r| r.last_message_timestamp),
+        newest_key_ts = messages.iter().filter_map(|m| m.timestamp).max(),
+        "chat state synced",
+    );
 }
 
 // ---------------------------------------------------------------------------
