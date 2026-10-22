@@ -466,17 +466,28 @@ impl InboundContent {
 
     /// Extract a human-readable summary for display.
     pub fn display_text(&self) -> String {
+        self.display_text_with_media_len(None)
+    }
+
+    /// [`display_text`](Self::display_text), showing `media_len` as the size of a media variant
+    /// instead of the length of its bytes. A history row carries no bytes (nothing is downloaded,
+    /// ADR 0048), so its label takes the size from the proto's `file_length`: the length of the
+    /// decrypted file, which is what a download would have measured.
+    pub(crate) fn display_text_with_media_len(&self, media_len: Option<u64>) -> String {
+        let size_of = |data: &Arc<[u8]>| {
+            format_size(media_len.map_or(data.len(), |n| usize::try_from(n).unwrap_or(usize::MAX)))
+        };
         match self {
             Self::Text { body, .. } => body.clone(),
             Self::Image { caption, data, .. } => {
-                let size = format_size(data.len());
+                let size = size_of(data);
                 match caption {
                     Some(c) => format!("[image {size}] {c}"),
                     None => format!("[image {size}]"),
                 }
             }
             Self::Audio { data, seconds, is_voice, .. } => {
-                let size = format_size(data.len());
+                let size = size_of(data);
                 let kind = if *is_voice { "voice" } else { "audio" };
                 match seconds {
                     Some(s) => format!("[{kind} {s}s {size}]"),
@@ -484,21 +495,21 @@ impl InboundContent {
                 }
             }
             Self::Video { caption, data, .. } => {
-                let size = format_size(data.len());
+                let size = size_of(data);
                 match caption {
                     Some(c) => format!("[video {size}] {c}"),
                     None => format!("[video {size}]"),
                 }
             }
             Self::Document { filename, data, caption, .. } => {
-                let size = format_size(data.len());
+                let size = size_of(data);
                 match caption {
                     Some(c) => format!("[doc: {filename} {size}] {c}"),
                     None => format!("[doc: {filename} {size}]"),
                 }
             }
             Self::Sticker { is_animated, data, .. } => {
-                let size = format_size(data.len());
+                let size = size_of(data);
                 if *is_animated {
                     format!("[animated sticker {size}]")
                 } else {
@@ -770,6 +781,13 @@ pub struct BridgeConfig {
     /// client" rationale for skipping is obsolete on current wa-rs (history is
     /// processed on a dedicated worker, off the live path). See ADR 0037.
     pub skip_history_sync: bool,
+    /// Store the messages of the history package the phone sends when the device is linked
+    /// (`messages.source = "bootstrap"`), so those chats have an anchor for `fetch-history`.
+    /// Default true. When false, such chunks are ignored; a late answer to an on-demand fetch
+    /// is stored either way. Has no effect when `skip_history_sync` is true (nothing arrives).
+    /// Only pairing delivers the package, so an already-paired profile gets nothing from it.
+    /// See ADR 0048.
+    pub store_pairing_history: bool,
     /// Automatically send read receipts for inbound messages after enqueue.
     pub auto_mark_read: bool,
     /// If non-empty, only process inbound messages from these phone numbers (digits only).
@@ -871,6 +889,7 @@ impl Default for BridgeConfig {
             pair_phone: None,
             max_reconnect_delay: Duration::from_secs(60),
             skip_history_sync: false, // history sync ON by default (needed for 1:1 DM tctokens); see ADR 0037
+            store_pairing_history: true, // keep the pairing package's messages (fetch anchors); see ADR 0048
             auto_mark_read: true,
             allowed_numbers: Vec::new(),
             min_send_interval_ms: 400,
@@ -2720,11 +2739,7 @@ async fn run_bridge(
             correlator.clone(),
             store.clone(),
         ));
-        let bf_sink = Arc::new(LiveBatchSink::new(
-            client_handle.clone(),
-            store.clone(),
-            embed_notify.clone(),
-        ));
+        let bf_sink = Arc::new(LiveBatchSink::new(store.clone(), embed_notify.clone()));
         let bf_store = store.clone();
         let bf_notify = backfill_notify.clone();
         let bf_cancel = cancel.clone();
@@ -2951,6 +2966,7 @@ async fn run_bot_session(
     let event_tx_for_events = event_tx.clone();
     let gc_for_events = group_cache.clone();
     let correlator_for_events = correlator.clone();
+    let store_pairing_history = config.store_pairing_history;
     // Track previous QR terminal height for in-place overwrite on refresh
     let prev_qr_lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -2984,7 +3000,7 @@ async fn run_bot_session(
             let corr = correlator_for_events.clone();
             async move {
                 let event_owned = (*event).clone();
-                handle_event(event_owned, client, &ch, &itx, &stx, &qtx, &store, &sr, &srr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &emb_notify, &etx, &gc, &corr)
+                handle_event(event_owned, client, &ch, &itx, &stx, &qtx, &store, &sr, &srr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &emb_notify, &etx, &gc, &corr, store_pairing_history)
                     .await;
             }
         });
@@ -3152,6 +3168,7 @@ async fn handle_event(
     event_tx: &tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
     group_cache: &GroupCacheHandle,
     correlator: &Arc<crate::backfill::HistoryCorrelator>,
+    store_pairing_history: bool,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -3724,15 +3741,26 @@ async fn handle_event(
             // Copy the session-id to an owned String before moving `lazy` into fulfill,
             // to satisfy borrow checker (peer_data_request_session_id borrows lazy).
             let sid_owned: Option<String> = lazy.peer_data_request_session_id().map(|s| s.to_owned());
-            match sid_owned {
-                Some(sid) if correlator.fulfill(&sid, lazy) => {
-                    debug!("on-demand history sync routed to backfill worker");
+            let unmatched = match sid_owned {
+                Some(sid) => {
+                    // `fulfill` consumes the chunk and drops it when nobody is waiting any more
+                    // (the 180 s wait is over), so keep a spare for that late answer. A clone
+                    // shares the compressed payload and carries no decode cache: cheap.
+                    let spare = lazy.clone();
+                    if correlator.fulfill(&sid, lazy) {
+                        debug!("on-demand history sync routed to backfill worker");
+                        None
+                    } else {
+                        Some(spare)
+                    }
                 }
-                _ => {
-                    // Unmatched: pairing-bootstrap history sync (ADR-0037) has no session-id.
-                    // MUST remain a no-op — do not break pairing.
-                    debug!("history sync chunk received (unsolicited bootstrap — ignored)");
-                }
+                None => Some(lazy),
+            };
+            // Unmatched: the package the phone sends at pairing (ADR 0037, no session-id), or a
+            // late on-demand answer. Stored best-effort in a spawned task; never fails the event
+            // (ADR 0048).
+            if let Some(chunk) = unmatched {
+                spawn_store_unmatched_history(chunk, store, embed_notify, store_pairing_history);
             }
         }
         Event::OfflineSyncPreview(_) => {
@@ -3993,7 +4021,102 @@ fn extract_context_meta(msg: &wa::Message) -> ContextMeta {
 /// Maximum recursion depth for unwrapping ephemeral/view-once wrappers.
 const MAX_EXTRACT_DEPTH: u8 = 3;
 
-/// Try to extract structured content from an inbound message.
+/// What `extract_content_inner` does with a media message's bytes.
+enum MediaMode<'a> {
+    /// Live ingest: download the bytes (one slot of `dl_semaphore` at a time, size-limited); the
+    /// content carries them, because they feed the inbound event.
+    Download { client: &'a Arc<Client>, dl_semaphore: &'a Semaphore },
+    /// Stored history (ADR 0048): download nothing. The content carries no bytes, and the media
+    /// message's reference is kept in `media_ref` for the caller to store (`media_refs`, ADR 0005).
+    Reference { media_ref: Option<crate::storage::MediaRefRow> },
+}
+
+/// Why a media message gave no content (the two non-content `ExtractResult`s).
+enum MediaSkip {
+    /// Over `MAX_MEDIA_BYTES`: nothing to retry.
+    TooLarge,
+    /// The download failed: may succeed on a redelivery.
+    DownloadFailed,
+}
+
+impl From<MediaSkip> for ExtractResult {
+    fn from(skip: MediaSkip) -> Self {
+        match skip {
+            MediaSkip::TooLarge => ExtractResult::Unhandled,
+            MediaSkip::DownloadFailed => ExtractResult::TransientFailure,
+        }
+    }
+}
+
+impl MediaMode<'_> {
+    /// A mode for stored history: no download, the reference is recorded.
+    fn reference() -> MediaMode<'static> {
+        MediaMode::Reference { media_ref: None }
+    }
+
+    /// The reference `Reference` mode recorded for the media message it extracted, if any.
+    fn into_media_ref(self) -> Option<crate::storage::MediaRefRow> {
+        match self {
+            Self::Reference { media_ref } => media_ref,
+            Self::Download { .. } => None,
+        }
+    }
+
+    /// The bytes of one media message, per mode. `what` names the media type in logs; `mime`,
+    /// `width` and `height` are what the content will carry (kept in the reference).
+    ///
+    /// `Download`: refuse a file over `MAX_MEDIA_BYTES` (by its `file_length`, before downloading,
+    /// and by its size after), then download it. `Reference`: record the reference and return no
+    /// bytes. There is no size limit, because nothing is downloaded: the row only describes the
+    /// file.
+    async fn bytes(
+        &mut self,
+        what: &str,
+        media: &dyn Downloadable,
+        mime: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Result<Arc<[u8]>, MediaSkip> {
+        match self {
+            Self::Download { client, dl_semaphore } => {
+                if let Some(len) = media.file_length() {
+                    if len > MAX_MEDIA_BYTES {
+                        warn!(size = len, "{what} exceeds size limit, skipping");
+                        return Err(MediaSkip::TooLarge);
+                    }
+                }
+                let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
+                match client.download(media).await {
+                    Ok(data) => {
+                        if data.len() as u64 > MAX_MEDIA_BYTES {
+                            warn!(size = data.len(), "downloaded {what} exceeds size limit");
+                            return Err(MediaSkip::TooLarge);
+                        }
+                        Ok(data.into())
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to download {what}");
+                        Err(MediaSkip::DownloadFailed)
+                    }
+                }
+            }
+            Self::Reference { media_ref } => {
+                *media_ref = Some(crate::storage::MediaRefRow {
+                    media_key: media.media_key().map(<[u8]>::to_vec),
+                    direct_path: media.direct_path().map(str::to_owned),
+                    file_enc_sha256: media.file_enc_sha256().map(<[u8]>::to_vec),
+                    mimetype: Some(mime.to_owned()),
+                    file_length: media.file_length().and_then(|n| i64::try_from(n).ok()),
+                    width: width.map(i64::from),
+                    height: height.map(i64::from),
+                });
+                Ok(Arc::from(Vec::<u8>::new()))
+            }
+        }
+    }
+}
+
+/// Try to extract structured content from an inbound message (live ingest: media is downloaded).
 async fn extract_content(
     msg: &wa::Message,
     client: &Arc<Client>,
@@ -4001,14 +4124,15 @@ async fn extract_content(
     store: &Store,
     sender_jid: Option<&str>,
 ) -> ExtractResult {
-    extract_content_inner(msg, client, dl_semaphore, 0, store, sender_jid).await
+    let mut media = MediaMode::Download { client, dl_semaphore };
+    extract_content_inner(msg, &mut media, 0, store, sender_jid).await
 }
 
-/// Inner recursive extractor with depth limit.
+/// Inner recursive extractor with depth limit. `media` decides what happens to a media message's
+/// bytes (`MediaMode`): live ingest downloads them, stored history only records the reference.
 async fn extract_content_inner(
     msg: &wa::Message,
-    client: &Arc<Client>,
-    dl_semaphore: &Semaphore,
+    media: &mut MediaMode<'_>,
     depth: u8,
     store: &Store,
     sender_jid: Option<&str>,
@@ -4022,138 +4146,78 @@ async fn extract_content_inner(
 
     // --- Image ---
     if let Some(ref img) = msg.image_message {
-        if let Some(len) = img.file_length {
-            if len > MAX_MEDIA_BYTES { warn!(size = len, "image exceeds size limit, skipping"); return ExtractResult::Unhandled; }
-        }
         let caption = img.caption.clone();
         let mime = img.mimetype.clone().unwrap_or_else(|| "image/jpeg".to_string());
         let width = img.width;
         let height = img.height;
-        let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
-        match client.download(img.as_ref() as &dyn Downloadable).await {
-            Ok(data) => {
-                if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded image exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Image { data: data.into(), mime, caption, width, height });
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to download image");
-                return ExtractResult::TransientFailure;
-            }
-        }
+        return match media.bytes("image", img.as_ref() as &dyn Downloadable, &mime, width, height).await {
+            Ok(data) => ExtractResult::Content(InboundContent::Image { data, mime, caption, width, height }),
+            Err(skip) => skip.into(),
+        };
     }
 
     // --- Video (includes PTV/video notes) ---
     if let Some(vid) = msg.video_message.as_deref().or(msg.ptv_message.as_deref()) {
-        if let Some(len) = vid.file_length {
-            if len > MAX_MEDIA_BYTES { warn!(size = len, "video exceeds size limit, skipping"); return ExtractResult::Unhandled; }
-        }
         let caption = vid.caption.clone();
         let mime = vid.mimetype.clone().unwrap_or_else(|| "video/mp4".to_string());
         let seconds = vid.seconds;
         let width = vid.width;
         let height = vid.height;
         let is_gif = vid.gif_playback.unwrap_or(false);
-        let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
-        match client.download(vid as &dyn Downloadable).await {
-            Ok(data) => {
-                if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded video exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Video { data: data.into(), mime, caption, seconds, width, height, is_gif });
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to download video");
-                return ExtractResult::TransientFailure;
-            }
-        }
+        return match media.bytes("video", vid as &dyn Downloadable, &mime, width, height).await {
+            Ok(data) => ExtractResult::Content(InboundContent::Video { data, mime, caption, seconds, width, height, is_gif }),
+            Err(skip) => skip.into(),
+        };
     }
 
     // --- Audio ---
     if let Some(ref aud) = msg.audio_message {
-        if let Some(len) = aud.file_length {
-            if len > MAX_MEDIA_BYTES { warn!(size = len, "audio exceeds size limit, skipping"); return ExtractResult::Unhandled; }
-        }
         let mime = aud.mimetype.clone().unwrap_or_else(|| "audio/ogg".to_string());
         let seconds = aud.seconds;
         let is_voice = aud.ptt.unwrap_or(false);
-        let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
-        match client.download(aud.as_ref() as &dyn Downloadable).await {
-            Ok(data) => {
-                if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded audio exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Audio { data: data.into(), mime, seconds, is_voice });
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to download audio");
-                return ExtractResult::TransientFailure;
-            }
-        }
+        return match media.bytes("audio", aud.as_ref() as &dyn Downloadable, &mime, None, None).await {
+            Ok(data) => ExtractResult::Content(InboundContent::Audio { data, mime, seconds, is_voice }),
+            Err(skip) => skip.into(),
+        };
     }
 
     // --- Document ---
     if let Some(ref doc) = msg.document_message {
-        if let Some(len) = doc.file_length {
-            if len > MAX_MEDIA_BYTES { warn!(size = len, "document exceeds size limit, skipping"); return ExtractResult::Unhandled; }
-        }
         let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
         let filename = doc.file_name.clone().unwrap_or_else(|| "file".to_string());
         let caption = doc.caption.clone();
         let page_count = doc.page_count;
-        let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
-        match client.download(doc.as_ref() as &dyn Downloadable).await {
-            Ok(data) => {
-                if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded document exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Document { data: data.into(), mime, filename, caption, page_count });
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to download document");
-                return ExtractResult::TransientFailure;
-            }
-        }
+        return match media.bytes("document", doc.as_ref() as &dyn Downloadable, &mime, None, None).await {
+            Ok(data) => ExtractResult::Content(InboundContent::Document { data, mime, filename, caption, page_count }),
+            Err(skip) => skip.into(),
+        };
     }
 
     // --- Document with caption (wrapper) ---
     if let Some(ref dwc) = msg.document_with_caption_message {
         if let Some(ref inner) = dwc.message {
             if let Some(ref doc) = inner.document_message {
-                if let Some(len) = doc.file_length {
-                    if len > MAX_MEDIA_BYTES { warn!(size = len, "document exceeds size limit, skipping"); return ExtractResult::Unhandled; }
-                }
                 let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
                 let filename = doc.file_name.clone().unwrap_or_else(|| "file".to_string());
                 let caption = doc.caption.clone();
                 let page_count = doc.page_count;
-                let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
-                match client.download(doc.as_ref() as &dyn Downloadable).await {
-                    Ok(data) => {
-                        if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded document exceeds size limit"); return ExtractResult::Unhandled; }
-                        return ExtractResult::Content(InboundContent::Document { data: data.into(), mime, filename, caption, page_count });
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "failed to download document (with caption)");
-                        return ExtractResult::TransientFailure;
-                    }
-                }
+                return match media.bytes("document", doc.as_ref() as &dyn Downloadable, &mime, None, None).await {
+                    Ok(data) => ExtractResult::Content(InboundContent::Document { data, mime, filename, caption, page_count }),
+                    Err(skip) => skip.into(),
+                };
             }
         }
     }
 
     // --- Sticker ---
     if let Some(ref stk) = msg.sticker_message {
-        if let Some(len) = stk.file_length {
-            if len > MAX_MEDIA_BYTES { warn!(size = len, "sticker exceeds size limit, skipping"); return ExtractResult::Unhandled; }
-        }
         let mime = stk.mimetype.clone().unwrap_or_else(|| "image/webp".to_string());
         let is_animated = stk.is_animated.unwrap_or(false);
         let sticker_emoji = stk.accessibility_label.clone();
-        let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
-        match client.download(stk.as_ref() as &dyn Downloadable).await {
-            Ok(data) => {
-                if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded sticker exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Sticker { data: data.into(), mime, is_animated, sticker_emoji });
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to download sticker");
-                return ExtractResult::TransientFailure;
-            }
-        }
+        return match media.bytes("sticker", stk.as_ref() as &dyn Downloadable, &mime, stk.width, stk.height).await {
+            Ok(data) => ExtractResult::Content(InboundContent::Sticker { data, mime, is_animated, sticker_emoji }),
+            Err(skip) => skip.into(),
+        };
     }
 
     // --- Location ---
@@ -4403,24 +4467,24 @@ async fn extract_content_inner(
     // --- Ephemeral wrapper (unwrap and recurse) ---
     if let Some(ref eph) = msg.ephemeral_message {
         if let Some(ref inner) = eph.message {
-            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store, sender_jid)).await;
+            return Box::pin(extract_content_inner(inner, media, depth + 1, store, sender_jid)).await;
         }
     }
 
     // --- View-once wrapper (unwrap and recurse) ---
     if let Some(ref vo) = msg.view_once_message {
         if let Some(ref inner) = vo.message {
-            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store, sender_jid)).await;
+            return Box::pin(extract_content_inner(inner, media, depth + 1, store, sender_jid)).await;
         }
     }
     if let Some(ref vo2) = msg.view_once_message_v2 {
         if let Some(ref inner) = vo2.message {
-            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store, sender_jid)).await;
+            return Box::pin(extract_content_inner(inner, media, depth + 1, store, sender_jid)).await;
         }
     }
     if let Some(ref vo2_ext) = msg.view_once_message_v2_extension {
         if let Some(ref inner) = vo2_ext.message {
-            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store, sender_jid)).await;
+            return Box::pin(extract_content_inner(inner, media, depth + 1, store, sender_jid)).await;
         }
     }
 
@@ -5040,30 +5104,159 @@ impl crate::backfill::HistorySource for LiveHistorySource {
 }
 
 // ---------------------------------------------------------------------------
+// History storage — the backfill sink and unmatched history-sync chunks share it
+// ---------------------------------------------------------------------------
+
+/// `messages.source` of a message stored from an on-demand fetch, or from a late answer to one.
+const SOURCE_BACKFILL: &str = "backfill";
+/// `messages.source` of a message stored from the history package the phone sends at pairing
+/// (ADR 0048).
+const SOURCE_BOOTSTRAP: &str = "bootstrap";
+
+/// What storing a run of history messages did. Every message lands in exactly one of the first
+/// four fields.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PersistCounts {
+    /// New rows written.
+    stored: usize,
+    /// Already stored (live, an earlier chunk or a fetch): the existing row is kept.
+    duplicates: usize,
+    /// Nothing to store: no payload or key, or content the extractor does not handle.
+    unstorable: usize,
+    /// The insert itself failed (a database error).
+    failed: usize,
+    /// `media_refs` rows written, for new media messages (ADR 0005).
+    media_refs: usize,
+    /// Media references that could not be written (the message row itself was stored).
+    media_refs_failed: usize,
+}
+
+impl PersistCounts {
+    fn add(&mut self, other: PersistCounts) {
+        self.stored += other.stored;
+        self.duplicates += other.duplicates;
+        self.unstorable += other.unstorable;
+        self.failed += other.failed;
+        self.media_refs += other.media_refs;
+        self.media_refs_failed += other.media_refs_failed;
+    }
+}
+
+/// Store `messages` as rows of `chat_jid`: extract the content (the single extraction path,
+/// ADR 0014) without downloading any media, classify `embed_status` like live ingest,
+/// `INSERT OR IGNORE` by message id, write the `media_refs` row of a new media message, and wake
+/// the embedding-drain worker for each new row left 'pending' (M2.3.2). Used by the backfill sink
+/// (`source` = backfill) and for unmatched history-sync chunks. Never fails: a message that
+/// cannot be stored is counted, not raised.
+///
+/// `dm_alt` is the phone JID of a `@lid` direct chat (the conversation's `pnJid`): it resolves
+/// the sender of a DM message like the chat itself, as live messages use `sender_alt`.
+async fn persist_history_messages(
+    store: &Store,
+    embed_notify: &tokio::sync::Notify,
+    chat_jid: &str,
+    dm_alt: Option<&Jid>,
+    messages: &[wa::WebMessageInfo],
+    source: &str,
+) -> PersistCounts {
+    let mut counts = PersistCounts::default();
+
+    for web in messages {
+        // Skip messages with no payload
+        let Some(msg) = web.message.as_deref() else {
+            counts.unstorable += 1;
+            continue;
+        };
+
+        // Use the requested chat_jid (phone JID) rather than web.key.remote_jid (may be LID).
+        // This ensures stored rows unify with the live timeline under the phone JID.
+        let Some(msg_id) = web.key.id.as_deref() else {
+            counts.unstorable += 1;
+            continue;
+        };
+        let from_me = web.key.from_me.unwrap_or(false);
+        // messageTimestamp is Unix seconds in the proto
+        let ts_secs = web.message_timestamp.unwrap_or(0) as i64;
+
+        // For group messages the real sender is in `participant`; for DMs it's the remote JID.
+        // Resolve @lid → @s.whatsapp.net so the stored sender matches the live path.
+        let (sender_raw, sender_alt) = match web.key.participant.as_deref() {
+            Some(participant) => (participant, None),
+            None => (web.key.remote_jid.as_deref().unwrap_or(""), dm_alt),
+        };
+        let sender_resolved = resolve_chat_jid(sender_raw, sender_alt, store).await;
+        let sender_jid = sender_resolved.as_str();
+
+        // No download: a history row keeps the media's label and reference, not its bytes
+        // (ADR 0048; the reference is what a later on-demand download starts from, ADR 0005).
+        let mut media = MediaMode::reference();
+        match extract_content_inner(msg, &mut media, 0, store, Some(sender_jid)).await {
+            ExtractResult::Content(c) => {
+                let media_ref = media.into_media_ref();
+                // The label shows the size the proto gives (`file_length`), as a download would
+                // have measured it.
+                let media_len = media_ref.as_ref().and_then(|m| u64::try_from(m.file_length?).ok());
+                let body_str = c.display_text_with_media_len(media_len);
+                let body_opt = if body_str.is_empty() { None } else { Some(body_str.as_str()) };
+                // M2.2.2/2.2.3: same write-time classification as the live-ingest call site
+                // (bridge.rs, ExtractResult::Content branch above) — see that comment for the
+                // Option C / backlog-tolerance rationale (ADR 0016/0038). Stored history rows get
+                // exactly the same classification discipline as live-ingested ones.
+                let embed_status = c.embed_status();
+                match store
+                    .insert_message_if_new(
+                        chat_jid, sender_jid, msg_id, c.kind(), body_opt, ts_secs, from_me, source, embed_status,
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        counts.stored += 1;
+                        // M2.3.2: fire embed_notify when a stored row lands 'pending'.
+                        if embed_status == "pending" {
+                            embed_notify.notify_one();
+                        }
+                        if let Some(media_ref) = media_ref {
+                            match store.insert_media_ref(msg_id, &media_ref).await {
+                                Ok(_) => counts.media_refs += 1,
+                                Err(e) => {
+                                    counts.media_refs_failed += 1;
+                                    debug!(error = %e, "history persist: insert_media_ref failed");
+                                }
+                            }
+                        }
+                    }
+                    Ok(false) => counts.duplicates += 1,
+                    Err(e) => {
+                        counts.failed += 1;
+                        debug!(error = %e, "history persist: insert_message failed");
+                    }
+                }
+            }
+            // Unhandled — skip; not an error for the batch
+            _ => counts.unstorable += 1,
+        }
+    }
+
+    counts
+}
+
+// ---------------------------------------------------------------------------
 // LiveBatchSink — persist backfill batch via extract_content_inner (Wave B2b)
 // ---------------------------------------------------------------------------
 
 /// Real `BatchSink` impl: extracts content from `WebMessageInfo` via
 /// `extract_content_inner` (the single extraction path, ADR 0014) and persists
-/// via `Store::insert_message`. Media stays lazy (ADR 0005).
+/// via `Store::insert_message_if_new`. Media is not downloaded: a row keeps the media's label
+/// and its `media_refs` reference (ADR 0005, ADR 0048).
 pub(crate) struct LiveBatchSink {
-    client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
     store: Store,
-    /// Small semaphore for the extract pipeline's download slot parameter.
-    /// Backfill uses a separate, tighter limit from the live-ingest semaphore.
-    dl_semaphore: Semaphore,
     /// Wakes the embedding-drain worker when a backfilled row lands 'pending' (M2.3.2).
     embed_notify: Arc<tokio::sync::Notify>,
 }
 
 impl LiveBatchSink {
-    pub fn new(
-        client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
-        store: Store,
-        embed_notify: Arc<tokio::sync::Notify>,
-    ) -> Self {
-        // Backfill: 2 concurrent download slots (smaller than live's MAX_CONCURRENT_DOWNLOADS=4)
-        Self { client_handle, store, dl_semaphore: Semaphore::new(2), embed_notify }
+    pub fn new(store: Store, embed_notify: Arc<tokio::sync::Notify>) -> Self {
+        Self { store, embed_notify }
     }
 }
 
@@ -5074,94 +5267,162 @@ impl crate::backfill::BatchSink for LiveBatchSink {
         chat_jid: &str,
         batch: &crate::backfill::HistoryBatch,
     ) -> anyhow::Result<usize> {
-        let client = get_client_handle(&self.client_handle)
-            .ok_or_else(|| anyhow::anyhow!("LiveBatchSink: no active client"))?;
-
-        let mut inserted = 0usize;
-
-        for web in &batch.messages {
-            // Skip messages with no payload
-            let msg = match web.message.as_deref() {
-                Some(m) => m,
-                None => continue,
-            };
-
-            // Use the requested chat_jid (phone JID) rather than web.key.remote_jid (may be LID).
-            // This ensures backfilled rows unify with the live timeline under the phone JID.
-            let msg_id = match web.key.id.as_deref() {
-                Some(id) => id,
-                None => continue,
-            };
-            let from_me = web.key.from_me.unwrap_or(false);
-            // messageTimestamp is Unix seconds in the proto
-            let ts_secs = web.message_timestamp.unwrap_or(0) as i64;
-
-            // For group messages the real sender is in `participant`; for DMs it's the remote JID.
-            // Resolve @lid → @s.whatsapp.net so the stored sender matches the live path.
-            let sender_raw = web.key.participant.as_deref()
-                .unwrap_or_else(|| web.key.remote_jid.as_deref().unwrap_or(""));
-            let sender_resolved = resolve_chat_jid(sender_raw, None, &self.store).await;
-            let sender_jid = sender_resolved.as_str();
-
-            // Do NOT emit inbound events / mark-read / store poll keys (live-only).
-            // Media stays lazy (ADR 0005) — extract_content_inner handles download if needed.
-            let result = extract_content_inner(
-                msg,
-                &client,
-                &self.dl_semaphore,
-                0,
-                &self.store,
-                Some(sender_jid),
-            )
-            .await;
-
-            match result {
-                ExtractResult::Content(c) => {
-                    let body_str = c.display_text();
-                    let body_opt = if body_str.is_empty() { None } else { Some(body_str.as_str()) };
-                    // M2.2.2/2.2.3: same write-time classification as the live-ingest call site
-                    // (bridge.rs, ExtractResult::Content branch above) — see that comment for the
-                    // Option C / backlog-tolerance rationale (ADR 0016/0038). Backfilled rows get
-                    // exactly the same classification discipline as live-ingested ones.
-                    let embed_status = c.embed_status();
-                    match self
-                        .store
-                        .insert_message(
-                            chat_jid,
-                            sender_jid,
-                            msg_id,
-                            c.kind(),
-                            body_opt,
-                            ts_secs,
-                            from_me,
-                            "backfill",
-                            embed_status,
-                        )
-                        .await
-                    {
-                        Ok(()) => {
-                            inserted += 1;
-                            // M2.3.2: fire embed_notify when a backfilled row lands 'pending'.
-                            if embed_status == "pending" {
-                                self.embed_notify.notify_one();
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                msg_id,
-                                error = %e,
-                                "backfill sink: insert_message failed (may be duplicate)"
-                            );
-                        }
-                    }
-                }
-                // Unhandled or TransientFailure — skip; not an error for the batch
-                _ => {}
-            }
-        }
-
-        Ok(inserted)
+        let counts = persist_history_messages(
+            &self.store,
+            &self.embed_notify,
+            chat_jid,
+            None,
+            &batch.messages,
+            SOURCE_BACKFILL,
+        )
+        .await;
+        // The count this sink always returned: messages the store accepted, a duplicate included
+        // (only a trace log reads it).
+        Ok(counts.stored + counts.duplicates)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Unmatched history-sync chunks — the pairing package and late on-demand answers (ADR 0048)
+// ---------------------------------------------------------------------------
+
+/// `messages.source` for a history-sync chunk no pending fetch claimed, or `None` to ignore it.
+///
+/// - An on-demand answer (`ON_DEMAND`) whose request has timed out is stored as `backfill`,
+///   whatever the flag says: the owner asked for it.
+/// - Anything else is the package the phone pushes at pairing: stored as `bootstrap`, unless
+///   `WHATSRUST_STORE_PAIRING_HISTORY=false` (`store_pairing_history`).
+///
+/// A chunk whose conversations turn out to be empty (push names, status) stores nothing either way.
+fn unmatched_history_source(sync_type: i32, store_pairing_history: bool) -> Option<&'static str> {
+    if sync_type == wa::message::HistorySyncType::OnDemand as i32 {
+        Some(SOURCE_BACKFILL)
+    } else if store_pairing_history {
+        Some(SOURCE_BOOTSTRAP)
+    } else {
+        None
+    }
+}
+
+/// The proto name of a history-sync type (`INITIAL_BOOTSTRAP`, `RECENT`, ...), for logs.
+fn history_sync_type_name(sync_type: i32) -> &'static str {
+    wa::message::HistorySyncType::try_from(sync_type).map_or("UNKNOWN", |t| t.as_str_name())
+}
+
+/// What storing the batches of one chunk did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ChunkStored {
+    /// Conversations that had messages to store.
+    conversations: usize,
+    counts: PersistCounts,
+}
+
+/// Store each conversation's batch as rows of its chat. The chat is keyed like live inbound
+/// messages (`resolve_chat_jid`): a `@lid` DM becomes the phone JID when the conversation's
+/// `pnJid` gives it (used first, as live messages use `sender_alt`) or `lid_pn_mapping` knows it;
+/// a group or phone JID passes through; an unmapped `@lid` without a `pnJid` stays as it is.
+async fn store_history_batches(
+    store: &Store,
+    embed_notify: &tokio::sync::Notify,
+    conversations: &[crate::backfill::ConversationBatch],
+    source: &str,
+) -> ChunkStored {
+    let mut stored = ChunkStored::default();
+    for conv in conversations {
+        let pn_jid = conv.pn_jid.as_deref().and_then(|p| Jid::from_str(p).ok());
+        let chat_jid = resolve_chat_jid(&conv.id, pn_jid.as_ref(), store).await;
+        let counts = persist_history_messages(
+            store,
+            embed_notify,
+            &chat_jid,
+            pn_jid.as_ref(),
+            &conv.batch.messages,
+            source,
+        )
+        .await;
+        stored.conversations += 1;
+        stored.counts.add(counts);
+    }
+    stored
+}
+
+/// Decode one unmatched chunk and store its messages as `source`, then log one line. Best-effort:
+/// a chunk that cannot be decoded or stored is a WARN, never an error for the caller. Runs in a
+/// spawned task (`spawn_store_unmatched_history`).
+async fn store_unmatched_history(
+    lazy: Box<wacore::types::events::LazyHistorySync>,
+    source: &'static str,
+    store: &Store,
+    embed_notify: &tokio::sync::Notify,
+) {
+    let sync_type = history_sync_type_name(lazy.sync_type());
+    // Inflating and decoding a multi-MB chunk takes tens of milliseconds: keep it off the async
+    // workers. Only the per-conversation batches come back; the decoded chunk is dropped there.
+    let decoded = tokio::task::spawn_blocking(move || {
+        lazy.get().map(|hs| crate::backfill::drain_all_conversations(hs, should_ignore_jid))
+    })
+    .await;
+    let conversations = match decoded {
+        Ok(Some(conversations)) => conversations,
+        Ok(None) => {
+            warn!(sync_type, "could not decode a history sync chunk: not stored");
+            return;
+        }
+        Err(e) => {
+            warn!(sync_type, error = %e, "decoding a history sync chunk failed: not stored");
+            return;
+        }
+    };
+    if conversations.is_empty() {
+        debug!(sync_type, "history sync chunk holds no messages to store");
+        return;
+    }
+
+    let stored = store_history_batches(store, embed_notify, &conversations, source).await;
+    info!(
+        sync_type,
+        source,
+        conversations = stored.conversations,
+        stored = stored.counts.stored,
+        duplicates = stored.counts.duplicates,
+        unstorable = stored.counts.unstorable,
+        media_refs = stored.counts.media_refs,
+        "stored a history sync chunk",
+    );
+    if stored.counts.failed > 0 || stored.counts.media_refs_failed > 0 {
+        warn!(
+            sync_type,
+            failed = stored.counts.failed,
+            media_refs_failed = stored.counts.media_refs_failed,
+            "some messages of a history sync chunk could not be written",
+        );
+    }
+}
+
+/// Handle a history-sync chunk no pending fetch claimed (see [`unmatched_history_source`]): store
+/// it in a spawned task, or ignore it. Pairing must never break and the event loop must never
+/// wait on this: the chunk may hold hundreds of conversations and storing does one or two
+/// database writes per message, so none of it runs inline. The task is detached and best-effort.
+fn spawn_store_unmatched_history(
+    lazy: Box<wacore::types::events::LazyHistorySync>,
+    store: &Store,
+    embed_notify: &Arc<tokio::sync::Notify>,
+    store_pairing_history: bool,
+) {
+    let sync_type = lazy.sync_type();
+    let Some(source) = unmatched_history_source(sync_type, store_pairing_history) else {
+        debug!(
+            sync_type = history_sync_type_name(sync_type),
+            "history sync chunk received (unmatched; pairing-history storage is off — ignored)",
+        );
+        return;
+    };
+    debug!(sync_type = history_sync_type_name(sync_type), source, "unmatched history sync chunk: storing");
+    let store = store.clone();
+    let embed_notify = embed_notify.clone();
+    tokio::spawn(async move {
+        store_unmatched_history(lazy, source, &store, &embed_notify).await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -7382,5 +7643,690 @@ mod tests {
             history_fetch_timeout_error().to_string(),
             "LiveHistorySource: the phone did not answer within 180 s; it may be asleep or offline: open WhatsApp on the phone, then retry",
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — unmatched history-sync chunks (ADR 0048)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod history_storage_tests {
+    use super::*;
+    use crate::backfill::{resolve_anchor, Anchor, AnchorResolution};
+    use std::path::Path;
+    use wacore::store::traits::LidPnMappingEntry;
+
+    fn open_store(name: &str) -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("test_history_storage_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::new(&dir.join("wa.db")).expect("test DB");
+        (store, dir)
+    }
+
+    fn web(id: &str, remote_jid: &str, from_me: bool, ts_secs: u64, message: wa::Message) -> wa::WebMessageInfo {
+        wa::WebMessageInfo {
+            key: wa::MessageKey {
+                id: Some(id.to_owned()),
+                remote_jid: Some(remote_jid.to_owned()),
+                from_me: Some(from_me),
+                ..Default::default()
+            },
+            message: Some(Box::new(message)),
+            message_timestamp: Some(ts_secs),
+            ..Default::default()
+        }
+    }
+
+    fn msg(id: &str, remote_jid: &str, from_me: bool, ts_secs: u64, body: &str) -> wa::WebMessageInfo {
+        web(id, remote_jid, from_me, ts_secs, wa::Message { conversation: Some(body.to_owned()), ..Default::default() })
+    }
+
+    fn image_message(file_length: u64, caption: Option<&str>) -> wa::Message {
+        wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage {
+                mimetype: Some("image/png".to_owned()),
+                caption: caption.map(str::to_owned),
+                file_length: Some(file_length),
+                media_key: Some(vec![1, 2, 3, 4]),
+                direct_path: Some("/v/t62/abc?ccb=11".to_owned()),
+                file_enc_sha256: Some(vec![9, 8, 7]),
+                file_sha256: Some(vec![5, 5]),
+                width: Some(640),
+                height: Some(480),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn document_message(file_length: u64, file_name: &str) -> wa::Message {
+        wa::Message {
+            document_message: Some(Box::new(wa::message::DocumentMessage {
+                mimetype: Some("application/pdf".to_owned()),
+                file_name: Some(file_name.to_owned()),
+                file_length: Some(file_length),
+                media_key: Some(vec![6, 6]),
+                direct_path: Some("/v/t62/doc".to_owned()),
+                file_enc_sha256: Some(vec![4]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn conv(id: &str, messages: Vec<wa::WebMessageInfo>) -> wa::Conversation {
+        wa::Conversation {
+            id: id.to_owned(),
+            messages: messages
+                .into_iter()
+                .map(|m| wa::HistorySyncMsg { message: Some(Box::new(m)), ..Default::default() })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn conv_with_pn(id: &str, pn_jid: &str, messages: Vec<wa::WebMessageInfo>) -> wa::Conversation {
+        wa::Conversation { pn_jid: Some(pn_jid.to_owned()), ..conv(id, messages) }
+    }
+
+    fn chunk(conversations: Vec<wa::Conversation>) -> wa::HistorySync {
+        wa::HistorySync { conversations, ..Default::default() }
+    }
+
+    /// The chunk-to-rows steps `store_unmatched_history` runs after decoding it.
+    async fn store_chunk(store: &Store, notify: &tokio::sync::Notify, hs: &wa::HistorySync, source: &str) -> ChunkStored {
+        let conversations = crate::backfill::drain_all_conversations(hs, should_ignore_jid);
+        store_history_batches(store, notify, &conversations, source).await
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Row {
+        chat_jid: String,
+        sender_jid: String,
+        message_id: String,
+        content_kind: String,
+        from_me: bool,
+        source: String,
+        embed_status: String,
+        body_text: Option<String>,
+    }
+
+    fn rows(dir: &Path) -> Vec<Row> {
+        let conn = rusqlite::Connection::open(dir.join("wa.db")).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT chat_jid, sender_jid, message_id, content_kind, from_me, source, embed_status, body_text
+                 FROM messages ORDER BY message_id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok(Row {
+                chat_jid: r.get(0)?,
+                sender_jid: r.get(1)?,
+                message_id: r.get(2)?,
+                content_kind: r.get(3)?,
+                from_me: r.get::<_, i64>(4)? != 0,
+                source: r.get(5)?,
+                embed_status: r.get(6)?,
+                body_text: r.get(7)?,
+            })
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    fn row<'a>(rows: &'a [Row], message_id: &str) -> &'a Row {
+        rows.iter().find(|r| r.message_id == message_id).unwrap_or_else(|| panic!("no stored row {message_id}"))
+    }
+
+    /// All `media_refs` rows, `(message_id, ref)`, plus the `hydrated_path` of each.
+    fn media_refs(dir: &Path) -> Vec<(String, crate::storage::MediaRefRow, Option<String>)> {
+        let conn = rusqlite::Connection::open(dir.join("wa.db")).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT message_id, media_key, direct_path, file_enc_sha256, mimetype, file_length, width, height, hydrated_path
+                 FROM media_refs ORDER BY message_id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                crate::storage::MediaRefRow {
+                    media_key: r.get(1)?,
+                    direct_path: r.get(2)?,
+                    file_enc_sha256: r.get(3)?,
+                    mimetype: r.get(4)?,
+                    file_length: r.get(5)?,
+                    width: r.get(6)?,
+                    height: r.get(7)?,
+                },
+                r.get(8)?,
+            ))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    async fn woken(notify: &tokio::sync::Notify) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), notify.notified()).await.is_ok()
+    }
+
+    const PHONE_CHAT: &str = "15557654321@s.whatsapp.net";
+    const GROUP_CHAT: &str = "120363000000000001@g.us";
+
+    #[tokio::test]
+    async fn test_pairing_chunk_rows_are_bootstrap_keyed_like_live_messages() {
+        let (store, dir) = open_store("keying");
+        store
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: "100000000000001".to_owned(),
+                phone_number: "15551234567".to_owned(),
+                created_at: 1,
+                updated_at: 1,
+                learning_source: "test".to_owned(),
+            })
+            .await
+            .unwrap();
+        let mut group_msg = msg("G1", GROUP_CHAT, false, 1_500, "group hello");
+        group_msg.key.participant = Some("15559998888@s.whatsapp.net".to_owned());
+        let hs = chunk(vec![
+            conv(
+                PHONE_CHAT,
+                vec![msg("P1", PHONE_CHAT, false, 1_000, "hi"), msg("P2", PHONE_CHAT, true, 2_000, "yo")],
+            ),
+            conv(GROUP_CHAT, vec![group_msg]),
+            conv("100000000000001@lid", vec![msg("L1", "100000000000001@lid", false, 1_200, "mapped")]),
+            conv("100000000000002@lid", vec![msg("U1", "100000000000002@lid", false, 1_300, "unmapped")]),
+            conv("status@broadcast", vec![msg("S1", "status@broadcast", false, 1_100, "status")]),
+            conv("news@newsletter", vec![msg("N1", "news@newsletter", false, 1_100, "news")]),
+            conv("15550000000@s.whatsapp.net", vec![]),
+        ]);
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.conversations, 4, "phone DM, group, mapped LID, unmapped LID");
+        assert_eq!(
+            stored.counts,
+            PersistCounts { stored: 5, ..Default::default() },
+        );
+        let rows = rows(&dir);
+        assert_eq!(rows.len(), 5, "status, newsletter and the empty conversation store nothing");
+        assert!(rows.iter().all(|r| r.source == "bootstrap"), "{rows:?}");
+
+        assert_eq!(row(&rows, "P1").chat_jid, PHONE_CHAT);
+        assert!(!row(&rows, "P1").from_me);
+        assert!(row(&rows, "P2").from_me, "from_me is kept");
+        assert_eq!(row(&rows, "G1").chat_jid, GROUP_CHAT);
+        assert_eq!(row(&rows, "G1").sender_jid, "15559998888@s.whatsapp.net", "a group row names its sender");
+        assert_eq!(
+            row(&rows, "L1").chat_jid,
+            "15551234567@s.whatsapp.net",
+            "a mapped @lid DM is stored under the phone JID, like live messages",
+        );
+        assert_eq!(row(&rows, "U1").chat_jid, "100000000000002@lid", "an unmapped @lid stays as it is");
+
+        // The same classification as live ingest: natural-language text is embeddable.
+        assert_eq!(row(&rows, "P1").embed_status, "pending");
+        assert_eq!(row(&rows, "P1").body_text.as_deref(), Some("hi"));
+        assert!(woken(&notify).await, "a new 'pending' row wakes the embedding-drain worker");
+        assert!(media_refs(&dir).is_empty(), "text messages have no media reference");
+
+        // The oldest stored message of each chat is now its fetch anchor.
+        assert_eq!(
+            resolve_anchor(&store, PHONE_CHAT, None).await.unwrap(),
+            AnchorResolution::OldestStored(Anchor {
+                oldest_msg_id: "P1".to_owned(),
+                oldest_msg_from_me: false,
+                oldest_msg_timestamp_ms: 1_000_000,
+            }),
+        );
+        assert_eq!(
+            resolve_anchor(&store, "15551234567@s.whatsapp.net", None).await.unwrap(),
+            AnchorResolution::OldestStored(Anchor {
+                oldest_msg_id: "L1".to_owned(),
+                oldest_msg_from_me: false,
+                oldest_msg_timestamp_ms: 1_200_000,
+            }),
+        );
+        assert_eq!(resolve_anchor(&store, "status@broadcast", None).await.unwrap(), AnchorResolution::NoAnchor);
+        assert_eq!(
+            resolve_anchor(&store, "15550000000@s.whatsapp.net", None).await.unwrap(),
+            AnchorResolution::NoAnchor,
+            "an empty conversation gives no anchor, and no cursor row is written for it",
+        );
+        assert!(store.get_backfill_cursor(PHONE_CHAT).await.unwrap().is_none(), "no cursor rows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_lid_conversation_with_a_pn_jid_is_stored_under_the_phone_jid() {
+        let (store, dir) = open_store("pn-jid");
+        let hs = chunk(vec![
+            // Unmapped in lid_pn_mapping, but the chunk names the phone JID.
+            conv_with_pn(
+                "100000000000001@lid",
+                "15551234567@s.whatsapp.net",
+                vec![
+                    msg("A1", "100000000000001@lid", false, 1_000, "from the contact"),
+                    msg("A2", "100000000000001@lid", true, 2_000, "from me"),
+                ],
+            ),
+            // Unmapped and no pnJid: stays under the @lid.
+            conv("100000000000002@lid", vec![msg("B1", "100000000000002@lid", false, 1_000, "no pn")]),
+            // An empty pnJid counts as absent.
+            conv_with_pn("100000000000003@lid", "", vec![msg("C1", "100000000000003@lid", false, 1_000, "empty pn")]),
+            // A pnJid that is not a phone JID is not used.
+            conv_with_pn("100000000000004@lid", "100000000000009@lid", vec![msg("D1", "100000000000004@lid", false, 1_000, "lid pn")]),
+        ]);
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.counts.stored, 5);
+        let rows = rows(&dir);
+        assert_eq!(row(&rows, "A1").chat_jid, "15551234567@s.whatsapp.net");
+        assert_eq!(row(&rows, "A2").chat_jid, "15551234567@s.whatsapp.net");
+        assert_eq!(
+            row(&rows, "A1").sender_jid,
+            "15551234567@s.whatsapp.net",
+            "a DM message's sender is resolved like its chat",
+        );
+        assert_eq!(row(&rows, "B1").chat_jid, "100000000000002@lid");
+        assert_eq!(row(&rows, "C1").chat_jid, "100000000000003@lid");
+        assert_eq!(row(&rows, "D1").chat_jid, "100000000000004@lid");
+        // The phone JID now has an anchor to fetch from.
+        assert!(matches!(
+            resolve_anchor(&store, "15551234567@s.whatsapp.net", None).await.unwrap(),
+            AnchorResolution::OldestStored(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_pn_jid_does_not_change_a_phone_or_group_conversation() {
+        let (store, dir) = open_store("pn-jid-passthrough");
+        let hs = chunk(vec![
+            conv_with_pn(PHONE_CHAT, "15559990000@s.whatsapp.net", vec![msg("P1", PHONE_CHAT, false, 1_000, "hi")]),
+            conv_with_pn(GROUP_CHAT, "15559990000@s.whatsapp.net", vec![msg("G1", GROUP_CHAT, false, 1_000, "hi")]),
+        ]);
+        let notify = tokio::sync::Notify::new();
+
+        store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        let rows = rows(&dir);
+        assert_eq!(row(&rows, "P1").chat_jid, PHONE_CHAT);
+        assert_eq!(row(&rows, "G1").chat_jid, GROUP_CHAT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_media_messages_are_stored_with_a_label_and_a_media_ref_and_no_download() {
+        let (store, dir) = open_store("media");
+        let hs = chunk(vec![conv(
+            PHONE_CHAT,
+            vec![
+                web("IMG1", PHONE_CHAT, false, 1_000, image_message(12_345, Some("look at this"))),
+                web("DOC1", PHONE_CHAT, true, 2_000, document_message(2_048, "report.pdf")),
+                msg("TXT1", PHONE_CHAT, false, 3_000, "plain text"),
+            ],
+        )]);
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.counts, PersistCounts { stored: 3, media_refs: 2, ..Default::default() });
+        let rows = rows(&dir);
+
+        // The label is the one a download would have produced: size from file_length.
+        let downloaded = InboundContent::Image {
+            data: Arc::from(vec![0u8; 12_345]),
+            mime: "image/png".to_owned(),
+            caption: Some("look at this".to_owned()),
+            width: Some(640),
+            height: Some(480),
+        };
+        assert_eq!(downloaded.display_text(), "[image 12.1KB] look at this");
+        assert_eq!(row(&rows, "IMG1").body_text.as_deref(), Some(downloaded.display_text().as_str()));
+        assert_eq!(row(&rows, "IMG1").content_kind, "image");
+        assert_eq!(row(&rows, "IMG1").embed_status, "pending", "a caption stays embeddable");
+
+        assert_eq!(row(&rows, "DOC1").body_text.as_deref(), Some("[doc: report.pdf 2.0KB]"));
+        assert_eq!(row(&rows, "DOC1").content_kind, "document");
+        assert_eq!(row(&rows, "DOC1").embed_status, "skipped", "a document without a caption is not embeddable");
+        assert!(row(&rows, "DOC1").from_me);
+
+        let refs = media_refs(&dir);
+        assert_eq!(refs.len(), 2, "no media_refs row for the text message");
+        assert_eq!(refs[0].0, "DOC1");
+        assert_eq!(
+            refs[0].1,
+            crate::storage::MediaRefRow {
+                media_key: Some(vec![6, 6]),
+                direct_path: Some("/v/t62/doc".to_owned()),
+                file_enc_sha256: Some(vec![4]),
+                mimetype: Some("application/pdf".to_owned()),
+                file_length: Some(2_048),
+                width: None,
+                height: None,
+            },
+        );
+        assert_eq!(refs[1].0, "IMG1");
+        assert_eq!(
+            refs[1].1,
+            crate::storage::MediaRefRow {
+                media_key: Some(vec![1, 2, 3, 4]),
+                direct_path: Some("/v/t62/abc?ccb=11".to_owned()),
+                file_enc_sha256: Some(vec![9, 8, 7]),
+                mimetype: Some("image/png".to_owned()),
+                file_length: Some(12_345),
+                width: Some(640),
+                height: Some(480),
+            },
+        );
+        assert!(refs.iter().all(|r| r.2.is_none()), "no bytes were hydrated");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_media_larger_than_the_download_limit_is_stored_without_downloading_anything() {
+        let (store, dir) = open_store("media-large");
+        let size = MAX_MEDIA_BYTES + 1;
+        let hs = chunk(vec![conv(PHONE_CHAT, vec![web("BIG1", PHONE_CHAT, false, 1_000, image_message(size, None))])]);
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.counts, PersistCounts { stored: 1, media_refs: 1, ..Default::default() });
+        assert_eq!(rows(&dir)[0].body_text.as_deref(), Some("[image 50.0MB]"));
+        assert_eq!(media_refs(&dir)[0].1.file_length, Some(size as i64));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_media_without_a_file_length_still_gets_a_label_and_a_reference() {
+        let (store, dir) = open_store("media-no-length");
+        let mut image = image_message(0, None);
+        image.image_message.as_mut().unwrap().file_length = None;
+        let hs = chunk(vec![conv(PHONE_CHAT, vec![web("IMG1", PHONE_CHAT, false, 1_000, image)])]);
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.counts, PersistCounts { stored: 1, media_refs: 1, ..Default::default() });
+        assert_eq!(rows(&dir)[0].body_text.as_deref(), Some("[image 0B]"));
+        assert_eq!(media_refs(&dir)[0].1.file_length, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_a_duplicate_media_message_does_not_create_a_second_media_ref() {
+        let (store, dir) = open_store("media-dup");
+        let hs = chunk(vec![conv(
+            PHONE_CHAT,
+            vec![web("IMG1", PHONE_CHAT, false, 1_000, image_message(500, Some("c")))],
+        )]);
+        let notify = tokio::sync::Notify::new();
+
+        let first = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+        let second = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+        let late = store_chunk(&store, &notify, &hs, SOURCE_BACKFILL).await;
+
+        assert_eq!(first.counts, PersistCounts { stored: 1, media_refs: 1, ..Default::default() });
+        assert_eq!(second.counts, PersistCounts { duplicates: 1, ..Default::default() });
+        assert_eq!(late.counts, PersistCounts { duplicates: 1, ..Default::default() });
+        assert_eq!(rows(&dir).len(), 1);
+        assert_eq!(media_refs(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_a_media_message_that_arrived_live_keeps_its_row_and_gets_no_media_ref() {
+        let (store, dir) = open_store("media-live-dup");
+        store
+            .insert_inbound(PHONE_CHAT, "15557654321", "IMG1", "image", Some("[image 1.0KB]"), 1_000, "skipped")
+            .await
+            .unwrap();
+        let hs = chunk(vec![conv(PHONE_CHAT, vec![web("IMG1", PHONE_CHAT, false, 1_000, image_message(500, None))])]);
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.counts, PersistCounts { duplicates: 1, ..Default::default() });
+        assert_eq!(row(&rows(&dir), "IMG1").source, "live");
+        assert!(media_refs(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_messages_without_key_timestamp_or_content_are_not_stored() {
+        let (store, dir) = open_store("unstorable");
+        let no_key = wa::WebMessageInfo { key: wa::MessageKey::default(), ..msg("x", PHONE_CHAT, false, 1_000, "a") };
+        let no_ts = wa::WebMessageInfo { message_timestamp: None, ..msg("NOTS", PHONE_CHAT, false, 1_000, "b") };
+        let non_text = web("OTHER", PHONE_CHAT, false, 1_000, wa::Message::default());
+        let hs = chunk(vec![conv(
+            PHONE_CHAT,
+            vec![no_key, no_ts, non_text, msg("OK1", PHONE_CHAT, false, 1_000, "kept")],
+        )]);
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        // The key-less and time-less messages are dropped before storing; the one the extractor
+        // does not handle is counted as unstorable.
+        assert_eq!(stored.counts, PersistCounts { stored: 1, unstorable: 1, ..Default::default() });
+        let rows = rows(&dir);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id, "OK1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_a_message_is_never_stored_twice() {
+        let (store, dir) = open_store("duplicates");
+        // Already stored live, before the package arrived.
+        store
+            .insert_inbound(PHONE_CHAT, "15557654321", "P1", "text", Some("hi"), 1_000, "pending")
+            .await
+            .unwrap();
+        let hs = chunk(vec![conv(
+            PHONE_CHAT,
+            vec![msg("P1", PHONE_CHAT, false, 1_000, "hi"), msg("P2", PHONE_CHAT, false, 2_000, "again")],
+        )]);
+        let notify = tokio::sync::Notify::new();
+
+        let first = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+        assert_eq!(first.counts, PersistCounts { stored: 1, duplicates: 1, ..Default::default() });
+
+        // The same chunk again, and the same messages as a late fetch answer.
+        let second = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+        assert_eq!(second.counts, PersistCounts { duplicates: 2, ..Default::default() });
+        let late = store_chunk(&store, &notify, &hs, SOURCE_BACKFILL).await;
+        assert_eq!(late.counts, PersistCounts { duplicates: 2, ..Default::default() });
+
+        let rows = rows(&dir);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row(&rows, "P1").source, "live", "the first writer's row is kept");
+        assert_eq!(row(&rows, "P2").source, "bootstrap");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_unmatched_chunk_source_follows_the_type_and_the_flag() {
+        use wa::message::HistorySyncType as T;
+        let on_demand = T::OnDemand as i32;
+        // A late on-demand answer is stored whatever the flag says.
+        assert_eq!(unmatched_history_source(on_demand, true), Some("backfill"));
+        assert_eq!(unmatched_history_source(on_demand, false), Some("backfill"));
+        // The package sent at pairing is stored only with the flag on.
+        for t in [T::InitialBootstrap, T::Recent, T::Full, T::NonBlockingData, T::PushName, T::InitialStatusV3] {
+            assert_eq!(unmatched_history_source(t as i32, true), Some("bootstrap"), "{t:?}");
+            assert_eq!(unmatched_history_source(t as i32, false), None, "{t:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_late_on_demand_chunk_is_stored_as_backfill_with_the_flag_off() {
+        let (store, dir) = open_store("late");
+        let hs = chunk(vec![conv(
+            PHONE_CHAT,
+            vec![
+                msg("P1", PHONE_CHAT, false, 1_000, "late answer"),
+                web("IMG1", PHONE_CHAT, false, 900, image_message(100, None)),
+            ],
+        )]);
+        let notify = tokio::sync::Notify::new();
+
+        let source = unmatched_history_source(wa::message::HistorySyncType::OnDemand as i32, false)
+            .expect("a late on-demand answer is stored with the flag off");
+        let stored = store_chunk(&store, &notify, &hs, source).await;
+
+        assert_eq!(stored.counts.stored, 2);
+        let rows = rows(&dir);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.source == "backfill"), "{rows:?}");
+        assert_eq!(media_refs(&dir).len(), 1, "a fetched media message gets its reference too");
+        assert!(
+            matches!(resolve_anchor(&store, PHONE_CHAT, None).await.unwrap(), AnchorResolution::OldestStored(_)),
+            "the next fetch continues from the stored message",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_sink_stores_media_without_a_client_and_counts_like_before() {
+        use crate::backfill::BatchSink;
+        let (store, dir) = open_store("sink");
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let sink = LiveBatchSink::new(store.clone(), notify.clone());
+        let batch = crate::backfill::HistoryBatch {
+            messages: vec![
+                msg("P1", PHONE_CHAT, false, 1_000, "hi"),
+                web("IMG1", PHONE_CHAT, false, 2_000, image_message(10, Some("pic"))),
+                web("OTHER", PHONE_CHAT, false, 3_000, wa::Message::default()),
+            ],
+            more_remain: true,
+            progress: None,
+        };
+
+        let first = sink.persist_batch(PHONE_CHAT, &batch).await.unwrap();
+        let second = sink.persist_batch(PHONE_CHAT, &batch).await.unwrap();
+
+        assert_eq!(first, 2, "the unhandled message is not counted");
+        assert_eq!(second, 2, "the count includes duplicates, as before");
+        let rows = rows(&dir);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.source == "backfill"));
+        assert_eq!(row(&rows, "IMG1").body_text.as_deref(), Some("[image 10B] pic"));
+        assert_eq!(media_refs(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_pairing_chunk_stores_nothing_with_the_flag_off() {
+        let (store, dir) = open_store("flag-off");
+        let hs = chunk(vec![conv(PHONE_CHAT, vec![msg("P1", PHONE_CHAT, false, 1_000, "hi")])]);
+        let notify = tokio::sync::Notify::new();
+
+        // What `spawn_store_unmatched_history` does: no source, no storing.
+        let source = unmatched_history_source(wa::message::HistorySyncType::InitialBootstrap as i32, false);
+        if let Some(source) = source {
+            store_chunk(&store, &notify, &hs, source).await;
+        }
+
+        assert_eq!(source, None);
+        assert!(rows(&dir).is_empty());
+        assert_eq!(resolve_anchor(&store, PHONE_CHAT, None).await.unwrap(), AnchorResolution::NoAnchor);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rows_that_cannot_be_embedded_do_not_wake_the_drain_worker() {
+        let (store, dir) = open_store("embed-skipped");
+        let hs = chunk(vec![conv(PHONE_CHAT, vec![msg("P1", PHONE_CHAT, false, 1_000, "")])]);
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.counts.stored, 1);
+        assert_eq!(rows(&dir)[0].embed_status, "skipped", "empty text is not natural language (ADR 0016)");
+        assert!(!woken(&notify).await);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_a_database_error_is_counted_not_raised() {
+        let (store, dir) = open_store("db-error");
+        let hs = chunk(vec![conv(
+            PHONE_CHAT,
+            vec![msg("P1", PHONE_CHAT, false, 1_000, "a"), msg("P2", PHONE_CHAT, false, 2_000, "b")],
+        )]);
+        {
+            // Break the store from the side: the table the rows go into is gone.
+            let conn = rusqlite::Connection::open(dir.join("wa.db")).unwrap();
+            conn.execute_batch("DROP TABLE messages").unwrap();
+        }
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.counts, PersistCounts { failed: 2, ..Default::default() });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_a_media_ref_error_is_counted_and_the_message_row_is_kept() {
+        let (store, dir) = open_store("ref-error");
+        let hs = chunk(vec![conv(PHONE_CHAT, vec![web("IMG1", PHONE_CHAT, false, 1_000, image_message(5, None))])]);
+        {
+            let conn = rusqlite::Connection::open(dir.join("wa.db")).unwrap();
+            conn.execute_batch("DROP TABLE media_refs").unwrap();
+        }
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.counts, PersistCounts { stored: 1, media_refs_failed: 1, ..Default::default() });
+        assert_eq!(rows(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_display_text_with_media_len_replaces_only_the_size() {
+        let image = |data: Vec<u8>| InboundContent::Image {
+            data: Arc::from(data),
+            mime: "image/png".to_owned(),
+            caption: Some("c".to_owned()),
+            width: None,
+            height: None,
+        };
+        assert_eq!(image(vec![0; 3]).display_text(), "[image 3B] c");
+        assert_eq!(image(vec![0; 3]).display_text_with_media_len(None), "[image 3B] c");
+        assert_eq!(image(Vec::new()).display_text_with_media_len(Some(2_048)), "[image 2.0KB] c");
+        // Not a media variant: the override changes nothing.
+        let text = InboundContent::Text { body: "hi".to_owned(), link_preview: None };
+        assert_eq!(text.display_text_with_media_len(Some(99)), "hi");
+        // Every media kind reads the same override.
+        let audio = InboundContent::Audio { data: Arc::from(Vec::new()), mime: "audio/ogg".to_owned(), seconds: Some(3), is_voice: true };
+        assert_eq!(audio.display_text_with_media_len(Some(1_536)), "[voice 3s 1.5KB]");
+        let sticker = InboundContent::Sticker { data: Arc::from(Vec::new()), mime: "image/webp".to_owned(), is_animated: false, sticker_emoji: None };
+        assert_eq!(sticker.display_text_with_media_len(Some(1_048_576)), "[sticker 1.0MB]");
+    }
+
+    #[test]
+    fn test_history_sync_type_names() {
+        assert_eq!(history_sync_type_name(0), "INITIAL_BOOTSTRAP");
+        assert_eq!(history_sync_type_name(3), "RECENT");
+        assert_eq!(history_sync_type_name(6), "ON_DEMAND");
+        assert_eq!(history_sync_type_name(999), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_store_pairing_history_defaults_to_true() {
+        assert!(BridgeConfig::default().store_pairing_history);
     }
 }
