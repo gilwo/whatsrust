@@ -637,9 +637,16 @@ cursors all stay in `whatsapp.db` (ADR 0043).
    the pair code).
 
 **What to expect:**
-- History sync runs again, as on any first pairing. The messages it sends are
-  already in the database; duplicates are skipped because each WhatsApp
-  message ID is stored once.
+- History sync runs again, as on any first pairing. The phone sends a package
+  with the messages of some of its chats (a few chats and recent messages;
+  how many depends on the phone), and whatsrust stores them (`source` =
+  `bootstrap`, ADR 0048). Those chats now have a message to start from, so you
+  can run `fetch-history` on them at once (§4). A message already in the
+  database is not stored twice: each WhatsApp message ID is kept once. Media is
+  not downloaded for these messages: the stored text shows its kind and size
+  (for example `[image 12.1KB]`), and the file's reference is kept in
+  `media_refs` for a later on-demand download (not built yet). To turn the
+  storing off, set `WHATSRUST_STORE_PAIRING_HISTORY=false` before pairing.
 - Older history stays local; fetch more on demand with `fetch-history` (§4).
 - It's a new device identity to WhatsApp, so contacts' encryption sessions
   are set up again, and anything still in the outbound queue at the moment of
@@ -724,9 +731,18 @@ message, which becomes the starting point, so the daemon must be running and
 connected when you do it), or receive a message in the chat, or send one **from the phone**, then
 retry. Messages sent through whatsrust are not stored, so they do not count.
 
+After a **pairing**, the chats in the history package the phone sends already
+have stored messages (§3a), so they can be fetched without this step. Only a
+fresh pairing delivers the package: a profile that is already paired gets it
+only if you re-pair (§3a). Chats the phone left out of the package still need
+the archive and unarchive step. The package is stored unless
+`WHATSRUST_STORE_PAIRING_HISTORY=false` (ADR 0048).
+
 If a fetch fails with "the phone did not answer within 180 s; it may be asleep or
 offline", the phone did not answer in time: a sleeping phone can take minutes to
-receive the request. Open WhatsApp on the phone, then retry.
+receive the request. Open WhatsApp on the phone, then retry. If the answer
+arrives later anyway, whatsrust stores its messages (the job stays failed), and
+the retry continues from them.
 
 **Verification:** `whatsrust <cmd> ... ` prints a JSON object to stdout and
 exits non-zero on failure (`{"ok": false, ...}` or an HTTP error status).

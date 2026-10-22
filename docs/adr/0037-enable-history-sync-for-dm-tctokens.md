@@ -47,3 +47,7 @@ Investigation findings that drive this decision:
 **Related / carried forward:**
 - `MsgSecretStore` is currently stubbed as no-ops (can't decrypt history-delivered edits/reactions/poll-votes) — an F1-era TODO, unrelated to the DM fix.
 - This decision is part of the Phase 0 wa-rs HEAD adoption (ADR 0002); the DM-send bug was surfaced by that gate's live smoke test.
+
+## Amendment (2026-10-22)
+
+The `Event::HistorySync` handler is no longer a no-op. A chunk that no pending on-demand fetch claims, which is the package the phone sends at pairing, now has its messages stored (`source=bootstrap`), unless `WHATSRUST_STORE_PAIRING_HISTORY=false`; a late answer to an on-demand fetch is stored as `backfill`. The stored messages give the chats in the package a fetch anchor. Storing runs in a spawned task and is best-effort, so the rule of this ADR still holds: the history-sync handler must never break pairing. The tctokens, `nct_salt` and push name are still persisted by wa-rs, not by this handler. See ADR 0048.

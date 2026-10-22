@@ -60,6 +60,7 @@ This directory contains Architecture Decision Records (ADRs) for the whatsrust p
 | [0045](0045-mcp-streamable-http-transport-in-daemon.md) | MCP Streamable HTTP transport via dedicated `/mcp` listener inside the daemon | 2026-10-15 | Accepted |
 | [0046](0046-mcp-forwards-only-declared-tool-arguments.md) | MCP forwards only declared tool arguments | 2026-10-15 | Accepted |
 | [0047](0047-sync-send-timeout-returns-job-id.md) | Sync send timeout returns job_id and says "do not retry" | 2026-10-15 | Accepted |
+| [0048](0048-store-pairing-history-sync-messages.md) | Store the messages of the pairing history sync, and late on-demand answers | 2026-10-22 | Accepted |
 
 ## Revised ADRs
 
@@ -91,4 +92,4 @@ The following ADRs received M2-refinement pointers during M2 planning (2026-07-2
 
 ## Future ADRs
 
-Start numbering at 0048. Follow the established format. Keep each ADR focused on one decision.
+Start numbering at 0049. Follow the established format. Keep each ADR focused on one decision.
