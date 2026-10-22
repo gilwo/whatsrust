@@ -164,6 +164,24 @@ fn parse_env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
     }
 }
 
+/// `WHATSRUST_STORE_PAIRING_HISTORY` (default: on): `true`/`1`/`yes` or `false`/`0`/`no`, in any
+/// case, as `parse_boolish` reads them. Unset or blank keeps the default; an unrecognised value
+/// warns and keeps it too, so a typo never silently turns the storage off.
+fn store_pairing_history_from_env(value: Option<&str>) -> bool {
+    let default = bridge::BridgeConfig::default().store_pairing_history;
+    let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return default;
+    };
+    parse_boolish(&raw.to_ascii_lowercase()).unwrap_or_else(|| {
+        tracing::warn!(
+            var = "WHATSRUST_STORE_PAIRING_HISTORY",
+            value = %raw,
+            "unrecognised value; using the default (use true or false)"
+        );
+        default
+    })
+}
+
 /// Resolve the configured device name from `WHATSRUST_DEVICE_NAME` (trimmed; absent or
 /// whitespace-only is treated as unset, falling back to `default`). Only takes effect
 /// while pairing a new device — see `BridgeConfig::device_name` and
@@ -385,6 +403,12 @@ async fn async_main() -> Result<()> {
     let skip_history_sync = std::env::var("WHATSRUST_SKIP_HISTORY_SYNC")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // The history package the phone sends at pairing is STORED by default, so its chats have a
+    // fetch anchor (ADR 0048). WHATSRUST_STORE_PAIRING_HISTORY=false (or 0/no) ignores it as before.
+    // Late answers to an on-demand fetch are stored either way.
+    let store_pairing_history = store_pairing_history_from_env(
+        std::env::var("WHATSRUST_STORE_PAIRING_HISTORY").ok().as_deref(),
+    );
 
     // --- Backfill knobs (ADR 0021/0022/0023) ---
     let bf_default = bridge::BridgeConfig::default();
@@ -478,6 +502,7 @@ async fn async_main() -> Result<()> {
         backup_dir,
         send_burst,
         skip_history_sync,
+        store_pairing_history,
         device_name,
         backfill_interval_secs,
         backfill_max_concurrent,
@@ -2159,6 +2184,7 @@ fn print_cli_help() {
     println!("  WHATSRUST_MCP_READ_ONLY=1  MCP listener offers only the 6 read tools");
     println!("  WHATSRUST_SEND_BURST     Max burst size before rate limit (default: 5)");
     println!("  WHATSRUST_SKIP_HISTORY_SYNC=1  Skip history sync (leaner pairing, but 1:1 DMs fail with 463; default: off)");
+    println!("  WHATSRUST_STORE_PAIRING_HISTORY=false  Do not store the messages of the history package sent at pairing (default: stored, so those chats can be fetched)");
     println!("  WHATSRUST_DEVICE_NAME  Name shown in Linked Devices (default: whatsrust); used only when pairing");
     println!("  (full list of variables: .env.example; docs/HOWTO.md §2)");
     println!();
@@ -2612,5 +2638,32 @@ mod device_name_config_tests {
         std::env::remove_var("WHATSRUST_DEVICE_NAME");
         let name = device_name_from_env(&BridgeConfig::default().device_name);
         assert_eq!(name, "whatsrust", "unset var must fall back to the default");
+    }
+}
+
+#[cfg(test)]
+mod pairing_history_config_tests {
+    use super::*;
+
+    /// Storing the pairing package is on by default (ADR 0048): the library default and an
+    /// unset, blank or unrecognised environment value all give true.
+    #[test]
+    fn test_store_pairing_history_defaults_to_true() {
+        assert!(BridgeConfig::default().store_pairing_history);
+        assert!(store_pairing_history_from_env(None));
+        assert!(store_pairing_history_from_env(Some("")));
+        assert!(store_pairing_history_from_env(Some("   ")));
+        assert!(store_pairing_history_from_env(Some("flase")), "a typo must not turn the storage off");
+    }
+
+    /// `false`, `0` and `no` (any case, trimmed) turn it off; the true spellings keep it on.
+    #[test]
+    fn test_store_pairing_history_false_spellings_turn_it_off() {
+        for off in ["false", "FALSE", "False", "0", "no", "NO", " false "] {
+            assert!(!store_pairing_history_from_env(Some(off)), "{off:?} must turn it off");
+        }
+        for on in ["true", "TRUE", "1", "yes", "Yes"] {
+            assert!(store_pairing_history_from_env(Some(on)), "{on:?} must keep it on");
+        }
     }
 }

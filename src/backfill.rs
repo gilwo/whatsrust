@@ -396,7 +396,8 @@ pub fn evaluate_target(
 /// Persist seam for writing a fetched batch to the message store.
 ///
 /// The real implementation (Wave B2) runs:
-///   `WebMessageInfo → extract_content_inner → INSERT OR IGNORE INTO messages`
+///   `WebMessageInfo → extract_content_inner (no media download) → INSERT OR IGNORE INTO messages`
+///   plus a `media_refs` row for a new media message (ADR 0005, ADR 0048)
 /// The fake records calls and returns a configurable inserted-count.
 ///
 /// Kept as a separate trait (ADR 0025) so the worker is fully testable without
@@ -712,6 +713,61 @@ pub fn drain_history_sync(hs: &wa::HistorySync, accepted_ids: &[String]) -> Hist
         more_remain,
         progress: hs.progress,
     }
+}
+
+/// Whether a history message can become a stored row: it has a payload, a non-empty key id
+/// and a positive timestamp (the timeline position, and what makes it usable as a fetch anchor).
+fn is_storable_history_message(web: &wa::WebMessageInfo) -> bool {
+    web.message.is_some()
+        && web.key.id.as_deref().is_some_and(|id| !id.is_empty())
+        && web
+            .message_timestamp
+            .is_some_and(|ts| i64::try_from(ts).is_ok_and(|ts| ts > 0))
+}
+
+/// One conversation of a history chunk, ready to store.
+#[derive(Debug)]
+pub struct ConversationBatch {
+    /// The conversation id as the phone sent it (it may be a `@lid`).
+    pub id: String,
+    /// The phone JID the chunk gives for the conversation (`pnJid`), when present and non-empty.
+    /// For a `@lid` DM it is the contact's phone JID, which is the key live messages use.
+    pub pn_jid: Option<String>,
+    pub batch: HistoryBatch,
+}
+
+/// Split a decoded `HistorySync` into one batch per conversation, for storing a chunk nobody
+/// asked for (the package the phone sends at pairing, or a late on-demand answer; ADR 0048).
+///
+/// [`drain_history_sync`] picks the messages of the conversations whose id it is given; this
+/// calls it once per distinct conversation id, so both turn a chunk into messages the same way.
+/// The result keeps the chunk's order. Left out:
+/// - a conversation with an empty id, or one `skip_chat` rejects (status, broadcast, newsletters);
+/// - messages without a payload, a key id or a timestamp (see [`is_storable_history_message`]);
+/// - a conversation left with no message.
+///
+/// The caller keys the stored rows: the id may be a `@lid`, and `pn_jid` is the phone JID to
+/// use for it. A chunk holds some hundreds of conversations at most, so the id scan that
+/// `drain_history_sync` does per call stays cheap.
+pub fn drain_all_conversations(
+    hs: &wa::HistorySync,
+    skip_chat: fn(&str) -> bool,
+) -> Vec<ConversationBatch> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut batches = Vec::new();
+    for conv in &hs.conversations {
+        let id = conv.id.as_str();
+        if id.is_empty() || skip_chat(id) || !seen.insert(id) {
+            continue;
+        }
+        let mut batch = drain_history_sync(hs, &[id.to_owned()]);
+        batch.messages.retain(is_storable_history_message);
+        if !batch.messages.is_empty() {
+            let pn_jid = conv.pn_jid.clone().filter(|p| !p.is_empty());
+            batches.push(ConversationBatch { id: id.to_owned(), pn_jid, batch });
+        }
+    }
+    batches
 }
 
 // ---------------------------------------------------------------------------
@@ -2646,6 +2702,119 @@ mod tests {
         };
         let batch = drain_history_sync(&hs, &["chat@s.whatsapp.net".to_string()]);
         assert!(batch.messages.is_empty(), "empty HistorySync → empty batch");
+    }
+
+    // --- drain_all_conversations: a chunk nobody asked for → one batch per storable chat ---
+
+    /// A WebMessageInfo that can be stored: a payload, a key id and a timestamp.
+    fn make_storable_wmi(id: &str, ts_secs: u64) -> wa::WebMessageInfo {
+        wa::WebMessageInfo {
+            message: Some(Box::new(wa::Message::default())),
+            message_timestamp: Some(ts_secs),
+            ..make_wmi(id)
+        }
+    }
+
+    fn make_conv(id: &str, messages: Vec<wa::WebMessageInfo>) -> wa::Conversation {
+        wa::Conversation {
+            id: id.to_owned(),
+            messages: messages.into_iter().map(make_hsm).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Stand-in for the bridge's `should_ignore_jid`.
+    fn skip_noise_chat(id: &str) -> bool {
+        id.ends_with("@broadcast") || id.ends_with("@newsletter")
+    }
+
+    fn batch_ids(batch: &HistoryBatch) -> Vec<&str> {
+        batch.messages.iter().map(|m| m.key.id.as_deref().unwrap_or("")).collect()
+    }
+
+    #[test]
+    fn test_drain_all_conversations_keeps_each_storable_chat_in_chunk_order() {
+        let no_key = wa::WebMessageInfo { key: wa::MessageKey::default(), ..make_storable_wmi("x", 5) };
+        let no_ts = wa::WebMessageInfo { message_timestamp: None, ..make_storable_wmi("no-ts", 5) };
+        let zero_ts = make_storable_wmi("zero-ts", 0);
+        let empty_id = make_storable_wmi("", 5);
+        let no_payload = wa::WebMessageInfo { message: None, ..make_storable_wmi("no-payload", 5) };
+        let hs = wa::HistorySync {
+            conversations: vec![
+                make_conv(
+                    "a@s.whatsapp.net",
+                    vec![
+                        make_storable_wmi("m1", 100),
+                        no_key,
+                        no_ts,
+                        zero_ts,
+                        empty_id,
+                        no_payload,
+                        make_storable_wmi("m2", 200),
+                    ],
+                ),
+                make_conv("status@broadcast", vec![make_storable_wmi("st1", 100)]),
+                make_conv("empty@s.whatsapp.net", vec![]),
+                make_conv("120363000000000001@g.us", vec![make_storable_wmi("g1", 300)]),
+                make_conv("news@newsletter", vec![make_storable_wmi("n1", 100)]),
+                // Every message unstorable: nothing to store, so the chat is left out.
+                make_conv("bad@s.whatsapp.net", vec![make_wmi("only-id")]),
+                make_conv("", vec![make_storable_wmi("anon", 100)]),
+                // The same id again: one batch for the chat, with both conversations' messages.
+                make_conv("a@s.whatsapp.net", vec![make_storable_wmi("m3", 50)]),
+                make_conv("100000000000001@lid", vec![make_storable_wmi("l1", 400)]),
+            ],
+            ..Default::default()
+        };
+
+        let batches = drain_all_conversations(&hs, skip_noise_chat);
+
+        let ids: Vec<&str> = batches.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, ["a@s.whatsapp.net", "120363000000000001@g.us", "100000000000001@lid"]);
+        assert_eq!(batch_ids(&batches[0].batch), ["m1", "m2", "m3"], "only storable messages, chunk order");
+        assert_eq!(batch_ids(&batches[1].batch), ["g1"]);
+        assert_eq!(batch_ids(&batches[2].batch), ["l1"], "an @lid id is returned as the phone sent it");
+    }
+
+    #[test]
+    fn test_drain_all_conversations_carries_pn_jid_when_present_and_non_empty() {
+        let mut with_pn = make_conv("100000000000001@lid", vec![make_storable_wmi("a1", 10)]);
+        with_pn.pn_jid = Some("15551234567@s.whatsapp.net".to_owned());
+        let mut empty_pn = make_conv("100000000000002@lid", vec![make_storable_wmi("b1", 10)]);
+        empty_pn.pn_jid = Some(String::new());
+        let without_pn = make_conv("100000000000003@lid", vec![make_storable_wmi("c1", 10)]);
+        let hs = wa::HistorySync { conversations: vec![with_pn, empty_pn, without_pn], ..Default::default() };
+
+        let batches = drain_all_conversations(&hs, skip_noise_chat);
+
+        let pns: Vec<Option<&str>> = batches.iter().map(|b| b.pn_jid.as_deref()).collect();
+        assert_eq!(pns, [Some("15551234567@s.whatsapp.net"), None, None]);
+    }
+
+    #[test]
+    fn test_drain_all_conversations_carries_more_remain_from_each_conversation() {
+        let mut more = make_conv("more@s.whatsapp.net", vec![make_storable_wmi("m1", 10)]);
+        more.end_of_history_transfer_type = Some(0);
+        let mut done = make_conv("done@s.whatsapp.net", vec![make_storable_wmi("d1", 10)]);
+        done.end_of_history_transfer_type = Some(1);
+        let hs = wa::HistorySync { conversations: vec![more, done], progress: Some(40), ..Default::default() };
+
+        let batches = drain_all_conversations(&hs, skip_noise_chat);
+
+        assert_eq!(batches.len(), 2);
+        assert!(batches[0].batch.more_remain, "type 0: more remain on the phone");
+        assert!(!batches[1].batch.more_remain, "type 1: the chat is complete");
+        assert_eq!(batches[0].batch.progress, Some(40));
+    }
+
+    #[test]
+    fn test_drain_all_conversations_empty_chunk_gives_nothing() {
+        assert!(drain_all_conversations(&wa::HistorySync::default(), skip_noise_chat).is_empty());
+        let only_noise = wa::HistorySync {
+            conversations: vec![make_conv("status@broadcast", vec![make_storable_wmi("st1", 100)])],
+            ..Default::default()
+        };
+        assert!(drain_all_conversations(&only_noise, skip_noise_chat).is_empty());
     }
 
     // --- oldest_stored_anchor: stored row → scaled anchor ---

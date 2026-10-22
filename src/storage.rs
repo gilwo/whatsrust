@@ -971,6 +971,20 @@ pub struct OldestMessageRow {
     pub timestamp_secs: i64,
 }
 
+/// What a media message says about its bytes: one row of `media_refs` (ADR 0005). Enough for a
+/// later on-demand download; the bytes themselves are not stored, so `hydrated_path` stays NULL.
+/// Numbers are `i64` (SQLite integers); `file_length` is the decrypted file's size in bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaRefRow {
+    pub media_key: Option<Vec<u8>>,
+    pub direct_path: Option<String>,
+    pub file_enc_sha256: Option<Vec<u8>>,
+    pub mimetype: Option<String>,
+    pub file_length: Option<i64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+}
+
 /// Statistics from a prune operation.
 #[derive(Debug, Clone)]
 pub struct PruneStats {
@@ -1322,7 +1336,8 @@ impl Store {
     /// Duplicates (by message_id) are silently ignored (INSERT OR IGNORE).
     ///
     /// `timestamp_secs` is Unix seconds — consistent with the `messages.timestamp` column.
-    /// `source` distinguishes live inbound messages (`"live"`) from backfilled ones (`"backfill"`).
+    /// `source` distinguishes live inbound messages (`"live"`) from backfilled ones (`"backfill"`)
+    /// and from those of the history package the phone sends at pairing (`"bootstrap"`, ADR 0048).
     /// `embed_status` is the write-time ADR 0016 classification (`"pending"` if
     /// `InboundContent::embeddable_text()` was `Some`, else `"skipped"`) — callers derive it from
     /// the `InboundContent` they have in hand (this fn only sees `content_kind`/`body_text`, not
@@ -1340,6 +1355,29 @@ impl Store {
         source: &str,
         embed_status: &str,
     ) -> Result<()> {
+        self.insert_message_if_new(
+            chat_jid, sender_jid, message_id, content_kind, body_text, timestamp_secs, from_me, source, embed_status,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// [`insert_message`](Self::insert_message) that reports whether it wrote a row: `Ok(true)`
+    /// for a new message, `Ok(false)` when `message_id` was already stored (the existing row is
+    /// kept untouched). Lets a caller count stored versus duplicate messages.
+    #[allow(clippy::too_many_arguments)] // the same columns as `insert_message`
+    pub async fn insert_message_if_new(
+        &self,
+        chat_jid: &str,
+        sender_jid: &str,
+        message_id: &str,
+        content_kind: &str,
+        body_text: Option<&str>,
+        timestamp_secs: i64,
+        from_me: bool,
+        source: &str,
+        embed_status: &str,
+    ) -> Result<bool> {
         let cj = chat_jid.to_owned();
         let sj = sender_jid.to_owned();
         let mid = message_id.to_owned();
@@ -1350,13 +1388,14 @@ impl Store {
         let from_me_i = if from_me { 1i64 } else { 0i64 };
         let created = now_secs();
         self.run(move |c| {
-            c.execute(
-                "INSERT OR IGNORE INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![cj, sj, mid, ck, bt, timestamp_secs, created, from_me_i, src, es],
-            )
-            .map_err(db_err)?;
-            Ok(())
+            let changed = c
+                .execute(
+                    "INSERT OR IGNORE INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![cj, sj, mid, ck, bt, timestamp_secs, created, from_me_i, src, es],
+                )
+                .map_err(db_err)?;
+            Ok(changed > 0)
         })
         .await
     }
@@ -1378,6 +1417,25 @@ impl Store {
         embed_status: &str,
     ) -> Result<()> {
         self.insert_message(chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, false, "live", embed_status).await
+    }
+
+    /// Store the media reference of message `message_id` (ADR 0005, `media_refs`). `Ok(true)` for
+    /// a new row, `Ok(false)` when the message already has one (the existing row is kept).
+    pub async fn insert_media_ref(&self, message_id: &str, media: &MediaRefRow) -> Result<bool> {
+        let mid = message_id.to_owned();
+        let m = media.clone();
+        self.run(move |c| {
+            let changed = c
+                .execute(
+                    "INSERT OR IGNORE INTO media_refs
+                        (message_id, media_key, direct_path, file_enc_sha256, mimetype, file_length, width, height)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![mid, m.media_key, m.direct_path, m.file_enc_sha256, m.mimetype, m.file_length, m.width, m.height],
+                )
+                .map_err(db_err)?;
+            Ok(changed > 0)
+        })
+        .await
     }
 
     /// Return the oldest stored message for a chat (by timestamp ASC), or None if no messages exist.
@@ -1789,31 +1847,43 @@ impl Store {
         .await
     }
 
-    /// Delete all inbound messages for a chat (e.g. when the chat is deleted).
+    /// Delete all inbound messages for a chat (e.g. when the chat is deleted), and their media
+    /// references.
     pub async fn delete_inbound_chat(&self, chat_jid: &str) -> Result<u32> {
         let jid = chat_jid.to_owned();
         self.run(move |c| {
-            let n = c
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            tx.execute(
+                "DELETE FROM media_refs WHERE message_id IN (SELECT message_id FROM messages WHERE chat_jid = ?1)",
+                params![jid],
+            )
+            .map_err(db_err)?;
+            let n = tx
                 .execute(
                     "DELETE FROM messages WHERE chat_jid = ?1",
                     params![jid],
                 )
                 .map_err(db_err)? as u32;
+            tx.commit().map_err(db_err)?;
             Ok(n)
         })
         .await
     }
 
-    /// Delete a single inbound message by its message ID.
+    /// Delete a single inbound message by its message ID, and its media reference.
     pub async fn delete_inbound_message(&self, message_id: &str) -> Result<u32> {
         let mid = message_id.to_owned();
         self.run(move |c| {
-            let n = c
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            tx.execute("DELETE FROM media_refs WHERE message_id = ?1", params![mid])
+                .map_err(db_err)?;
+            let n = tx
                 .execute(
                     "DELETE FROM messages WHERE message_id = ?1",
                     params![mid],
                 )
                 .map_err(db_err)? as u32;
+            tx.commit().map_err(db_err)?;
             Ok(n)
         })
         .await
@@ -5201,6 +5271,71 @@ mod tests {
         assert_eq!(row.message_id, "live-msg-1");
         assert!(!row.from_me, "insert_inbound must write from_me=false");
         assert_eq!(row.timestamp_secs, 500);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn media_ref_count(dir: &PathBuf) -> i64 {
+        let conn = rusqlite::Connection::open(dir.join("wa.db")).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM media_refs", [], |r| r.get(0)).unwrap()
+    }
+
+    fn sample_media_ref() -> MediaRefRow {
+        MediaRefRow {
+            media_key: Some(vec![1, 2, 3]),
+            direct_path: Some("/v/t62/x".to_owned()),
+            file_enc_sha256: Some(vec![4, 5]),
+            mimetype: Some("image/jpeg".to_owned()),
+            file_length: Some(1234),
+            width: Some(10),
+            height: Some(20),
+        }
+    }
+
+    /// (b2a-6) insert_media_ref: writes every column, leaves hydrated_path NULL, keeps the first
+    /// row for a message id.
+    #[tokio::test]
+    async fn test_insert_media_ref_roundtrip_and_insert_or_ignore() {
+        let (store, dir) = open_b2a_store("media-ref");
+
+        assert!(store.insert_media_ref("img-1", &sample_media_ref()).await.unwrap(), "a new row");
+        let other = MediaRefRow { direct_path: Some("/v/t62/other".to_owned()), ..sample_media_ref() };
+        assert!(!store.insert_media_ref("img-1", &other).await.unwrap(), "a second row for the same message is ignored");
+        assert!(store.insert_media_ref("img-2", &MediaRefRow::default()).await.unwrap(), "all-NULL refs are allowed");
+
+        let conn = rusqlite::Connection::open(dir.join("wa.db")).unwrap();
+        let (key, path, sha, mime, len, w, h, hydrated): (Vec<u8>, String, Vec<u8>, String, i64, i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT media_key, direct_path, file_enc_sha256, mimetype, file_length, width, height, hydrated_path
+                 FROM media_refs WHERE message_id = 'img-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+            )
+            .unwrap();
+        assert_eq!((key, path.as_str(), sha, mime.as_str(), len, w, h), (vec![1, 2, 3], "/v/t62/x", vec![4, 5], "image/jpeg", 1234, 10, 20));
+        assert_eq!(hydrated, None);
+        assert_eq!(media_ref_count(&dir), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b2a-7) Deleting a message or a chat removes its media references with it.
+    #[tokio::test]
+    async fn test_deleting_messages_removes_their_media_refs() {
+        let (store, dir) = open_b2a_store("media-ref-delete");
+        for (chat, id) in [("a@s.whatsapp.net", "m1"), ("a@s.whatsapp.net", "m2"), ("b@s.whatsapp.net", "m3")] {
+            store.insert_message(chat, "s@s.whatsapp.net", id, "image", Some("[image 1B]"), 1000, false, "bootstrap", "skipped").await.unwrap();
+            store.insert_media_ref(id, &sample_media_ref()).await.unwrap();
+        }
+        assert_eq!(media_ref_count(&dir), 3);
+
+        assert_eq!(store.delete_inbound_message("m1").await.unwrap(), 1);
+        assert_eq!(media_ref_count(&dir), 2);
+
+        assert_eq!(store.delete_inbound_chat("a@s.whatsapp.net").await.unwrap(), 1);
+        assert_eq!(media_ref_count(&dir), 1, "only the other chat's reference is left");
+        assert_eq!(store.delete_inbound_chat("b@s.whatsapp.net").await.unwrap(), 1);
+        assert_eq!(media_ref_count(&dir), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
