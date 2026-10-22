@@ -109,6 +109,9 @@ Mechanism: edit `Cargo.toml` to point the 6 wa-rs crates at `oxidezap/whatsapp-r
 - **Anchor-based backward pagination.** `HistorySyncOnDemandRequest` takes an anchor
   (`oldest_msg_id`, `oldest_msg_from_me`, `oldest_msg_timestamp_ms`) + `on_demand_msg_count`
   → returns messages older than the anchor. Each batch's new oldest message becomes the next anchor.
+  *(Amended 2026-10-22: the anchor must be a real message key; the phone ignores an empty or
+  timestamp-only anchor. Where the first anchor comes from, and the 180 s wait: ADR 0003
+  amendments and ADR 0048.)*
 - **Single contiguous backward frontier per chat.** We only ever fetch *older than the current oldest contiguous anchor* → no mid-history gaps, no arbitrary windows.
 
 **Target model (contained-C, ADR 0033):** Single `target` kind per request (clean discriminator, NOT ambiguous composition):

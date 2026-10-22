@@ -213,8 +213,8 @@ starts or lands; re-rank with the owner.
 | P1 | Dev run profiles (`runs/<profile>/`) | S | F9 | protects the main DB while experimenting | 🟢 done (f953948); 👤 move root state into `runs/main/` |
 | P1 | Stdio `initialize`: answer 2025-11-25/2025-06-18 and add instructions | S | F3 known nit | stdio is the main local path and still advertises 2024-11-05, which predates tool annotations | 🟢 done (858de51) |
 | P1 | fetch-history: fail fast without an anchor; re-seed empty cursors | S | live run 2026-10-20 | the phone ignores an empty anchor, so the job hung 60 s and the chat stayed stuck | 🟢 done (e140361) |
-| P1 | fetch-history: seed anchors from archive/read-state syncs; 180 s wait for a sleeping phone | S | live tests 2026-10-21 | the phone rejects anchor-free requests; a sleeping phone answered after the 60 s wait | 🟢 done (ec3691f) |
-| P1 | fetch-history: store the pairing history and late on-demand answers | M | live tests 2026-10-21 | fresh profiles had no anchors; late answers were dropped | 🟢 done (eed8e19) |
+| P1 | fetch-history: seed anchors from archive/read-state syncs; 180 s wait for a sleeping phone | S | live tests 2026-10-21 | the phone rejects anchor-free requests; a sleeping phone answered after the 60 s wait | 🟢 done (ec3691f); 👤 live check of archive seeding open |
+| P1 | fetch-history: store the pairing history and late on-demand answers | M | live tests 2026-10-21 | fresh profiles had no anchors; late answers were dropped | 🟢 done (eed8e19); live-verified 2026-10-22 |
 | P1 | On-demand media download for stored history (REST/CLI/MCP, from media_refs; best-effort, CDN links expire) | M | ADR 0005 | history rows keep media refs but no bytes | ⚪ |
 | P1 | Rate limiting for network-touching reads (`groups`, `group_info` cache misses) and chat-management via MCP | M | follow-up above | an LLM loop can hammer WhatsApp; anti-ban is a core promise | ⚪ |
 | P1 | wa-rs upgrade check | M | Q-WARS | pin is from 2026-07-01 and upstream has moved | ⚪ |
@@ -227,7 +227,8 @@ starts or lands; re-rank with the owner.
 | P2 | `/api/contact` produces `TEL:++…` | S | follow-up above | wrong vCard phone format | ⚪ |
 | P2 | One parser for boolean env vars | S | follow-up above | `yes` works for some flags only | ⚪ |
 | P2 | Flaky `test_drain_worker_max_batch_clamp` → paused clock | S | follow-up above | load-dependent test failure | ⚪ |
-| P2 | Richer read tools (names, counts, contacts, groups, search pagination) | L | F7 | user value; viable item by item | ⚪ |
+| P2 | Richer read tools (names, counts, contacts, groups, search pagination) | L | F7 | user value; viable item by item; owner asked 2026-10-22 for sender information on historical messages (F7 item 1) | ⚪ |
+| P2 | `@lid` DM split: re-key pairing-package DM rows stored under `@lid` once the LID mapping is known | M | F1 follow-up | one DM landed under `@lid` on the 2026-10-22 re-pair, so its history and live messages can split | ⚪ |
 | P3 | fail2ban helper script | S | Q-F2B | only for direct exposure; the proxy recipe covers most setups | ⚪ |
 | P3 | `whatsrust_send_async` MCP tool | S | follow-up above | only if an agent needs scheduling or link previews | ⚪ |
 | P3 | Two-token rotation for the MCP listener | M | F3 follow-up | needs a restart today; low frequency | ⚪ |
