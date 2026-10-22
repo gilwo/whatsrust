@@ -584,8 +584,9 @@ the row counts below are an example):
      same linked device.
    - `scripts/run-profile.sh cli dev history 15551234567 20` returns 0 messages (the local history is empty).
    - `scripts/run-profile.sh cli dev fetch-history 15551234567 all` fails with HTTP 409 and `"code": "no_anchor"` and queues
-     no job: the cursor and the stored messages that served as the starting point are gone. It works again once a message
-     arrives in that chat (or you send one from the phone), which becomes the new anchor (§4).
+     no job: the cursor and the stored messages that served as the starting point are gone. It works again once you
+     archive and then unarchive the chat on the phone, or a message arrives in that chat (or you send one from the
+     phone), which becomes the new anchor (§4).
 6. Restore, if you want the old data back: stop the daemon, then run the two commands the report printed (copy the backup
    over `whatsapp.db`, delete `whatsapp.db-wal` and `whatsapp.db-shm`) and start the daemon. The backup is a normal
    file in `runs/dev/`: delete it when you no longer need it (it holds all messages and the session keys; keep it private).
@@ -717,9 +718,15 @@ JID format (from the daemon's own `--help`): a bare phone number
 backwards from a known message, so the chat must have at least one stored
 message. Without one, the call fails with HTTP 409 and `"code": "no_anchor"`
 (the CLI prints that body and exits 1; the MCP tool returns `isError: true`), and
-no job is queued. To fix it, receive a message in the chat, or send one **from
-the phone**, then retry. Messages sent through whatsrust are not stored, so they
-do not count.
+no job is queued. To fix it, **archive and then unarchive the chat on the phone**
+(the other side sees nothing; the phone's sync tells the daemon the chat's last
+message, which becomes the starting point, so the daemon must be running and
+connected when you do it), or receive a message in the chat, or send one **from the phone**, then
+retry. Messages sent through whatsrust are not stored, so they do not count.
+
+If a fetch fails with "the phone did not answer within 180 s; it may be asleep or
+offline", the phone did not answer in time: a sleeping phone can take minutes to
+receive the request. Open WhatsApp on the phone, then retry.
 
 **Verification:** `whatsrust <cmd> ... ` prints a JSON object to stdout and
 exits non-zero on failure (`{"ok": false, ...}` or an HTTP error status).
