@@ -647,6 +647,11 @@ cursors all stay in `whatsapp.db` (ADR 0043).
   (for example `[image 12.1KB]`), and the file's reference is kept in
   `media_refs` for a later on-demand download (not built yet). To turn the
   storing off, set `WHATSRUST_STORE_PAIRING_HISTORY=false` before pairing.
+- **Known issue (2026-10-22, open):** after a logout and re-pair, the new device's app-state sync looks broken.
+  The log says "Push name is empty" on every start, presence is not sent, and archive or read-state changes made
+  on the phone never reach the daemon, so archive seeding (§4) does not work. The likely cause is that the logout
+  keeps the old device's app-state data. Until it is fixed, a pairing from an empty DB avoids it: stop the daemon,
+  move `whatsapp.db*` aside, start, and scan the QR code. Message history then starts empty.
 - Older history stays local; fetch more on demand with `fetch-history` (§4).
 - It's a new device identity to WhatsApp, so contacts' encryption sessions
   are set up again, and anything still in the outbound queue at the moment of
