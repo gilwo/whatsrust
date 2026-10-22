@@ -324,7 +324,7 @@ impl McpRegistry {
                     },"required":["q"]}),
                     ToolAnnotations::READ_LOCAL, RestMapping::get("/api/search", search_query)),
                 McpToolMeta::write("whatsrust_fetch_history",
-                    "Trigger a per-chat historical backfill. Runs as a paced background job (anti-ban) and is daemon-clamped (cooldown, queue-depth, max-messages); poll whatsrust_fetch_status for progress. The chat needs at least one stored message to start from; otherwise the call returns no_anchor.",
+                    "Trigger a per-chat historical backfill. Runs as a paced background job (anti-ban) and is daemon-clamped (cooldown, queue-depth, max-messages); poll whatsrust_fetch_status for progress. The chat needs a starting point (a stored message, or an archive and unarchive of the chat on the phone); otherwise the call returns no_anchor with guidance.",
                     json!({"type":"object","properties":{
                         "chat_jid":{"type":"string","description":"Chat JID to backfill"},
                         "mode":{"type":"string","description":"all | since | count; default all"},

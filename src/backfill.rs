@@ -720,7 +720,7 @@ pub fn drain_history_sync(hs: &wa::HistorySync, accepted_ids: &[String]) -> Hist
 
 /// Why a fetch cannot start, and what to do about it. Shared by the REST `409 no_anchor`
 /// body and the worker's `no_anchor:` failure reason so the two never drift apart.
-pub const NO_ANCHOR_GUIDANCE: &str = "no stored message in this chat to start from: WhatsApp pages history backwards from a known message. Receive a message in the chat, or send one from the phone (messages sent through whatsrust are not stored), then retry.";
+pub const NO_ANCHOR_GUIDANCE: &str = "no stored message in this chat to start from: WhatsApp pages history backwards from a known message. Archive and then unarchive the chat on the phone (the other side sees nothing), or receive a message in it, or send one from the phone (messages sent through whatsrust are not stored), then retry.";
 
 /// Where a fetch starts, and which source supplied it (ADR 0003).
 ///

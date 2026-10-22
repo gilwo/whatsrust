@@ -3710,6 +3710,7 @@ async fn handle_event(
         Event::ArchiveUpdate(update) => {
             let action = if update.action.archived == Some(true) { "archive" } else { "unarchive" };
             log_message_range(action, &update.jid, update.action.message_range.as_ref(), update.from_full_sync);
+            seed_anchor_from_message_range(store, &update.jid, update.action.message_range.as_ref(), action).await;
         }
         Event::StarUpdate(_) => {
             debug!("message star state changed");
@@ -3717,6 +3718,7 @@ async fn handle_event(
         Event::MarkChatAsReadUpdate(update) => {
             let action = if update.action.read == Some(true) { "mark_read" } else { "mark_unread" };
             log_message_range(action, &update.jid, update.action.message_range.as_ref(), update.from_full_sync);
+            seed_anchor_from_message_range(store, &update.jid, update.action.message_range.as_ref(), action).await;
         }
         Event::HistorySync(lazy) => {
             // Copy the session-id to an owned String before moving `lazy` into fulfill,
@@ -3769,7 +3771,8 @@ async fn handle_event(
 /// Log what an archive or read-state sync says about the chat's last messages.
 /// The phone fills `messageRange` with the chat's last message key (seen 2026-10-21 on an
 /// archive/unarchive), so such a key can anchor a history fetch for a chat that has no
-/// stored message. Logs counts and timestamps only, never message ids or text.
+/// stored message: `seed_anchor_from_message_range` (called right after this) does that.
+/// Logs counts and timestamps only, never message ids or text.
 fn log_message_range(
     action: &str,
     jid: &Jid,
@@ -3789,6 +3792,108 @@ fn log_message_range(
         newest_key_ts = messages.iter().filter_map(|m| m.timestamp).max(),
         "chat state synced",
     );
+}
+
+/// A chat's last message as an archive or read-state sync reports it: what a history fetch
+/// needs as its anchor.
+#[derive(Debug, PartialEq, Eq)]
+struct RangeAnchor<'a> {
+    id: &'a str,
+    from_me: bool,
+    /// Unix seconds, the proto's unit (the cursor stores milliseconds).
+    timestamp_secs: i64,
+}
+
+/// The newest message of a sync action's range that can anchor a fetch: a key with a
+/// non-empty id and a positive timestamp. Entries without either are skipped. On equal
+/// timestamps the first one wins.
+fn newest_anchor_in_range(
+    range: Option<&wa::sync_action_value::SyncActionMessageRange>,
+) -> Option<RangeAnchor<'_>> {
+    range?
+        .messages
+        .iter()
+        .filter_map(|m| {
+            let key = m.key.as_ref()?;
+            let id = key.id.as_deref().filter(|id| !id.is_empty())?;
+            let timestamp_secs = m.timestamp.filter(|&ts| ts > 0)?;
+            Some(RangeAnchor { id, from_me: key.from_me.unwrap_or(false), timestamp_secs })
+        })
+        .reduce(|best, next| if next.timestamp_secs > best.timestamp_secs { next } else { best })
+}
+
+/// Seed the fetch anchor of a chat that has none from an archive or read-state sync.
+///
+/// The phone ignores a history request without a real message key, so a chat with no stored
+/// message could not be fetched at all. Such a sync carries the chat's last message key, which
+/// is enough: it becomes the cursor's anchor ("older than this message"). Best-effort: any
+/// error is logged as a WARN and never fails event handling.
+///
+/// The chat is keyed like live inbound messages (`resolve_chat_jid`: an `@lid` DM becomes the
+/// phone JID when the mapping is known; groups and phone JIDs pass through), so the cursor
+/// lands under the JID the chat's messages are stored under. Nothing is written unless the
+/// chat has no usable anchor; see `seed_cursor_if_no_anchor`.
+async fn seed_anchor_from_message_range(
+    store: &Store,
+    jid: &Jid,
+    range: Option<&wa::sync_action_value::SyncActionMessageRange>,
+    action: &str,
+) {
+    let Some(anchor) = newest_anchor_in_range(range) else {
+        return;
+    };
+    let chat_jid = resolve_chat_jid(&jid.to_string(), None, store).await;
+    match seed_cursor_if_no_anchor(store, &chat_jid, &anchor).await {
+        Ok(true) => info!(
+            %chat_jid,
+            action,
+            anchor_ts_ms = anchor.timestamp_secs.saturating_mul(1000),
+            "seeded the fetch anchor from a chat state sync",
+        ),
+        Ok(false) => {}
+        Err(e) => warn!(
+            %chat_jid,
+            action,
+            error = %format!("{e:#}"),
+            "could not seed the fetch anchor from a chat state sync",
+        ),
+    }
+}
+
+/// Write `anchor` as the cursor of `chat_jid` only if the chat has no way to start a fetch:
+/// the cursor is not exhausted, has no usable anchor, and the chat has no stored message
+/// (`resolve_anchor` finds `NoAnchor`). Returns whether it wrote. A usable cursor, a stored
+/// message or an exhausted chat is never touched.
+async fn seed_cursor_if_no_anchor(
+    store: &Store,
+    chat_jid: &str,
+    anchor: &RangeAnchor<'_>,
+) -> Result<bool> {
+    use crate::backfill::{resolve_anchor, AnchorResolution};
+
+    let cursor = store
+        .get_backfill_cursor(chat_jid)
+        .await
+        .context("get_backfill_cursor failed")?;
+    if cursor.as_ref().is_some_and(|c| c.exhausted) {
+        return Ok(false);
+    }
+    if resolve_anchor(store, chat_jid, cursor.as_ref()).await? != AnchorResolution::NoAnchor {
+        return Ok(false);
+    }
+    store
+        .upsert_backfill_cursor(
+            chat_jid,
+            Some(anchor.id),
+            Some(anchor.from_me),
+            Some(anchor.timestamp_secs.saturating_mul(1000)),
+            true,
+            false,
+            None,
+        )
+        .await
+        .context("upsert_backfill_cursor failed")?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -4849,6 +4954,19 @@ fn rand_jitter_ms(base_ms: u64) -> u64 {
 // LiveHistorySource — real WhatsApp history fetch (Wave B2b)
 // ---------------------------------------------------------------------------
 
+/// How long a history fetch waits for the phone's answer. A phone that is asleep can receive
+/// the request minutes late (seen 2026-10-21: its receipt came 2.5 min after the request),
+/// while an awake one answers in about a second. A late answer after this wait is dropped.
+const HISTORY_FETCH_WAIT: Duration = Duration::from_secs(180);
+
+/// The error for a fetch the phone did not answer within `HISTORY_FETCH_WAIT`.
+fn history_fetch_timeout_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "LiveHistorySource: the phone did not answer within {} s; it may be asleep or offline: open WhatsApp on the phone, then retry",
+        HISTORY_FETCH_WAIT.as_secs()
+    )
+}
+
 /// Real `HistorySource` impl: issues `client.fetch_message_history`, registers a
 /// correlator entry, awaits the matching `Event::HistorySync`, then drains the batch.
 pub(crate) struct LiveHistorySource {
@@ -4898,9 +5016,9 @@ impl crate::backfill::HistorySource for LiveHistorySource {
         // seconds-scale latency; ADR 0026 single-flight.
         let rx = self.correlator.register(sid);
 
-        let lazy = tokio::time::timeout(std::time::Duration::from_secs(60), rx)
+        let lazy = tokio::time::timeout(HISTORY_FETCH_WAIT, rx)
             .await
-            .map_err(|_| anyhow::anyhow!("LiveHistorySource: history fetch timed out after 60s"))?
+            .map_err(|_| history_fetch_timeout_error())?
             .map_err(|_| anyhow::anyhow!("LiveHistorySource: correlator sender dropped"))?;
 
         let hs = lazy
@@ -6999,5 +7117,270 @@ mod tests {
             semantic_query_timeout: Duration::from_secs(20),
             semantic_cooldown: Arc::new(crate::embed_drain::SemanticCooldown::new()),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Anchor seeding from archive / read-state syncs, and the fetch wait
+    // -----------------------------------------------------------------------
+
+    type SyncRange = wa::sync_action_value::SyncActionMessageRange;
+    type SyncMessage = wa::sync_action_value::SyncActionMessage;
+
+    /// A range entry with a key. `id`/`ts_secs` of `None` model a sync that omits them.
+    fn sync_msg(id: Option<&str>, from_me: Option<bool>, ts_secs: Option<i64>) -> SyncMessage {
+        SyncMessage {
+            key: Some(wa::MessageKey {
+                id: id.map(str::to_owned),
+                from_me,
+                ..Default::default()
+            }),
+            timestamp: ts_secs,
+        }
+    }
+
+    fn sync_range(messages: Vec<SyncMessage>) -> SyncRange {
+        SyncRange { messages, ..Default::default() }
+    }
+
+    fn jid(s: &str) -> Jid {
+        Jid::from_str(s).unwrap()
+    }
+
+    fn open_seed_store(name: &str) -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("test_anchor_seed_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::new(&dir.join("wa.db")).expect("test DB");
+        (store, dir)
+    }
+
+    #[test]
+    fn test_newest_anchor_in_range_newest_key_wins() {
+        let range = sync_range(vec![
+            sync_msg(Some("OLDER"), Some(false), Some(1_000)),
+            sync_msg(Some("NEWEST"), Some(true), Some(3_000)),
+            sync_msg(Some("MIDDLE"), Some(false), Some(2_000)),
+        ]);
+        assert_eq!(
+            newest_anchor_in_range(Some(&range)),
+            Some(RangeAnchor { id: "NEWEST", from_me: true, timestamp_secs: 3_000 }),
+        );
+    }
+
+    #[test]
+    fn test_newest_anchor_in_range_skips_entries_that_cannot_anchor() {
+        let range = sync_range(vec![
+            // Newer than the usable entry, but each lacks something a fetch needs.
+            sync_msg(None, Some(false), Some(9_000)),
+            sync_msg(Some(""), Some(false), Some(9_100)),
+            sync_msg(Some("NO-TS"), Some(false), None),
+            sync_msg(Some("ZERO-TS"), Some(false), Some(0)),
+            SyncMessage { key: None, timestamp: Some(9_200) },
+            sync_msg(Some("USABLE"), Some(false), Some(1_500)),
+        ]);
+        assert_eq!(
+            newest_anchor_in_range(Some(&range)),
+            Some(RangeAnchor { id: "USABLE", from_me: false, timestamp_secs: 1_500 }),
+        );
+    }
+
+    #[test]
+    fn test_newest_anchor_in_range_nothing_usable_gives_none() {
+        assert_eq!(newest_anchor_in_range(None), None);
+        assert_eq!(newest_anchor_in_range(Some(&sync_range(vec![]))), None);
+        let unusable = sync_range(vec![
+            sync_msg(None, None, Some(5)),
+            sync_msg(Some("NO-TS"), None, None),
+        ]);
+        assert_eq!(newest_anchor_in_range(Some(&unusable)), None);
+    }
+
+    #[test]
+    fn test_newest_anchor_in_range_missing_from_me_is_false_and_ties_keep_the_first() {
+        let range = sync_range(vec![
+            sync_msg(Some("FIRST"), None, Some(2_000)),
+            sync_msg(Some("SECOND"), Some(true), Some(2_000)),
+        ]);
+        assert_eq!(
+            newest_anchor_in_range(Some(&range)),
+            Some(RangeAnchor { id: "FIRST", from_me: false, timestamp_secs: 2_000 }),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_seed_anchor_no_cursor_no_message_is_seeded() {
+        let (store, dir) = open_seed_store("fresh");
+        let chat = "15551234567@s.whatsapp.net";
+        let range = sync_range(vec![sync_msg(Some("LAST1"), Some(true), Some(1_792_568_908))]);
+
+        seed_anchor_from_message_range(&store, &jid(chat), Some(&range), "archive").await;
+
+        let cursor = store.get_backfill_cursor(chat).await.unwrap().expect("cursor seeded");
+        assert_eq!(cursor.oldest_msg_id.as_deref(), Some("LAST1"));
+        assert_eq!(cursor.oldest_msg_from_me, Some(true));
+        assert_eq!(cursor.oldest_msg_timestamp_ms, Some(1_792_568_908_000), "seconds become ms");
+        assert!(cursor.more_remain);
+        assert!(!cursor.exhausted);
+        assert_eq!(cursor.last_backfill_at, None, "seeding must not start the cooldown");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_seed_anchor_chat_with_stored_message_is_not_seeded() {
+        let (store, dir) = open_seed_store("stored");
+        let chat = "120363000000000001@g.us";
+        store
+            .insert_inbound(chat, "2@s.whatsapp.net", "STORED1", "text", Some("hi"), 1_700_000_000, "pending")
+            .await
+            .unwrap();
+        let range = sync_range(vec![sync_msg(Some("LAST1"), Some(false), Some(1_792_568_908))]);
+
+        seed_anchor_from_message_range(&store, &jid(chat), Some(&range), "mark_read").await;
+
+        assert!(
+            store.get_backfill_cursor(chat).await.unwrap().is_none(),
+            "a chat with a stored message already has an anchor: no cursor row",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_seed_anchor_usable_cursor_is_unchanged() {
+        let (store, dir) = open_seed_store("usable");
+        let chat = "15551234567@s.whatsapp.net";
+        store
+            .upsert_backfill_cursor(chat, Some("CUR1"), Some(false), Some(5_000_000), false, false, Some(42))
+            .await
+            .unwrap();
+        let before = store.get_backfill_cursor(chat).await.unwrap().unwrap();
+        let range = sync_range(vec![sync_msg(Some("LAST1"), Some(true), Some(1_792_568_908))]);
+
+        seed_anchor_from_message_range(&store, &jid(chat), Some(&range), "unarchive").await;
+
+        let after = store.get_backfill_cursor(chat).await.unwrap().unwrap();
+        assert_eq!(after.oldest_msg_id.as_deref(), Some("CUR1"));
+        assert_eq!(after.oldest_msg_from_me, before.oldest_msg_from_me);
+        assert_eq!(after.oldest_msg_timestamp_ms, Some(5_000_000));
+        assert_eq!(after.more_remain, before.more_remain);
+        assert_eq!(after.exhausted, before.exhausted);
+        assert_eq!(after.last_backfill_at, Some(42));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_seed_anchor_exhausted_cursor_is_unchanged() {
+        let (store, dir) = open_seed_store("exhausted");
+        let chat = "15551234567@s.whatsapp.net";
+        // Exhausted and without an anchor: the strictest case, nothing else stops a seed.
+        store
+            .upsert_backfill_cursor(chat, None, None, None, false, true, Some(42))
+            .await
+            .unwrap();
+        let range = sync_range(vec![sync_msg(Some("LAST1"), Some(true), Some(1_792_568_908))]);
+
+        seed_anchor_from_message_range(&store, &jid(chat), Some(&range), "archive").await;
+
+        let after = store.get_backfill_cursor(chat).await.unwrap().unwrap();
+        assert!(after.exhausted);
+        assert!(!after.more_remain);
+        assert_eq!(after.oldest_msg_id, None);
+        assert_eq!(after.oldest_msg_timestamp_ms, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_seed_anchor_empty_placeholder_cursor_is_seeded() {
+        let (store, dir) = open_seed_store("placeholder");
+        let chat = "15551234567@s.whatsapp.net";
+        // The row older versions left for an empty chat: '' id, NULL timestamp.
+        store
+            .upsert_backfill_cursor(chat, Some(""), None, None, true, false, None)
+            .await
+            .unwrap();
+        let range = sync_range(vec![sync_msg(Some("LAST1"), Some(false), Some(1_792_568_908))]);
+
+        seed_anchor_from_message_range(&store, &jid(chat), Some(&range), "archive").await;
+
+        let cursor = store.get_backfill_cursor(chat).await.unwrap().unwrap();
+        assert_eq!(cursor.oldest_msg_id.as_deref(), Some("LAST1"));
+        assert_eq!(cursor.oldest_msg_from_me, Some(false));
+        assert_eq!(cursor.oldest_msg_timestamp_ms, Some(1_792_568_908_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_seed_anchor_then_resolve_anchor_returns_the_cursor_anchor() {
+        use crate::backfill::{resolve_anchor, Anchor, AnchorResolution};
+        let (store, dir) = open_seed_store("resolves");
+        let chat = "15551234567@s.whatsapp.net";
+        assert_eq!(resolve_anchor(&store, chat, None).await.unwrap(), AnchorResolution::NoAnchor);
+        let range = sync_range(vec![sync_msg(Some("LAST1"), Some(true), Some(1_792_568_908))]);
+
+        seed_anchor_from_message_range(&store, &jid(chat), Some(&range), "mark_read").await;
+
+        let cursor = store.get_backfill_cursor(chat).await.unwrap();
+        assert_eq!(
+            resolve_anchor(&store, chat, cursor.as_ref()).await.unwrap(),
+            AnchorResolution::Cursor(Anchor {
+                oldest_msg_id: "LAST1".to_owned(),
+                oldest_msg_from_me: true,
+                oldest_msg_timestamp_ms: 1_792_568_908_000,
+            }),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_seed_anchor_without_a_usable_key_writes_nothing() {
+        let (store, dir) = open_seed_store("nokey");
+        let chat = "15551234567@s.whatsapp.net";
+        let unusable = sync_range(vec![sync_msg(None, Some(false), Some(1_792_568_908))]);
+
+        seed_anchor_from_message_range(&store, &jid(chat), None, "archive").await;
+        seed_anchor_from_message_range(&store, &jid(chat), Some(&unusable), "archive").await;
+
+        assert!(store.get_backfill_cursor(chat).await.unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_seed_anchor_keys_the_chat_like_live_messages() {
+        use wacore::store::traits::LidPnMappingEntry;
+        let (store, dir) = open_seed_store("keying");
+        let range = sync_range(vec![sync_msg(Some("LAST1"), Some(false), Some(1_792_568_908))]);
+
+        // A DM the phone names by LID, with a known phone mapping: seeded under the phone JID,
+        // the form live inbound messages are stored under (resolve_chat_jid).
+        store
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: "100000000000001".to_owned(),
+                phone_number: "15551234567".to_owned(),
+                created_at: 1,
+                updated_at: 1,
+                learning_source: "test".to_owned(),
+            })
+            .await
+            .unwrap();
+        seed_anchor_from_message_range(&store, &jid("100000000000001@lid"), Some(&range), "archive").await;
+        assert!(store.get_backfill_cursor("15551234567@s.whatsapp.net").await.unwrap().is_some());
+        assert!(store.get_backfill_cursor("100000000000001@lid").await.unwrap().is_none());
+
+        // A LID with no mapping stays as it is, as for live messages.
+        seed_anchor_from_message_range(&store, &jid("100000000000002@lid"), Some(&range), "archive").await;
+        assert!(store.get_backfill_cursor("100000000000002@lid").await.unwrap().is_some());
+
+        // Groups pass through unchanged.
+        seed_anchor_from_message_range(&store, &jid("120363000000000001@g.us"), Some(&range), "archive").await;
+        assert!(store.get_backfill_cursor("120363000000000001@g.us").await.unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_history_fetch_wait_is_180_seconds_and_the_error_says_so() {
+        assert_eq!(HISTORY_FETCH_WAIT, Duration::from_secs(180));
+        assert_eq!(
+            history_fetch_timeout_error().to_string(),
+            "LiveHistorySource: the phone did not answer within 180 s; it may be asleep or offline: open WhatsApp on the phone, then retry",
+        );
     }
 }
