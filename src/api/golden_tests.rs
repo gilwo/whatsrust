@@ -1178,16 +1178,17 @@ fn corpus() -> Vec<Case> {
                 {\"code\":\"bad_request\",\"error\":\"mode 'count' requires a positive target_value\",\"ok\":false}",
         ),
         // No message is stored for 1@g.us on this bridge, so there is nothing to start from.
+        // Changed 2026-10-22 (ADR 0003 amendment): the guidance now also offers archive/unarchive.
         case(
             "fetch_trigger_no_anchor",
             Cfg::Loopback,
             json_post("/api/history-fetch", r#"{"chat_jid":"1@g.us","mode":"all"}"#),
             "HTTP/1.1 409 Conflict\r\n\
                 Content-Type: application/json\r\n\
-                Content-Length: 305\r\n\
+                Content-Length: 382\r\n\
                 Connection: close\r\n\
                 \r\n\
-                {\"chat_jid\":\"1@g.us\",\"code\":\"no_anchor\",\"message\":\"no stored message in this chat to start from: WhatsApp pages history backwards from a known message. Receive a message in the chat, or send one from the phone (messages sent through whatsrust are not stored), then retry.\",\"ok\":false,\"status\":\"no_anchor\"}",
+                {\"chat_jid\":\"1@g.us\",\"code\":\"no_anchor\",\"message\":\"no stored message in this chat to start from: WhatsApp pages history backwards from a known message. Archive and then unarchive the chat on the phone (the other side sees nothing), or receive a message in it, or send one from the phone (messages sent through whatsrust are not stored), then retry.\",\"ok\":false,\"status\":\"no_anchor\"}",
         ),
         case(
             "fetch_cancel_without_job_id",
