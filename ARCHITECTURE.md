@@ -95,7 +95,9 @@ src/
 
 ### Backfill worker (`src/backfill.rs`)
 
-Fetching history is a **two-phase async, on-demand** flow, since WhatsApp doesn't answer history requests synchronously:
+Fetching history is a **two-phase async, on-demand** flow, since WhatsApp doesn't answer history requests synchronously.
+
+Every request starts from an **anchor**: a real message key that the phone pages back from (ADR 0003 and its amendments). `backfill::resolve_anchor` takes the cursor's anchor, else the oldest stored message. The phone ignores a request without a real key, so a chat with neither is refused at once (REST 409 `no_anchor`, and the worker fails fast). Anchors also come from two other places: an archive or read-state sync from the phone, which carries the chat's last message key and seeds the cursor of a chat that has none, and the stored pairing package (below). The worker waits up to 180 s (`HISTORY_FETCH_WAIT`) for the phone, because a sleeping phone can receive the request minutes late. The flow:
 
 1. The worker calls `client.fetch_message_history(...)`, which returns a `session_id` immediately (no messages yet).
 2. The worker registers that `session_id` with `HistoryCorrelator` and awaits a oneshot receiver.
