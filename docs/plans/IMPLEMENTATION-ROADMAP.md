@@ -1,246 +1,141 @@
-# Implementation Roadmap — Historical Fetch + Semantic/Lexical Search
+# whatsrust Roadmap
 
-**Date:** 2026-06-25 (updated 2026-09-30)
-**Status:** **Phase 0 GATE PASSED — GO** (2026-07-01, commit 615d185). **M1 COMPLETE (2026-07-20)** — M1.1/M1.2/M1.3/M1.4 all DONE and the live E2E smoke test passed on a real account (API/CLI/MCP trigger, SSE `backfill` + `storage_alert`, FTS search, cancel→404). **M2 (semantic search) COMPLETE (code-complete 2026-09-30, live-validated 2026-10-05)** — embedder sidecar contract, drain worker, multi-model purge, config-wiring/misbehave tests + observability (2026-09-02), **plus ADR 0041 hybrid recall** (FTS5 ∪ bounded vector scan, replacing rerank-only recall) **and the ADR 0039/0040 bge-m3 rollout** (native Rust/candle sidecar is now the default, serving bge-m3 by default or MiniLM selectably; default `WHATSRUST_SEMANTIC_MIN_SCORE=0.55`, calibrated for bge-m3). Live E2E validated on the real account: English queries found Hebrew messages with no shared words.
-**Design:** `docs/plans/2026-06-17-historical-fetch-semantic-search-design.md` (3 cold reviews, converged, implementation-ready)
-**Why this is a skeleton:** Phase 0 is a hard GO/NO-GO gate (the wa-rs v0.6.0 dependency adoption). We do not write detailed phase/task plans behind an unvalidated gate — a NO-GO or a fallback-triggering result reshapes everything. Only Phase 0 is planned in detail below; M1/M2 phase detail is deferred to their starts.
+**Type:** Live document: what is planned, in what order, and what is done. Update it as work
+advances (see [Keeping it current](#keeping-it-current)).
+**Last updated:** 2026-10-23
 
----
+Where else to look:
+- **Feature detail (breakdown, issues encountered, ADR links):** `docs/plans/FEATURES.md`.
+- **What changed, and when:** `CHANGELOG.md`.
+- **Why (decisions):** `docs/adr/` (start at `0000-index.md`). **Blueprints:** `docs/plans/*-design.md`.
 
-## Shape
+**Status legend:** 🟢 Done · 🟡 In progress or partly done · 🔵 Designed (not started) · ⚪ Planned / open · ⏸️ Deferred · 👤 Owner action
 
-```
-  Phase 0 ── GATE (wa-rs v0.6.0 adopt) ──┬── GO ──► Milestone 1 ──► Milestone 2
-                                   └── NO-GO / fallback ──► pivot (see Phase 0)
-```
+## Contents
 
-- **Phase 0 (gate):** adopt wa-rs upstream v0.6.0 (dependency bump, NOT a rebase — fork has zero custom commits); GO/NO-GO decision. Detailed below — it's the next action.
-- **Milestone 1 (M1):** historical fetch + lexical (FTS5) search. **Ships independently, no sidecar.** A complete, useful feature on its own.
-- **Milestone 2 (M2):** semantic search (embedder sidecar + vectors). Layers onto M1.
+- [Keeping it current](#keeping-it-current)
+- [Feature map](#feature-map)
+- [Priority backlog](#priority-backlog)
+- [Project health (not ranked)](#project-health)
+- [Completed](#completed)
 
-Cross-cutting (NOT separate phases — built into each phase as it's reached): **testing** (fake seams per ADR 0025, alongside each layer), **safety/config** (fail-closed config + pacer + daemon-side guards exist *as* the fetch worker is built, not bolted on after).
+<a id="keeping-it-current"></a>
+## Keeping it current
 
-Tracking: this roadmap = the plan; `FEATURES.md` = live status; the design doc = what/how; ADRs = why. No duplication.
+- **Work starts or lands:** update the Status cell of its backlog row.
+- **A feature's status changes:** update its row in the feature map (and its heading in FEATURES.md).
+- **Work is finished:** move the backlog row to [Completed](#completed) with the date and the commit,
+  and add a line to `CHANGELOG.md`.
+- **New open work:** add one backlog row (each open item lives in one row only; its detail lives in
+  FEATURES.md or the source it names). Re-rank with the owner.
 
----
+<a id="feature-map"></a>
+## Feature map
 
-## Phase 0 — adopt wa-rs upstream v0.6.0 (HARD GO/NO-GO GATE)  [ADR 0002]
+| ID | Feature | Status | In one line |
+|---|---|---|---|
+| [F1](FEATURES.md#f1) | Historical message fetch + search | 🟢 Done; open items | Per-chat history backfill plus local lexical (FTS5) and opt-in semantic search. |
+| [F2](FEATURES.md#f2) | Embedder sidecar | 🟢 Done; follow-ups open | Stateless vectorizer process (Rust/candle; bge-m3 or MiniLM) that feeds semantic search. |
+| [F3](FEATURES.md#f3) | MCP Streamable HTTP transport | 🟢 Done; follow-ups open | Opt-in `/mcp` HTTP listener beside stdio: dual-era, own port and token. |
+| [F4](FEATURES.md#f4) | Multi-account support | ⚪ Planned | Run several WhatsApp accounts from one daemon or from coordinated daemons. |
+| [F5](FEATURES.md#f5) | Access profiles | ⚪ Planned | Read-only and full-access profiles, so an agent can read without sending or changing anything. |
+| [F6](FEATURES.md#f6) | Database encryption at rest | ⚪ Planned | Encrypt `whatsapp.db` and its backups; the passphrase is entered at daemon start. |
+| [F7](FEATURES.md#f7) | Richer read tools | ⚪ Planned | Sender names, counts, contacts, groups and search pagination in the read surfaces. |
+| [F8](FEATURES.md#f8) | Documentation overhaul | 🟡 Started (planning docs + CHANGELOG) | README = the what, an operations guide = the how, ARCHITECTURE with diagrams. |
+| [F9](FEATURES.md#f9) | Dev run profiles | 🟢 Done; owner step open | Each debug run keeps its DB, logs and `.env` in `runs/<profile>/`. |
 
-The entire feature is conditional on this. **No rebase, no fork, no clone** — the `199-biotechnologies` pin has zero custom commits (it's just upstream frozen at v0.2). This is a **dependency bump**: point `Cargo.toml` at upstream and fix the breakage. **Upstream of record = `oxidezap/whatsapp-rust`** (byte-identical to `jlucaso1`; the project's active home). Done on a branch in THIS repo; the result is a normal committed dep change (no `rev` to push anywhere).
+<a id="priority-backlog"></a>
+## Priority backlog
 
-**Steps:**
-1. On a branch, edit `Cargo.toml`: repoint all 6 wa-rs deps to `git = "https://github.com/oxidezap/whatsapp-rust", tag = "v0.6.0"` (drop the `199-biotechnologies` rev). `cargo update`. (Verified: all 6 crates + all 7 requested features exist at v0.6.0.)
-2. Fix the mechanical breakage the spike predicted (~15-20 sites): `Event::Message(Box,_)` → `(Arc,Arc)`, `.on_event` closure → `Fn(Arc<Event>,_)`, exhaustive match (+4 new variants, −JoinedGroup), `HistorySync` → `Box<LazyHistorySync>`.
-3. Resolve the JoinedGroup handler (bridge.rs:2815): move the `group_cache.invalidate` to wherever group-join now surfaces in v0.6, or accept stale-until-refresh. **Verify group_cache on-demand population still works** (review I1).
-
-**GO criteria (ALL must pass — fork R1 hardened):**
-- **G1:** whatsrust compiles **and the 89 existing tests pass** against v0.6.
-- **G2:** history `WebMessageInfo.message` is usable plaintext through the `extract_content_inner` adapter (ADR 0014).
-- **G3:** an ON_DEMAND response is correlatable to its request (or single-flight matching suffices — ADR 0026).
-- **LIVE SMOKE TEST (~15-30 min, real account):** connect → send → receive → **verify group-sender parsing** → one small history fetch. Runtime breakage (decryption, media, JID/LID) is exactly what compile+unit-tests miss.
-
-**Decision checkpoint:**
-- **GO** → write the M1 detailed plan, begin M1.
-- **NO-GO / partial** → pivot (do NOT proceed to M1):
-  - G1 deep-breakage beyond time-box → cherry-pick only the history-sync/PDO commits onto the current pin, **or** defer F1 and pick up audit quick-wins (CI, cargo-deny, etc.).
-  - G2 encrypted → ADR 0014 fallback B (parallel extractor) — re-scope M1 with that cost.
-  - G3 no correlation even single-flight → **F1 not viable on this protocol; STOP and reassess.**
-
-**Exit:** a written GO/NO-GO verdict + (on GO) `Cargo.toml` pointed at upstream and whatsrust green (build + tests + live smoke test).
-
----
-
-### ✅ VERDICT: GO — 2026-07-01 (commit 615d185)
-
-- **Pinned to wa-rs `oxidezap` main HEAD `9e8c70e2`, NOT the v0.6.0 tag.** The tag (pinned first) compiled + passed 150 tests, but live testing showed **1:1 DM sends failed** with the server nack `463 MissingTcToken`. Root cause traced to upstream bug #730/#731, whose fix (`09a3b0c1`) landed **after** the v0.6.0 tag. Scope-analyzed HEAD (+315, incl. #852 bot API / #866 Message boxing / #893 typed errors — all handled; #911 bincode→prost doesn't affect us; #853 history-sync verified F1-safe) and pinned there.
-- **G1 ✅** compile + **150 tests**. **G2 ✅** history `WebMessageInfo` plaintext (bootstrap decoded). **G3 ✅** `peer_data_request_session_id` + `fetch_message_history` intact at HEAD.
-- **Live smoke test ✅** connect / receive / **group send (delivered+read)** / **1:1 send (delivered)** / history bootstrap processed.
-- **DM fix:** the `463` was resolved by **enabling history sync** (delivers trusted-contact tokens) — see **ADR 0037**. `skip_history_sync` default flipped to `false`; opt-out via `WHATSRUST_SKIP_HISTORY_SYNC=1`.
-- **Known limitation (not a blocker):** cold-outreach to non-contacts may still `463` — `nct_salt` (the cstoken path) is WhatsApp-account-gated, not code-fixable.
-- **Deferred to M1:** `MsgSecretStore` currently stubbed no-op (can't decrypt history-delivered edits/reactions/poll-votes).
-
-**Next:** M1 — write its detailed phase/task plan, then begin M1.1 (storage + migration). ⚠️ Fold in the reviews' I-items (esp. removing the prune age-DELETE, review I2).
-
----
-
-## Milestone 1 — Historical fetch + lexical search  (detail deferred to M1 start)
-
-**Goal:** explicitly trigger per-chat historical backfill; backfilled + live messages in one unified timeline; lexical (FTS5) search over it. **No sidecar, no embeddings** — fully usable on its own.
-
-**Phases (detailed in `docs/plans/2026-07-02-M1-detailed-plan.md`):**
-- ✅ **M1.1 Storage + migration — DONE 2026-07-03.** Unified `messages` table via **copy-then-drop** (not rename — SCHEMA-first ordering; ADR 0009 correction), sibling tables (`media_refs`, `embeddings`, `backfill_cursor`, `backfill_jobs`, `metadata`), FTS5 external-content + `'delete'`-command triggers (ADR 0019 correction), staged migration-mode + validation + circuit-breaker (`--rollback`/`--migrate`), FTS5 probe, watchdog baseline seed, single-connection model. [ADR 0009/0019/0027/0028-0032/0036] **prune age-DELETE removed (review I2).** Verified: 168 tests + real-data v7→v8 dry-run (Hebrew/Arabic FTS, pristine-v7 backup).
-- ✅ **M1.2 Fetch worker — DONE 2026-07-03 (live-validated).** `history-source` trait (test seam), durable backfill-job queue, single-worker FIFO pagination loop with 3-level abort, cursor, dedicated pacer, contained-C target model, enqueue-time atomic validation, stuck-anchor guard. [ADR 0003/0010/0020/0026/0033/0035] Safety/config (fail-closed, pacer, queue-depth) built in here, not deferred. Two-phase async on-demand fetch (`HistoryCorrelator`); connection-gating + LID/PN resolution fixes surfaced live; end-to-end verified (count fetch auto-paginated to exhaustion).
-- ✅ **M1.3 Search (lexical) — DONE 2026-07-13.** FTS5 query path; `search_inbound` rewritten (`MATCH` + BM25 `ORDER BY rank` ascending; quote-as-phrase sanitization; single FTS path, EXPLAIN-verified; multilingual + injection-safe). API/MCP shape unchanged. 188 lib / 203 bin green. [ADR 0019]
-- ✅ **M1.4 API/MCP + watchdog — DONE 2026-07-16.** `/api/history-fetch` trigger/status/cancel; MCP tools `whatsrust_fetch_history`/`_status`/`_cancel` (33 total); SSE `BackfillProgress` (fuzzy/precise per target-kind); storage-growth watchdog in the periodic prune tick (PASSIVE checkpoint + 3-file stat, ≥50% → WARN + `BridgeEvent::StorageAlert` + baseline reset); temp `WHATSRUST_BACKFILL_TEST` hook retired. **Live E2E passed 2026-07-20 (real account) — M1 COMPLETE.** [ADR 0011/0034/0013]
-
-**M1 exit criteria (milestone-level):**
-- A user can trigger `all` / `since:T` / `count:N` backfill for a chat/group via API/MCP/CLI and watch SSE progress.
-- Backfilled + live messages are unified, searchable by FTS5 (incl. Hebrew/Arabic), retained indefinitely (no age-pruning).
-- Migration v7→v8 is safe: staged, backed-up, validated, rollback-able (`--rollback`/`--migrate`), circuit-breaker proven.
-- Cancel + graceful-shutdown behave per the 3-level abort model (resume-on-restart for shutdown, terminal for cancel).
-- Tests per ADR 0025 (history-source fake, storage temp-DB) green; manual E2E checklist passes.
-- **Semantic layer absent by design** — `embed_status` column exists and accrues `pending`, but nothing consumes it yet.
-
----
-
-## Milestone 2 — Semantic search  (DONE: code-complete 2026-09-30, incl. ADR 0041 hybrid recall + bge-m3 default; live-validated 2026-10-05)
-
-**Goal:** optional semantic search via the embedder sidecar, layered on M1's stored messages.
-
-**Phases (detailed in `docs/plans/2026-07-23-M2-detailed-plan.md`):**
-- ✅ **M2.1 Embedder sidecar contract & transport — DONE.** `Embedder` trait (`model_info`/`embed`/`health`), `StdioEmbedder` (JSON-RPC stdio client), `FakeEmbedder` test seam, trust-but-verify validation (dim, model_id, timeout). [ADR 0006/0024/0025]
-- ✅ **M2.2 Embeddable-text classification — DONE.** `InboundContent::embeddable_text()` (NL-only, distinct from `display_text()`), write-time classification (`pending`/`skipped`), set-difference drain query (`embed_status='pending'` minus already-embedded). Backlog tolerance: pre-M2 rows remain `pending` with `display_text()` stored; tolerated per ADR 0038 (small single-user backlog, raw captions unrecoverable). [ADR 0016/0017/0038]
-- ✅ **M2.3 Embedding-drain worker — DONE.** Independent task (spawned alongside backfill/prune, before reconnect loop), periodic wake (default 60s), batch sidecar calls (default 64), transport-failure retry (rows stay `pending`); the in-memory 3-attempt-cap → terminal `failed` path is scaffolded but **dormant** (batch protocol can't distinguish content rejection from transport failure — deferred to M2.6.7); pathological-pending circuit-breaker back-pressures **new backfill enqueues** (`EmbedderBacklogFull`) at a ceiling (default 100k), drain itself keeps running. [ADR 0015/0017/0038]
-- ✅ **M2.4 Semantic search path — DONE.** `WhatsAppBridge::search`: embed query → FTS recall (width = max of 200 and limit) → fetch vectors by `(message_id, active_model_id)` → cosine rerank (Rust-side `cosine_similarity()`) → additive lexical fallback (byte-identical to M1 when sidecar absent/down). Superseded by ADR 0041's hybrid recall below as the active search path (kept as the scan-cap-exceeded fallback). [ADR 0007/0008/0017/0018]
-- ✅ **M2.5 Multi-model retention & explicit purge — DONE.** `embeddings` PK `(message_id, model_id)` supports model switch without purge; `Store::purge_embeddings(model_id)` deletes one model's rows + `incremental_vacuum`; surfaces: API `POST /api/embeddings/purge`, MCP `whatsrust_purge_embeddings` (34 tools total), CLI `purge-embeddings <model_id>`. Returns `{model_id, rows_deleted, bytes_reclaimed}`. [ADR 0017]
-- ✅ **MVP sidecar BUILT (2026-08-31).** `scripts/embedder-sidecar.py` (Python + sentence-transformers, `paraphrase-multilingual-MiniLM-L12-v2`, 384-dim, prefix-free, multilingual) + `scripts/run-embedder.sh` convenience wrapper. Superseded as the deployment default by the native Rust sidecar below. [ADR 0039]
-- ✅ **M2.6 Config, integration test, wiring — DONE (2026-09-02).** Embedder knobs plumbed through `.env`/`BridgeConfig` with config tests (override + absent-is-benign); `.env.example` completed (FAILURE_THRESHOLD); fake-embedder misbehave mode + real-subprocess trust-but-verify integration tests (wrong dim/count/model_id rejected over the process boundary, CI-safe); additive `/api/status` embed-status counts (watchdog already covers footprint); stale multi-worker-backfill comments reworded; inert per-row-rejection semantics reconciled in ADR 0015/0038 (path a — cap-3 dormant pending a protocol signal). [ADR 0023/0024/0025]
-- ✅ **Native Rust sidecar + bge-m3 default — DONE (2026-09-30).** `embedder-rs/` (candle, ADR 0040) replaces the Python MVP as the deployment target, serving `--model minilm|bge-m3`; **bge-m3 is now the default for `make run-semantic`** (`EMBED_MODEL ?= bge-m3` in the Makefile), MiniLM stays selectable (`EMBED_MODEL=minilm`). Fixes the cold-cache download bug (hf-hub's redirect-following gap) for both models. [ADR 0039/0040]
-- ✅ **Hybrid recall — DONE (2026-09-30).** `WhatsAppBridge::search` unions FTS5 lexical candidates with a bounded brute-force vector scan of the search scope (skipped above `WHATSRUST_SEMANTIC_SCAN_CAP`, default 50000); lexical matches are always kept, vector-only matches need `cosine ≥ WHATSRUST_SEMANTIC_MIN_SCORE`. Fixes the M2.4 limitation where a word-free query (e.g. an English query matching a Hebrew-only message) returned nothing. Default floor raised to **0.55**, calibrated against the real (read-only) `whatsapp.db` for both models (`make calibrate`); right-sized for bge-m3, conservative (vector-only recall effectively off) for MiniLM. `/api/status` → `embeddings` now reports per-active-model `{model_id, embedded, pending, failed, skipped}`. [ADR 0041]
-  **Live end-to-end validation: done 2026-10-05** on the real account with bge-m3. Searches embedded the query (sidecar CPU per search) and returned vector-only Hebrew matches for English queries; the first search after idle took 2-6 s while weights paged back in. The live runs surfaced the sidecar-client desync and `+`-decoding bugs, both fixed (ADR 0042, `decode_query_component`).
-
-**M2 exit criteria (milestone-level):**
-- ✅ With a sidecar configured, semantic search returns relevant results; without one, search cleanly falls back to M1 lexical (no errors, no blocking). — **Validated live 2026-10-05.**
-- ✅ Drain keeps up under normal backfill (the >100k pathological ceiling is the only coupling); model switch + per-model purge work. — **Drain and model switch validated live** (MiniLM → bge-m3 re-embedded all rows, old vectors kept as cold storage); per-model purge covered by tests, not exercised live.
-- ⏸️ Multilingual model handles CJK semantically (the lexical gap M1 leaves). — **Deferred to live testing.**
-
-**M2 code-review follow-ups (2026-09-02, deferred — none block push or live E2E).**
-Capstone `review` of the M2 diff (`27972e3`..HEAD). Findings orchestrator-verified against the
-code. None are correctness/security defects in normal operation; all are defense-in-depth hardening
-against a *trusted* sidecar or rare inputs. Fix opportunistically or during a later hardening pass.
-
-*Real items to fix later:*
-- [ ] **(Med, defense-in-depth) Bounded sidecar line read** — `StdioEmbedder` reads a line via
-  `read_until` into a `Vec` and checks the 16 MiB cap *after* the allocation (`src/embedder.rs`
-  ~read_line_bounded). A runaway/buggy sidecar could OOM before the cap fires. Read in chunks and
-  check accumulated size before each chunk (true hard bound). Reviewer "M6".
-- [ ] **(Med, defense-in-depth) Timeout on `fetch_embeddings_for_candidates`** in
-  `WhatsAppBridge::search` (`src/bridge.rs:1487`): query-embed has a bounded wait (20s budget + cool-down, ADR 0042), the candidate
-  vector fetch does not. NOTE: this is a property of the whole single-`Mutex<Connection>` storage
-  layer (the M1 lexical fallback `search_inbound` has no timeout either), **not an M2 regression** —
-  if fixed, apply consistently, not just to the semantic path. Reviewer "H2".
-- [ ] **(Low) cosine epsilon** — `cosine_similarity` (`src/embedder.rs`) uses exact `== 0.0`
-  zero-magnitude guard; use `< 1e-9` to avoid `Inf`/huge values from near-zero vectors. Reviewer "M4".
-- [ ] **(Low) `max_input_tokens` floor** — a sidecar advertising `0` would truncate all text to
-  empty (`src/embed_drain.rs` prepare_text_for_embedding); treat an unreasonably small value as
-  absent + WARN. Reviewer "M2".
-- [ ] **(Low) Surface purge non-INCREMENTAL warning to the caller** — the WARN is log-only; the
-  API/CLI/MCP response shows `bytes_reclaimed: 0` with no inline reason. Consider a `warning` field
-  or CLI note. Reviewer "M1".
-- [ ] **(Low) Poison-pill-at-tail visibility** — a genuinely unembeddable row at the tail keeps the
-  drain waking (bounded by backoff + notify-only quiescence); add a loud log after N solo failures
-  for operator visibility (do NOT auto-`failed` — that's the deferred M2.6.7 cap-3 path). Reviewer "M3".
-- [ ] **(Nit) L1** fake-embedder: env-configurable `max_batch`/`max_input_tokens` (incl. omitting
-  them) to exercise the no-advertised-limit path. **L2** cfg-gate the dormant `AttemptTracker`. **L3**
-  document the 100-iteration `incremental_vacuum` cap in `purge_embeddings`. **L4** (ADR 0040,
-  `embedder-rs/src/main.rs` `try_resolve_file`) a cold-cache download that fails partway through
-  (network drop mid-write, disk full) leaves its `<filename>.tmp-<pid>` sibling file behind — the
-  `File::create`/`io::copy` steps have no cleanup-on-error path before the `rename`. Harmless (a
-  stray file in the HF cache that a retry won't collide with, since the pid differs) but worth a
-  `defer`-style cleanup opportunistically.
-- [ ] **(Med) Sidecar auto-respawn** — if the sidecar process dies, whatsrust doesn't restart it;
-  semantic stays off until daemon restart (follow-up).
-- [ ] **(Low) Flaky test `embed_drain::tests::test_drain_worker_max_batch_clamp`** — it polls
-  with 50 ms sleeps against a wall-clock deadline and failed once in a full-suite run under heavy
-  memory pressure (swap ~32/34 GB), then passed 3/3 alone and in the next full run. Move it to
-  tokio's paused clock (as the ADR 0042 tests do) so it doesn't depend on machine load.
-- [ ] **(Low) One parser for boolean env vars** — `WHATSRUST_SKIP_HISTORY_SYNC` (src/main.rs,
-  `v == "1" || v.eq_ignore_ascii_case("true")`) and the `WHATSRUST_DANGEROUSLY_*` flags
-  (`parse_dangerously_flag`) accept `1`/`true` but not `yes`; every other bool var uses
-  `bool_env_var` (`1 true TRUE yes YES`). Switch them to one parser (docs say `=1`, which works
-  either way).
-- [ ] **(Med) wa-rs upgrade check** — current pin `9e8c70e2` (2026-07-01); upstream HEAD `7c4021d4` seen 2026-10-18 (newer than the pin). Check `oxidezap/whatsapp-rust` for new commits/tags, assess breaking changes, run tests + live smoke test per CLAUDE.md upgrade procedure. Untracked analysis file (2026-06-29, v0.6.0→main) pre-dates pin, advisory only.
-- [ ] **(Med) Native TLS for the MCP listener** — F3 follow-up; until then a non-loopback MCP bind sends the token in cleartext.
-- [ ] **(Low) Two-token rotation for the MCP listener** — F3 follow-up; requires daemon restart today.
-- [ ] **(Med) Rate limiting for MCP reads and chat-management operations** — no owner yet; F5 does not cover it.
-- [x] **(Med) MCP `whatsrust_send` tool schema declares `link_preview` and `schedule_at`**, but it
-  calls `/api/send?sync=true`, which rejects both with 400 → the params can never work via MCP. **RESOLVED 2026-10-15:** both fields removed from the MCP schema; REST and CLI keep them.
-- [ ] **(Low) `/api/contact` keeps a leading `+` in `phone`** and then prepends its own `+`,
-  producing `TEL:++972…`. Strip leading `+` in `handle_contact`.
-- [ ] **(Low) `enqueue_and_wait` skips `Lagged` broadcast errors**; a lagged receiver can miss the
-  Sent event and report a timeout for a job that was sent (covered by the 504 wording; consider
-  re-checking the job row on timeout).
-- [ ] **(Low) Add an MCP `whatsrust_send_async` tool** (jid, text, mentions, link_preview,
-  schedule_at → job_id) if an agent needs scheduling or link previews — currently both are only
-  available via REST async `/api/send`.
-
-*Double-checked and DISMISSED (do not re-investigate):*
-- **H1 "missing partial-coverage additive test" — FALSE.** `test_search_partial_coverage_keeps_unvectored`
-  exists (`src/bridge.rs:5580`) and covers exactly the M2.4.3 (b) additive-survival case.
-- **H3 "no discriminating recall-width test" — FALSE.** `test_search_recall_width_at_small_limit`
-  (`src/bridge.rs:5634`) is a real flip-check (needle recalled under `max(200,limit)`, not under
-  `min`), asserting the needle reaches top-5 → proves widening, not reorder.
-- The review cited a stale "305 lib / 318 bin" test count (from the M2.4 done-note); actual suite is
-  **312 lib / 327 bin** green (+ fake-embedder suite 333) — the reviewer read notes, not `cargo test`.
-- **M5 (LoadingTimer / `Instant` monotonicity)** — premise is largely incorrect (`Instant` is
-  monotonic and unaffected by NTP); no action beyond an optional doc note.
-
----
-
-## F3 — MCP Streamable HTTP listener (done 2026-10-19)
-
-**Goal:** Dedicated `/mcp` HTTP listener inside the daemon for MCP clients, alongside the existing stdio transport.
-
-**Phases:** See design doc §14 (`docs/plans/2026-10-15-mcp-http-transport-design.md`) for detailed phase descriptions and exit criteria.
-- Phase 0a: Pure refactors (head/body split, ApiResponse, RestRequest, CallContext) — done 2026-10-17
-- Behaviour-change step after 0a: gate + token before body read, lingering drain, new reason phrases, 415 code, 411 chunked, Expect: 100-continue supported after auth (other expectations 417), read deadlines — done 2026-10-17
-- Phase 0b: Config enforcement (REST rules; MCP-listener rules moved to Phase 2) — done 2026-10-18
-- Phase 1: Shared registry (access_class, integral float normalisation, ADR 0046 amendment) — done 2026-10-18
-- Phase 2: `/mcp` skeleton (opt-in, separate bind, routing, era detection, read-only switch) — done 2026-10-18 (initialize, ping, tools/list live; tools/call stubbed)
-- Phase 3: Legacy request handling (tools/call live, lanes, golden test, SDK test) — done 2026-10-18 (tools/call in-process via registry, permit lanes split by stage, 40 s tool budget from body completion; SDK gate passed; proxy test moved to Phase 5)
-- Phase 4: Modern request handling (dual-era, modern SDK gate) — done 2026-10-19
-- Phase 5: Polish, logging, metrics, documentation — done 2026-10-19 (four log targets, `/api/status` mcp_http snapshot, Docker proxy playbook, docs/HOWTO.md §5a, ADR 0045 amendment)
-
----
-
-## Priority backlog (set 2026-10-19)
-
-The order in which open work is picked up, set with the owner after F3 and the 2026-10-19 live
-crash. Detail lives where the "Source" column points (FEATURES.md items and the follow-up
-checklists above); this table tracks order and status. Update the Status cell when an item
-starts or lands; re-rank with the owner.
+The one ordered list of open work. It was set with the owner on 2026-10-19 and merged on
+2026-10-23 with the suggested feature order and the open follow-up lists. **Row order within a
+priority is the pick-up order.** Detail lives where the "Source" column points.
 
 **Priority:** P0 = stability of live runs · P1 = next up · P2 = planned · P3 = later / when needed.
 **Effort:** S / M / L (relative size, not a time estimate).
-**Status:** ⚪ open · 🟡 in progress or partly done · 🟢 done · 👤 owner action.
 
-| P | Item | Effort | Source | Why this rank | Status |
-|---|---|---|---|---|---|
-| P0 | Rebuild and restart the live daemon on the fixed binary | – | ops | a running pre-fix binary can still abort on a long multi-byte reply | 👤 open |
-| P0 | Panic visibility: log panics before the abort | S | Q-PANIC | the 2026-10-19 abort left only a stderr backtrace | 🟢 hook done (219697d) |
-| P0 | Supervisor restart (launchd/systemd) documented | S | Q-PANIC | nothing restarted the daemon after the crash | ⚪ (with F8 operational guide) |
-| P0 | Lint guard against byte-index string slicing | S | Q-SLICE | prevents a repeat of the crash | 🟢 done (219697d) |
-| P1 | Dev run profiles (`runs/<profile>/`) | S | F9 | protects the main DB while experimenting | 🟢 done (f953948); 👤 move root state into `runs/main/` |
-| P1 | Stdio `initialize`: answer 2025-11-25/2025-06-18 and add instructions | S | F3 known nit | stdio is the main local path and still advertises 2024-11-05, which predates tool annotations | 🟢 done (858de51) |
-| P1 | fetch-history: fail fast without an anchor; re-seed empty cursors | S | live run 2026-10-20 | the phone ignores an empty anchor, so the job hung 60 s and the chat stayed stuck | 🟢 done (e140361) |
-| P1 | fetch-history: seed anchors from archive/read-state syncs; 180 s wait for a sleeping phone | S | live tests 2026-10-21 | the phone rejects anchor-free requests; a sleeping phone answered after the 60 s wait | 🟢 done (ec3691f); 👤 live check of archive seeding open |
-| P1 | fetch-history: store the pairing history and late on-demand answers | M | live tests 2026-10-21 | fresh profiles had no anchors; late answers were dropped | 🟢 done (eed8e19); live-verified 2026-10-22 |
-| P1 | On-demand media download for stored history (REST/CLI/MCP, from media_refs; best-effort, CDN links expire) | M | ADR 0005 | history rows keep media refs but no bytes | ⚪ |
-| P1 | Logout + re-pair keeps the old device's app-state and Signal data (`clear_device` deletes only the device row and name): the new device's app-state sync looks broken (no push name, no archive/read-state events) | M | live re-pair 2026-10-22 | the documented re-pair path (HOWTO §3a) breaks archive seeding, the push name and presence; confirm first with a pairing from an empty DB, then wipe the device-scoped tables on logout (keep messages, `lid_pn_mapping`, `tc_tokens`) | ⚪ |
-| P1 | Rate limiting for network-touching reads (`groups`, `group_info` cache misses) and chat-management via MCP | M | follow-up above | an LLM loop can hammer WhatsApp; anti-ban is a core promise | ⚪ |
-| P1 | wa-rs upgrade check | M | Q-WARS | pin is from 2026-07-01 and upstream has moved | ⚪ |
-| P1 | README (the what) + fork notice + operational guide (the how) | M | F8 | README still carries the build section and how-to detail | ⚪ |
-| P2 | ARCHITECTURE update with Mermaid diagrams | M | F8 | follows the README split | ⚪ |
-| P2 | CONTRIBUTING update | S | F8 | align with Makefile targets, ignored tests, commit and ADR rules | ⚪ |
-| P2 | Sidecar auto-respawn | M | follow-up above | semantic search silently stays off after a sidecar crash | ⚪ |
-| P2 | ADR 0047 job_id cell (spawned enqueue publishes job_id) | M | F3 follow-up | rare now that the tool budget starts after the body | ⚪ |
-| P2 | `enqueue_and_wait` skips `Lagged` broadcast errors | S | follow-up above | can report a timeout for a job that was sent | ⚪ |
-| P2 | `/api/contact` produces `TEL:++…` | S | follow-up above | wrong vCard phone format | ⚪ |
-| P2 | One parser for boolean env vars | S | follow-up above | `yes` works for some flags only | ⚪ |
-| P2 | Flaky `test_drain_worker_max_batch_clamp` → paused clock | S | follow-up above | load-dependent test failure | ⚪ |
-| P2 | Richer read tools (names, counts, contacts, groups, search pagination) | L | F7 | user value; viable item by item; owner asked 2026-10-22 for sender information on historical messages (F7 item 1) | ⚪ |
-| P2 | `@lid` DM split: re-key pairing-package DM rows stored under `@lid` once the LID mapping is known | M | F1 follow-up | one DM landed under `@lid` on the 2026-10-22 re-pair, so its history and live messages can split | ⚪ |
-| P3 | fail2ban helper script | S | Q-F2B | only for direct exposure; the proxy recipe covers most setups | ⚪ |
-| P3 | `whatsrust_send_async` MCP tool | S | follow-up above | only if an agent needs scheduling or link previews | ⚪ |
-| P3 | Two-token rotation for the MCP listener | M | F3 follow-up | needs a restart today; low frequency | ⚪ |
-| P3 | Native TLS for the MCP listener | L | F3 follow-up | the tested reverse-proxy recipe covers it | ⚪ |
-| P3 | F5 per-token access profiles | L | F5 | builds on AccessClass; not needed for a single owner | ⚪ |
-| P3 | HEAD `/mcp` returns 405 with a body | S | F3 known nit | cosmetic; the connection closes | ⚪ |
-| P3 | Test hygiene: `#[cfg(test)]` capture hooks in `log_request`/`accept_loop`; storage test that scans source text | S | F3 known nit | test-only code inside production functions; brittle text scan | ⚪ |
+| P | Item | Effort | Source | Depends on | Why this rank | Status |
+|---|---|---|---|---|---|---|
+| P0 | Rebuild and restart the live daemon on the fixed binary | – | ops | – | a running pre-fix binary can still abort on a long multi-byte reply | 👤 open |
+| P0 | Supervisor restart (launchd/systemd) documented | S | Q-PANIC | – | nothing restarted the daemon after the 2026-10-19 crash | ⚪ (planned with the F8 operations guide) |
+| P1 | On-demand media download for stored history (REST/CLI/MCP, from `media_refs`; an expired link can be recovered through a re-upload by the phone) | M | F1 open items; ADR 0005 | – | history rows keep media refs but no bytes; agreed as next | ⚪ |
+| P1 | Re-pair bug: logout + re-pair keeps the old device's app-state and Signal data (`clear_device` deletes only the device row and name), so the new device's app-state sync looks broken (no push name, no archive/read-state events). Confirm with a pairing from an empty DB, then wipe the device-scoped tables on logout (keep messages, `lid_pn_mapping`, `tc_tokens`) | M | F1 issues; HOWTO §3a | 👤 confirm first | the documented re-pair path breaks archive seeding, the push name, presence and (later) address-book names | ⚪ |
+| P1 | Live check of archive-key seeding | – | F1 open items | re-pair bug | the code is done (ec3691f); the check needs a device whose app-state sync works | 👤 open |
+| P1 | Rate limiting for network-touching reads (`groups`, `group_info` cache misses) and chat-management via MCP | M | F3 open items | – | an LLM loop can hammer WhatsApp; anti-ban is a core promise | ⚪ |
+| P1 | wa-rs upgrade check | M | Q-WARS | – | the pin is from 2026-07-01 and upstream has moved | ⚪ |
+| P1 | Move the root run state into `runs/main/` | – | F9 | daemon stopped | protects the main DB while experimenting | 👤 open |
+| P2 | `@lid` DM split: re-key pairing-package DM rows stored under `@lid` once the LID mapping is known (lead: HistorySync field 15) | M | F1 open items | – | one DM split on the 2026-10-22 re-pair; builds the LID→phone resolution that sender names need | ⚪ |
+| P2 | Sender information on messages (F7 item 1): display name and phone number in `history` / `search` | M | F7 item 1 | `@lid` split; re-pair bug for address-book names | owner request 2026-10-22; push names can ship first | ⚪ |
+| P2 | The other F7 items: search pagination, counts, groups, contacts | L | F7 items 2–5 | sender information (for names) | user value; viable item by item; pagination is ready to build | ⚪ |
+| P2 | README (the what) + fork notice + operational guide (the how) | M | F8 | after the items above | lowered from P1 on 2026-10-23 (owner): the docs change once, after the fetch and names work | ⚪ |
+| P2 | ARCHITECTURE update with Mermaid diagrams | M | F8 | README split | follows the README split | ⚪ |
+| P2 | CONTRIBUTING update | S | F8 | – | align with Makefile targets, ignored tests, commit and ADR rules, and the doc-update checklist | ⚪ |
+| P2 | Sidecar auto-respawn | M | F2 open items | – | semantic search silently stays off after a sidecar crash | ⚪ |
+| P2 | M2 review: bounded sidecar line read (reviewer M6) | S | F2 issues | – | a runaway sidecar could exhaust memory before the 16 MiB cap fires; Med → P2 (2026-10-23) | ⚪ |
+| P2 | M2 review: timeout on `fetch_embeddings_for_candidates` (reviewer H2); apply to the whole single-connection storage layer, not only the semantic path | M | F1 open items | – | the query embed is bounded, the candidate fetch is not; Med → P2 (2026-10-23) | ⚪ |
+| P2 | ADR 0047 job_id cell (a spawned enqueue publishes the `job_id`) | M | F3 open items | – | rare now that the tool budget starts after the body | ⚪ |
+| P2 | `enqueue_and_wait` skips `Lagged` broadcast errors (re-check the job row on timeout) | S | ARCHITECTURE (event bus) | – | can report a timeout for a job that was sent | ⚪ |
+| P2 | `/api/contact` keeps a leading `+` and adds its own, producing `TEL:++…` (strip it in `handle_contact`) | S | REST | – | wrong vCard phone format | ⚪ |
+| P2 | One parser for boolean env vars (`WHATSRUST_SKIP_HISTORY_SYNC` and the `WHATSRUST_DANGEROUSLY_*` flags accept `1`/`true` but not `yes`; switch them to `bool_env_var`, which accepts `1 true TRUE yes YES`) | S | config | – | `yes` works for some flags only | ⚪ |
+| P2 | Flaky `test_drain_worker_max_batch_clamp` → tokio paused clock | S | F2 issues | – | load-dependent test failure | ⚪ |
+| P3 | fail2ban helper script | S | Q-F2B | – | only for direct exposure; the proxy recipe covers most setups | ⚪ |
+| P3 | `whatsrust_send_async` MCP tool | S | F3 open items | – | only if an agent needs scheduling or link previews | ⚪ |
+| P3 | Two-token rotation for the MCP listener | M | F3 open items | – | needs a restart today; low frequency | ⚪ |
+| P3 | Native TLS for the MCP listener | L | F3 open items | – | the tested reverse-proxy recipe covers it; until then a non-loopback bind sends the token in cleartext | ⚪ |
+| P3 | F5 per-token access profiles | L | F5 | – | builds on AccessClass; not needed for a single owner | ⚪ |
+| P3 | HEAD `/mcp` returns 405 with a body | S | F3 open items | – | cosmetic; the connection closes | ⚪ |
+| P3 | Test hygiene: `#[cfg(test)]` capture hooks in `log_request`/`accept_loop`; a storage test that scans source text | S | F3 open items | – | test-only code inside production functions; brittle text scan | ⚪ |
+| P3 | M2 review, low: cosine epsilon `< 1e-9` (M4); `max_input_tokens` floor (M2); purge non-INCREMENTAL warning in the response (M1); poison-pill-at-tail log (M3); nits L1–L4 | S | F1, F2 open items | – | defense in depth; Low/Nit → P3 (2026-10-23) | ⚪ |
+| P3 | `MsgSecretStore` for history-delivered edits, reactions and poll votes | M | F1 issues | – | added 2026-10-23 (a Phase 0 deferral no list tracked); not ranked by the owner | ⚪ |
+| P3 | F4 multi-account and F6 encryption at rest: investigation + design | L | F4, F6 | – | not ranked by the owner; each needs a design first | ⚪ |
 
----
+<a id="project-health"></a>
+## Project health (not ranked)
 
-## Notes
-- Per Q3: phase-level granularity; task breakdown happens when each phase is reached.
-- Per Q2: nothing past Phase 0 is detailed until GO.
-- Reviews flagged implementation-time concerns (I1-I7) and residual risks (R1-R6) in `_reviewer/design/2026-06-24-...-v3.md` — fold the I-items into the relevant phase's detailed plan when written.
+From the 2026-06-17 read-only project audit. These are tracked but **not in the backlog** until they
+are ranked with the owner (the audit's own priority is shown). Items already ranked point to the
+backlog.
+
+| ID | Item | Why | Effort | Audit priority | Status |
+|----|------|-----|--------|----------|--------|
+| Q-CI | GitHub Actions CI (fmt + clippy + test + build matrix; nightly pin; wa-rs git-dep cache) | No CI exists; the nightly toolchain is fragile | M | High | ⚪ |
+| Q-IT | Integration test harness (`tests/` dir) using the F1/F2 fake seams (Embedder + history source) | Only inline unit tests; no `tests/` dir yet (checked 2026-10-23) | L | High | ⚪ |
+| Q-DENY | `cargo-deny` (`deny.toml`) + add to CI | No supply-chain audit for the crates.io and git-pinned wa-rs crates | S | Med-High | ⚪ |
+| Q-REL | Release pipeline: cross-compiled binaries + SHA256 + CHANGELOG + tags | README claims a 5 MB binary but there are no published releases or tags; `CHANGELOG.md` exists since 2026-10-23 | M | Med | ⚪ |
+| Q-SEC | `SECURITY.md` (disclosure policy, scope) | Used in production agent software; raw SQL via `params!` | S | Med | ⚪ |
+| Q-DOCS | `docs/INDEX.md` / onboarding guide | Many .md files; discoverability gap (partly addressed by the doc matrix, now in `AGENTS.md`) | S–M | Med | 🟡 Partial (CLAUDE.md matrix 2026-06-17, change checklist 2026-10-23) |
+| Q-TRACE | Structured `#[instrument]` spans on `handle_event` / `execute_job` | Debugging "message didn't send / backfill stuck" means grepping flat logs | M | Med | ⚪ |
+| Q-SPLIT | Split the 900-line `extract_content_inner` / 700-line `handle_event` | Maintainability | L | Low | ⏸️ Deferred (stack-overflow history — risky) |
+| Q-PANIC | Panic visibility + recovery: a panic hook that logs the message and location before the release-mode abort, and a documented supervisor (launchd/systemd restart) | A UTF-8 slicing panic (fixed in a763838) killed a 9 h live session on 2026-10-19; `panic = "abort"` gives no log line of its own | S | High | 🟡 Hook done (219697d); supervisor docs → backlog P0 |
+| Q-F2B | fail2ban reference + optional helper script (install filter/jail, plain-text log via `NO_COLOR=1`) | HOWTO §5a documents a filter and jail; a script makes direct exposure safer | S | Low | → backlog P3 |
+| Q-WARS | wa-rs dependency upgrade check | Pin `9e8c70e2` (2026-07-01); upstream HEAD `7c4021d4` seen 2026-10-18. Follow AGENTS.md "To upgrade wa-rs". The untracked `wa-rs-upgrade-impact-analysis.txt` (2026-06-29) pre-dates the pin and is advisory only | M | Med | → backlog P1 |
+
+<a id="completed"></a>
+## Completed
+
+Newest first. Detail: FEATURES.md (features) and `CHANGELOG.md` (every change). Dates are the
+recorded milestone dates; `CHANGELOG.md` sections use commit dates, which can be a few days later.
+
+| Date | What | Feature / source | Reference |
+|---|---|---|---|
+| 2026-10-23 | Planning docs restructured (FEATURES = detail, this roadmap = map/order/completed), `CHANGELOG.md` started, doc-update checklist; project instructions split into `AGENTS.md` (tool-neutral) + `CLAUDE.md` (imports it) | F8 | – |
+| 2026-10-22 | fetch-history: store the pairing history and late on-demand answers; live-verified 2026-10-22 | F1 | eed8e19; ADR 0048 |
+| 2026-10-22 | fetch-history: anchors from archive/read-state syncs; 180 s wait for a sleeping phone | F1 | ec3691f; ADR 0003 amendment |
+| 2026-10-22 | `run-profile.sh clear-data`: empty a profile's message data, keep the pairing | F9 | b9c7dd2 |
+| 2026-10-21 | fetch-history: fail fast without an anchor; re-seed empty cursors | F1 | e140361; ADR 0003 amendment |
+| 2026-10-20 | Stdio MCP `initialize` negotiates 2025-11-25/2025-06-18, returns instructions, answers `ping` | F3 | 858de51 |
+| 2026-10-20 | Run profiles: tmux made opt-in; `mcp-on` / `mcp-off` / `mcp-client` | F9 | – |
+| 2026-10-19 | F3 MCP Streamable HTTP listener complete (Phases 0a–5) | F3 | ADR 0045–0047 |
+| 2026-10-19 | Dev run profiles (`runs/<profile>/`) | F9 | f953948 |
+| 2026-10-19 | Panic hook (one `ERROR whatsrust::panic` line before the abort) and the byte-index string-slicing lint (Q-SLICE: `#![warn(clippy::string_slice)]` in both crate roots, 0 warnings in all targets); the UTF-8 slicing crash fixed on main | Q-PANIC, Q-SLICE | 219697d, a763838 |
+| 2026-10-15 | MCP argument validation (declared arguments only); sync-send timeout returns `job_id`; `whatsrust_send` MCP schema fixed | F3 | ADR 0046, 0047 |
+| 2026-10-14 | REST request gate (Origin/Host/Content-Type) | security | 1fda7ee; ADR 0044 |
+| 2026-10-13 | Device name fixed at pairing (`WHATSRUST_DEVICE_NAME`); `make release-all` / `make dist` | – | ADR 0043 |
+| 2026-10-05 | M2 semantic search live-validated (bge-m3 hybrid search on the real account) | F1, F2 | ADR 0042 |
+| 2026-09-30 | M2 code-complete: native Rust sidecar with bge-m3 default, hybrid recall | F1, F2 | ADR 0039–0041 |
+| 2026-09-02 | M2.1–M2.6 (sidecar contract, embeddable text, drain worker, semantic path, purge, config wiring); `.env.example` completed (Q-ENV, with `dotenvy` from M1.2) | F1, F2 | ADR 0015–0017, 0038 |
+| 2026-07-20 | M1 complete: fetch + FTS5 lexical search, live E2E | F1 | ADR 0003–0036 |
+| 2026-07-01 | Phase 0 gate GO: wa-rs upstream HEAD `9e8c70e2` adopted; history sync on for 1:1-DM tokens | F1 | 3df4ce9; ADR 0002, 0037 |
+| 2026-06-17 | Design + ADRs for F1/F2 (ADRs 0001–0025 + the consolidated design doc); doc matrix in CLAUDE.md; `.gitignore` leak hardening (`*.log`, `.mcp.json`, `.env`, session files; Q-GI) | F1, F2 | 7c4c403 |
+| 2026-06-15 | Daemon Ctrl-C hang fix (stdin an open terminal); tokio worker stack → 8 MB (inbound stack overflow) | – | 36ae622, 0c8228a; ADR 0001 |
+| 2026-06-14 | Dead-code warning silenced | – | b4b0500 |
