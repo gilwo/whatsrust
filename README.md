@@ -149,6 +149,7 @@ Once fetched, search your history locally: **FTS5 lexical** (BM25 relevance-rank
 - **Graceful shutdown.** Drains in-flight messages on SIGINT/SIGTERM.
 - **Single-instance flock.** Two bridges can't fight over one session.
 - **SQLite backup** on startup and shutdown. WAL mode, no corruption.
+- **Runs as a service.** `scripts/deploy.sh` installs a launchd (macOS) or systemd (Linux) user service that restarts the daemon after a crash; an unpaired instance never runs unattended (docs/HOWTO.md §3b).
 
 ### Doesn't get you banned
 

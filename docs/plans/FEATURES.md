@@ -28,6 +28,7 @@ backlog).
 - [F7 — Richer read tools](#f7)
 - [F8 — Documentation overhaul](#f8)
 - [F9 — Dev run profiles](#f9)
+- [F10 — Deployment as a service](#f10)
 
 ---
 
@@ -532,3 +533,62 @@ Keep each debug/live run's state out of the project root (added 2026-10-19).
 - [x] Script + Makefile target + docs — done 2026-10-19
 - [x] `clear-data` command (message data only, pairing kept) — done 2026-10-21
 - [ ] Move existing root run state into `runs/main/` (owner, daemon stopped; HOWTO checklist; roadmap P1)
+
+---
+
+<a id="f10"></a>
+## F10 — Deployment as a service (launchd / systemd) 🟢 Built 2026-10-26 (not live-tested)
+
+Run the daemon in the background as a user service that restarts after a crash: a launchd LaunchAgent
+on macOS, a systemd user unit on Linux. Separate from the dev profiles (F9). Roadmap P0 "Supervisor
+restart" (Q-PANIC), after the 2026-10-19 crash that nothing restarted.
+- **Design:** ADR 0049. Operator guide: `docs/HOWTO.md` §3b (commands, wizard, start gate, the owner
+  checklist to move a live state, a demo playbook). Files: `scripts/deploy.sh`, `deploy/supervisor/`
+  (`whatsrust.plist.in`, `whatsrust.service.in`, `start-if-paired.sh`, `README.md`).
+
+### Breakdown
+
+**Decisions with the owner (2026-10-24 → 26):** a separate deploy script (not `run-profile.sh`); each
+instance outside the repo with its own binary copy (option A of three: deploy directory / dev profile /
+repo root); both platforms; the rule **"an unpaired instance never runs unattended"**; an install wizard
+where every default can be overridden (list choice or typed value); `run` instead of a separate pair
+command; `re-pair` with two modes; `autostart`; an `uninstall` wizard that asks about deleting and
+backing up the data; no `clear` command.
+
+- [x] `install` — 10-step wizard (name, directory, binary, REST port from 7280, API token, MCP listener,
+  semantic search + model, device name, pairing history, autostart), each step also a flag; `--yes`,
+  `--dry-run`; starts nothing; a re-run reconfigures with the current values as defaults and edits only
+  the managed `.env` keys in place
+- [x] `run` — paired: start in the background; unpaired: start the service, draw its QR code in the
+  terminal until linked; Ctrl+C or 5 min stops it again
+- [x] `stop`, `restart` (graceful), `status` (paired, connected, gate, PID, last exit, restarts,
+  autostart), `logs`, `upgrade` (binary and embedder copies)
+- [x] `re-pair` — fresh (the DB moves to a dated backup; default while the P1 re-pair bug is open) or
+  keep-history (unlink on the phone first)
+- [x] `autostart on|off` — refused for an unpaired instance
+- [x] `uninstall` — wizard: keep the data, or delete it after an optional verified backup and a typed
+  confirmation
+- [x] Start gate `bin/start-if-paired`, ownership markers (directory and units), physical-path checks
+- [x] Harness: 312 checks on bash 3.2 and 5.3 (stub launchd/systemd, fake daemon, piped wizard
+  answers, a pty for signals); shellcheck clean (gate also clean for `sh` and `dash -n`)
+
+### Issues encountered
+
+| Date | Issue | Resolution | Reference |
+|---|---|---|---|
+| 2026-10-24 | A panic exits with code 101 (the panic hook calls `exit(101)`), not by a signal, so "restart on crash signal" would miss it | Restart on any non-zero exit; a config error therefore restarts every 10 s until fixed (systemd stops after its start limit) | ADR 0049 |
+| 2026-10-24 | The signal that `launchctl kickstart -k` sends is not documented, so a restart might not be graceful | `restart`/`upgrade` on macOS: `launchctl kill SIGTERM` → wait for the exit → `kickstart` | ADR 0049 |
+| 2026-10-24 | A first install started the service at once with a `.env` from `.env.example`, so it took port 7270, which the live daemon holds: exit 1 every 10 s, and an unpaired service with no terminal for the QR code | Redesign with the owner: `install` starts nothing, the wizard picks a free port from 7280, pairing happens only in `run` | owner decision 2026-10-24 |
+| 2026-10-25 | First adversarial review (14 findings), among them: the Ctrl+C handler could die on a closed pipe before it stopped the service; autostart could start an instance unlinked on the phone at the next login; `install --dir ~/.cargo` + `uninstall --delete-data` could delete `~/.cargo`; the re-pair backup ran inside `$(...)` with `set -e` off and could split the DB; a failed `systemctl --user` query read as "not running" | All fixed: signal-safe stop first; the start gate; the ownership marker + physical paths; explicit checks with rollback; "cannot query" stops every destructive command; unit markers; strict paired checks; wall-clock deadlines | review 2026-10-25; ADR 0049 |
+| 2026-10-26 | Second review (two focused passes, 19 findings), among them: a `.qr-flow` marker left by a SIGKILL could match a reused PID and start an unpaired daemon; a failure while switching to the QR flow left an unpaired service running; the gate started the daemon on any DB read error; a missing gate template installed an empty gate; a directory marked for another instance could be adopted; nested instance directories | All fixed: the marker holds the PID **and its start time** (a reused PID never matches) and expires after 15 min; the exit trap stops an unpaired QR-flow service; the gate fails closed on read errors (only a missing `sqlite3` starts with a warning); the template is checked before any write; markers must name the instance; overlapping directories are refused; plus 13 smaller fixes | review 2026-10-26; ADR 0049 |
+| 2026-10-26 | Not live-tested on real launchd or systemd: only stubs and linters | **Open.** The owner chose no smoke test on 2026-10-26; the HOWTO §3b demo playbook is the test to run before relying on it | – |
+
+### Open items
+
+- [ ] Live check on real launchd and systemd (HOWTO §3b demo playbook; owner)
+- [ ] Daemon option to exit when it is unlinked (`LoggedOut`) while it runs as a service, which the start
+  gate cannot cover (roadmap P2)
+- [ ] Without `sqlite3` the gate cannot tell whether the instance is paired and starts the daemon with a
+  warning (trade-off, ADR 0049)
+- [ ] Port `scripts/deploy.sh` (about 3500 lines of bash) to a Rust `whatsrust deploy` subcommand
+  (roadmap P3)

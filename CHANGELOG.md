@@ -7,6 +7,7 @@ This file tracks notable changes to the whatsrust experimental fork. The project
 Work on branch `ops/supervisor`, not yet on `main`.
 
 ### Added
+- `scripts/deploy.sh`: run the daemon as a service that restarts after a crash (launchd LaunchAgent on macOS, systemd user unit on Linux; ADR 0049). `install` is a step-by-step wizard (directory, binary, ports, API/MCP tokens, semantic model, device name, pairing history, autostart; every step also a flag, `--yes`, `--dry-run`) and starts nothing; `run` starts a paired instance in the background, or shows the QR code in the terminal until the device is linked; a start gate (`bin/start-if-paired`) keeps an unpaired instance from ever running unattended (login, crash restarts, upgrades); also `stop`, `re-pair` (fresh or keep-history), `autostart on|off`, `uninstall` (wizard: keep the data, or delete it after an optional verified backup), `status`, `logs`, `restart` (graceful), `upgrade`. Each instance lives outside the repo with its own copy of the binary and an ownership marker; restart on any non-zero exit (1 = startup refusal, 101 = panic) with a 10 s throttle; templates in `deploy/supervisor/`; HOWTO §3b; not live-tested yet
 - `scripts/remap-doc-hashes.sh`: after a rebase-merge, finds commit hashes cited in the docs that are no longer in `main`'s history and maps each to its rebased twin (same subject and author date); report-only by default, `--apply` rewrites
 
 ### Fixed

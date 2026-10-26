@@ -1,0 +1,31 @@
+# managed-by: scripts/deploy.sh instance=@INSTANCE@
+# systemd user unit for whatsrust instance @INSTANCE@. Rendered by scripts/deploy.sh install from
+# deploy/supervisor/whatsrust.service.in: edit the template, not this file.
+# install does not enable or start it: `run` starts it, `autostart on` enables it (systemctl --user enable).
+# Logs go to the journal: journalctl --user -u @UNIT@
+
+[Unit]
+Description=whatsrust WhatsApp bridge (@INSTANCE@)
+# Give up after 5 starts in 300 s (for example with a config error that makes every start fail).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# The daemon keeps its state (whatsapp.db, backups, instance lock) in the working directory.
+# WorkingDirectory= takes the path as it is (no quotes, spaces are fine). ExecStart= and Environment= need quotes.
+WorkingDirectory=@DIR@
+# The start gate, not the daemon: it starts bin/whatsrust only for a paired instance or during a QR flow.
+ExecStart="@START@"
+Environment="WHATSRUST_ENV_FILE=@ENV_FILE@"
+Environment="NO_COLOR=1"
+# Restart after any exit that is not status 0 (a panic exits 101); never after a clean stop.
+Restart=on-failure
+RestartSec=10
+# SIGTERM makes the daemon drain, back up the DB and exit 0. SIGKILL follows after 30 s.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardInput=null
+
+[Install]
+WantedBy=default.target
