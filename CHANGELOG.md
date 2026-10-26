@@ -4,27 +4,37 @@ This file tracks notable changes to the whatsrust experimental fork. The project
 
 ## [Unreleased]
 
-Work on branch `feature/mcp-streamable-http` not yet on `main`.
+Work on branch `ops/supervisor`, not yet on `main`.
 
 ### Added
-- Store messages from the pairing history sync package and late on-demand fetch answers, so chats have anchors from the start and stuck fetches unblock on the next attempt; `WHATSRUST_STORE_PAIRING_HISTORY=false` turns off the pairing part (eed8e19; ADR 0048)
-- Seed fetch anchors from archive/unarchive and mark-read syncs that carry a chat's last message key; a chat with no stored message can now be fetched without sending anything (ec3691f; ADR 0003 amendment)
-- `clear-data` command in `run-profile.sh`: empties a profile's message data and keeps the pairing; refuses while the daemon runs, prints the exact SQL, backs up first, asks y/N and then for the profile name (b9c7dd2)
-- `mcp-on` / `mcp-off` / `mcp-client` commands in `run-profile.sh`: switch a profile's HTTP MCP listener by rewriting the `.env` with bash builtins only; token never printed or in argv; `mcp-client` prints a Claude Code config using `${WHATSRUST_MCP_TOKEN}` (de4f0e3)
-- MCP Streamable HTTP listener (F3 Phases 2–5): `POST /mcp` on its own port, dual-era (modern 2026-07-28 + legacy 2025-11-25/2025-06-18), in-process tool dispatch via shared registry, permit lanes, 40 s tool budget from body completion, logging (four targets), metrics in `/api/status` (b0ae76a, bec2c4b, dff7d8a, c6350f9, eb635e6)
-- Dev run profiles (F9): each profile in `runs/<profile>/` keeps its own `.env`, DB, logs and instance lock; `scripts/run-profile.sh` commands `new`, `list`, `daemon`, `attach`, `cli`, `mcp`, `env`, `clear-data`, and the MCP listener switches; `daemon` supports `--tmux` (opt-in, session `whatsrust-<profile>`) and `--detach`; `make new-profile` / `make run-profile` / `make attach-profile` (f953948, 6976ff5, 33ec74c, de4f0e3, b9c7dd2)
-- Docker proxy playbook (`scripts/mcp-proxy-smoke.sh`): tests real nginx and Caddy in front of the MCP listener; ignored test `proxy_smoke_docker` (c6350f9)
+- `scripts/remap-doc-hashes.sh`: after a rebase-merge, finds commit hashes cited in the docs that are no longer in `main`'s history and maps each to its rebased twin (same subject and author date); report-only by default, `--apply` rewrites
+
+### Fixed
+- Commit hashes cited in the docs that the 2026-10-23 rebase-merge left pointing at branch-only commits now point at the `main` commits
+
+## 2026-10-23 — Fetch-history anchors and pairing history, MCP HTTP listener, run profiles, planning docs
+
+Merged from `feature/mcp-streamable-http` (rebase-merge; the hashes below are the `main` commits).
+
+### Added
+- Store messages from the pairing history sync package and late on-demand fetch answers, so chats have anchors from the start and stuck fetches unblock on the next attempt; `WHATSRUST_STORE_PAIRING_HISTORY=false` turns off the pairing part (b15aeec; ADR 0048)
+- Seed fetch anchors from archive/unarchive and mark-read syncs that carry a chat's last message key; a chat with no stored message can now be fetched without sending anything (2768412; ADR 0003 amendment)
+- `clear-data` command in `run-profile.sh`: empties a profile's message data and keeps the pairing; refuses while the daemon runs, prints the exact SQL, backs up first, asks y/N and then for the profile name (548d1d8)
+- `mcp-on` / `mcp-off` / `mcp-client` commands in `run-profile.sh`: switch a profile's HTTP MCP listener by rewriting the `.env` with bash builtins only; token never printed or in argv; `mcp-client` prints a Claude Code config using `${WHATSRUST_MCP_TOKEN}` (e667b36)
+- MCP Streamable HTTP listener (F3 Phases 2–5): `POST /mcp` on its own port, dual-era (modern 2026-07-28 + legacy 2025-11-25/2025-06-18), in-process tool dispatch via shared registry, permit lanes, 40 s tool budget from body completion, logging (four targets), metrics in `/api/status` (6ff509a, 03a5158, b64b458, 7768abf, 462d25a)
+- Dev run profiles (F9): each profile in `runs/<profile>/` keeps its own `.env`, DB, logs and instance lock; `scripts/run-profile.sh` commands `new`, `list`, `daemon`, `attach`, `cli`, `mcp`, `env`, `clear-data`, and the MCP listener switches; `daemon` supports `--tmux` (opt-in, session `whatsrust-<profile>`) and `--detach`; `make new-profile` / `make run-profile` / `make attach-profile` (5cb92e5, 8633a84, 4a24426, e667b36, 548d1d8)
+- Docker proxy playbook (`scripts/mcp-proxy-smoke.sh`): tests real nginx and Caddy in front of the MCP listener; ignored test `proxy_smoke_docker` (7768abf)
 - `CHANGELOG.md` (this file): summarized fork history, then one line per change; the doc matrix (now in `AGENTS.md`) lists which docs to update for each kind of change
 
 ### Changed
 - Planning docs restructured: `docs/plans/FEATURES.md` holds each feature's breakdown, issues encountered and ADR links; `docs/plans/IMPLEMENTATION-ROADMAP.md` holds the feature map, one merged priority backlog (F8 README lowered to P2) and the completed list
 - Project instructions split: the tool-neutral content of `CLAUDE.md` moved to `AGENTS.md` (read by any coding agent); `CLAUDE.md` now imports it with `@AGENTS.md` and holds only Claude Code-specific rules (none yet); the wa-rs section now states the real pin (`rev` 9e8c70e2, not a tag)
-- Fetch-history now waits 180 s for the phone (was 60 s), because a sleeping phone answered minutes late (ec3691f; ADR 0003 amendment)
-- Run profile daemons use tmux only when `--tmux` is passed (was always-on); `--detach` implies `--tmux`; a missing tmux is an error, not a silent fallback (33ec74c)
-- Stdio MCP transport now negotiates 2025-11-25 / 2025-06-18 protocol versions (was 2024-11-05 with no negotiation), returns `instructions`, and answers `ping` (858de51; ADR 0045 amendment)
+- Fetch-history now waits 180 s for the phone (was 60 s), because a sleeping phone answered minutes late (2768412; ADR 0003 amendment)
+- Run profile daemons use tmux only when `--tmux` is passed (was always-on); `--detach` implies `--tmux`; a missing tmux is an error, not a silent fallback (4a24426)
+- Stdio MCP transport now negotiates 2025-11-25 / 2025-06-18 protocol versions (was 2024-11-05 with no negotiation), returns `instructions`, and answers `ping` (d4cddad; ADR 0045 amendment)
 
 ### Fixed
-- Fetch-history without a usable anchor (no cursor, no stored message, not exhausted) now fails fast with REST 409 `no_anchor` and an MCP tool error, instead of hanging 60 s and leaving an empty cursor that blocked the chat for good; empty cursors from older versions are re-seeded (e140361; ADR 0003 amendment)
+- Fetch-history without a usable anchor (no cursor, no stored message, not exhausted) now fails fast with REST 409 `no_anchor` and an MCP tool error, instead of hanging 60 s and leaving an empty cursor that blocked the chat for good; empty cursors from older versions are re-seeded (9610d18; ADR 0003 amendment)
 
 ## 2026-10-19 — MCP HTTP listener, dev run profiles, crash hardening
 
