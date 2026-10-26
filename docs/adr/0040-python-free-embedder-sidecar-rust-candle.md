@@ -83,7 +83,7 @@ are interchangeable under the same `model_id`.
 **Supersedes:** the Python sidecar (ADR 0039 / spec §3) as the *deployment* target, once validated.
 ADR 0039's model-rollout decision (MiniLM → bge-m3, prefix-free) still stands — only the runtime changes.
 
-**Implementation note (2026-09-30, bge-m3 added; commit `8221260`):** the Rust sidecar now serves
+**Implementation note (2026-09-30, bge-m3 added; commit `46b070a`):** the Rust sidecar now serves
 **bge-m3** (`BAAI/bge-m3`, XLM-RoBERTa-large, 1024-dim, CLS-token pooling) alongside MiniLM, selected
 via `--model minilm|bge-m3` (default `minilm`; `WHATSRUST_EMBEDDER_MODEL` env var also works, and is
 inherited by the child process so `WHATSRUST_EMBEDDER_ARGS="--model bge-m3"` and the env var are

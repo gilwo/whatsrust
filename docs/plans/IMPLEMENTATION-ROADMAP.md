@@ -60,7 +60,7 @@ priority is the pick-up order.** Detail lives where the "Source" column points.
 | P0 | Supervisor restart (launchd/systemd) documented | S | Q-PANIC | – | nothing restarted the daemon after the 2026-10-19 crash | ⚪ (planned with the F8 operations guide) |
 | P1 | On-demand media download for stored history (REST/CLI/MCP, from `media_refs`; an expired link can be recovered through a re-upload by the phone) | M | F1 open items; ADR 0005 | – | history rows keep media refs but no bytes; agreed as next | ⚪ |
 | P1 | Re-pair bug: logout + re-pair keeps the old device's app-state and Signal data (`clear_device` deletes only the device row and name), so the new device's app-state sync looks broken (no push name, no archive/read-state events). Confirm with a pairing from an empty DB, then wipe the device-scoped tables on logout (keep messages, `lid_pn_mapping`, `tc_tokens`) | M | F1 issues; HOWTO §3a | 👤 confirm first | the documented re-pair path breaks archive seeding, the push name, presence and (later) address-book names | ⚪ |
-| P1 | Live check of archive-key seeding | – | F1 open items | re-pair bug | the code is done (ec3691f); the check needs a device whose app-state sync works | 👤 open |
+| P1 | Live check of archive-key seeding | – | F1 open items | re-pair bug | the code is done (2768412); the check needs a device whose app-state sync works | 👤 open |
 | P1 | Rate limiting for network-touching reads (`groups`, `group_info` cache misses) and chat-management via MCP | M | F3 open items | – | an LLM loop can hammer WhatsApp; anti-ban is a core promise | ⚪ |
 | P1 | wa-rs upgrade check | M | Q-WARS | – | the pin is from 2026-07-01 and upstream has moved | ⚪ |
 | P1 | Move the root run state into `runs/main/` | – | F9 | daemon stopped | protects the main DB while experimenting | 👤 open |
@@ -118,15 +118,16 @@ recorded milestone dates; `CHANGELOG.md` sections use commit dates, which can be
 
 | Date | What | Feature / source | Reference |
 |---|---|---|---|
+| 2026-10-25 | Doc hashes remapped after the 2026-10-23 rebase-merge; `scripts/remap-doc-hashes.sh` added, with the "after a merge" step in AGENTS.md | docs | – |
 | 2026-10-23 | Planning docs restructured (FEATURES = detail, this roadmap = map/order/completed), `CHANGELOG.md` started, doc-update checklist; project instructions split into `AGENTS.md` (tool-neutral) + `CLAUDE.md` (imports it) | F8 | – |
-| 2026-10-22 | fetch-history: store the pairing history and late on-demand answers; live-verified 2026-10-22 | F1 | eed8e19; ADR 0048 |
-| 2026-10-22 | fetch-history: anchors from archive/read-state syncs; 180 s wait for a sleeping phone | F1 | ec3691f; ADR 0003 amendment |
-| 2026-10-22 | `run-profile.sh clear-data`: empty a profile's message data, keep the pairing | F9 | b9c7dd2 |
-| 2026-10-21 | fetch-history: fail fast without an anchor; re-seed empty cursors | F1 | e140361; ADR 0003 amendment |
-| 2026-10-20 | Stdio MCP `initialize` negotiates 2025-11-25/2025-06-18, returns instructions, answers `ping` | F3 | 858de51 |
+| 2026-10-22 | fetch-history: store the pairing history and late on-demand answers; live-verified 2026-10-22 | F1 | b15aeec; ADR 0048 |
+| 2026-10-22 | fetch-history: anchors from archive/read-state syncs; 180 s wait for a sleeping phone | F1 | 2768412; ADR 0003 amendment |
+| 2026-10-22 | `run-profile.sh clear-data`: empty a profile's message data, keep the pairing | F9 | 548d1d8 |
+| 2026-10-21 | fetch-history: fail fast without an anchor; re-seed empty cursors | F1 | 9610d18; ADR 0003 amendment |
+| 2026-10-20 | Stdio MCP `initialize` negotiates 2025-11-25/2025-06-18, returns instructions, answers `ping` | F3 | d4cddad |
 | 2026-10-20 | Run profiles: tmux made opt-in; `mcp-on` / `mcp-off` / `mcp-client` | F9 | – |
 | 2026-10-19 | F3 MCP Streamable HTTP listener complete (Phases 0a–5) | F3 | ADR 0045–0047 |
-| 2026-10-19 | Dev run profiles (`runs/<profile>/`) | F9 | f953948 |
+| 2026-10-19 | Dev run profiles (`runs/<profile>/`) | F9 | 5cb92e5 |
 | 2026-10-19 | Panic hook (one `ERROR whatsrust::panic` line before the abort) and the byte-index string-slicing lint (Q-SLICE: `#![warn(clippy::string_slice)]` in both crate roots, 0 warnings in all targets); the UTF-8 slicing crash fixed on main | Q-PANIC, Q-SLICE | 219697d, a763838 |
 | 2026-10-15 | MCP argument validation (declared arguments only); sync-send timeout returns `job_id`; `whatsrust_send` MCP schema fixed | F3 | ADR 0046, 0047 |
 | 2026-10-14 | REST request gate (Origin/Host/Content-Type) | security | 1fda7ee; ADR 0044 |

@@ -1,7 +1,7 @@
 # Design Review: M2 Detailed Execution Plan (Semantic Search) — v3 (follow-up)
 
 **Date:** 2026-07-23
-**Artifact:** `docs/plans/2026-07-23-M2-detailed-plan.md` (revised at commit `edf5530` — folded in the v2 cold review)
+**Artifact:** `docs/plans/2026-07-23-M2-detailed-plan.md` (revised at commit `9fd8042` — folded in the v2 cold review)
 **Prior reviews (of this plan):** `2026-07-23-m2-execution-plan.md` (v1 — approve w/ changes, 1+12), `…-v2.md` (v2 — needs rework, 2+7)
 **Prior reviews (of the underlying F1 *design*):** `2026-06-18`, `2026-06-23-v2`, `2026-06-24-v3` (final — implementation-ready)
 **Reviewer:** Cold design-reviewer (independent, no prior context, no prior reviews fed)

@@ -163,14 +163,14 @@ a real account)
 **Follow-on: making fetch-history work on chats with no stored message (2026-10-20 → 22)**
 - [x] **A fetch needs a usable anchor** — 2026-10-20. The anchor is the cursor's, else the oldest
   stored message; none → REST 409 `no_anchor` (also an MCP tool error) and the worker fails fast
-  without calling the phone; empty cursors from older versions are re-seeded. (e140361; ADR 0003
+  without calling the phone; empty cursors from older versions are re-seeded. (9610d18; ADR 0003
   amendment)
 - [x] **Anchors from archive/read-state syncs, 180 s wait** — 2026-10-22. An archive, unarchive or
   mark-read sync from the phone carries the chat's last message key; for a chat with no anchor (no
   usable cursor, no stored message, not exhausted) that key becomes the cursor's anchor, so such a
   chat can be fetched without sending anything (archive and unarchive it on the phone). The fetch
   waits 180 s for the phone (was 60 s); the timeout error says to open WhatsApp on the phone.
-  `no_anchor` guidance updated. (ec3691f; ADR 0003 second amendment)
+  `no_anchor` guidance updated. (2768412; ADR 0003 second amendment)
 - [x] **Store the pairing history and late on-demand answers** — 2026-10-22. Every unmatched
   history-sync chunk with conversations is stored (`source=bootstrap`, keyed like live messages,
   duplicates skipped, embedding queued), so those chats have an anchor from the start; a late answer
@@ -181,7 +181,7 @@ a real account)
   `WHATSRUST_STORE_PAIRING_HISTORY=false` turns the pairing part off. Only a fresh pairing delivers
   the package. **Live-verified 2026-10-22** (dev re-pair): 5 + 3 conversations with only each chat's
   last message (5 chats stored), enough to fetch two group chats, including one stuck before.
-  (eed8e19; ADR 0048)
+  (b15aeec; ADR 0048)
 
 ### Issues encountered
 
@@ -197,9 +197,9 @@ a real account)
 | 2026-09-02 | M2 code review of the M2 diff (from 69f386a): defense-in-depth findings against a trusted sidecar or rare inputs | Real items are open and ranked in the roadmap backlog ("M2 review" rows). Checked and **dismissed** (do not re-investigate): H1 — `test_search_partial_coverage_keeps_unvectored` exists and covers the additive case; H3 — `test_search_recall_width_at_small_limit` is a real flip-check; a stale "305 lib / 318 bin" count (actual 312 lib / 327 bin, fake-embedder suite 333); M5 — `Instant` is monotonic and unaffected by NTP | M2 review |
 | 2026-09-30 | Rerank-only search (M2.4) returned nothing for a word-free query (an English query matching a Hebrew-only message) | Hybrid recall | ADR 0041 |
 | 2026-10-05 | A `+` in a search query was decoded wrongly (live run) | `decode_query_component` | ADR 0042 era |
-| 2026-10-20 | A fetch of a chat with no stored message hung 60 s and left an empty cursor that blocked the chat for good (the phone ignores an empty anchor) | Anchor resolution + `no_anchor` fail-fast + re-seeding | e140361; ADR 0003 amendment |
-| 2026-10-21 | The phone rejects every anchor-free request (empty, or timestamp-only with an empty or made-up id); a sleeping phone answered after the 60 s wait | Anchors from archive/read-state syncs; 180 s wait | ec3691f; ADR 0003 second amendment |
-| 2026-10-21 | Fresh profiles had no anchors; late on-demand answers were dropped | Store the pairing package and late answers | eed8e19; ADR 0048 |
+| 2026-10-20 | A fetch of a chat with no stored message hung 60 s and left an empty cursor that blocked the chat for good (the phone ignores an empty anchor) | Anchor resolution + `no_anchor` fail-fast + re-seeding | 9610d18; ADR 0003 amendment |
+| 2026-10-21 | The phone rejects every anchor-free request (empty, or timestamp-only with an empty or made-up id); a sleeping phone answered after the 60 s wait | Anchors from archive/read-state syncs; 180 s wait | 2768412; ADR 0003 second amendment |
+| 2026-10-21 | Fresh profiles had no anchors; late on-demand answers were dropped | Store the pairing package and late answers | b15aeec; ADR 0048 |
 | 2026-10-22 | After logout + re-pair, the device gets no push name and no archive/read-state events (seen as an empty history after an archive/unarchive test) | **Open.** Suspected cause: `Store::clear_device` deletes only the device row and name, so the old device's app-state and Signal data stay. Confirm with a pairing from an empty DB | roadmap P1; HOWTO §3a |
 | 2026-10-22 | A pairing-package DM without `pnJid` stays under its `@lid` JID, while live messages from that contact go under the phone JID | **Open** (the `@lid` split below) | roadmap P2 |
 
@@ -215,7 +215,7 @@ a real account)
   questions: where the bytes go (a file, the response, or both), whether to re-upload automatically,
   a size limit, and what MCP returns.
 - [ ] **Live check of archive-key seeding** (roadmap P1, owner): archive and unarchive a chat with no
-  stored message, then fetch it. The code is done (ec3691f). The 2026-10-22 runs never received an
+  stored message, then fetch it. The code is done (2768412). The 2026-10-22 runs never received an
   archive event because the device had been re-paired (issue above). Retest on a device paired from
   an empty DB.
 - [ ] **`@lid` DM split** (roadmap P2): re-key the rows once the LID mapping is known; needs a
@@ -346,7 +346,7 @@ connect over HTTP (remote/multiplexed) as well as spawn-as-child stdio.
 |---|---|---|---|
 | 2026-10-15 | The MCP `whatsrust_send` schema declared `link_preview` and `schedule_at`, but the tool calls `/api/send?sync=true`, which rejects both with 400, so they could never work via MCP | Both fields removed from the MCP schema; REST and CLI keep them | ADR 0046 |
 | 2026-10-15 | A sync send that times out must not be retried blindly | 30 s timeout returns HTTP 504 with the `job_id` and "do not retry"; the job stays queued and is usually delivered later | ADR 0047 |
-| 2026-10-20 | Stdio `initialize` advertised `2024-11-05` (before tool annotations), returned no `instructions` and had no `ping` | Stdio negotiates 2025-11-25 / 2025-06-18 through the shared helpers in `src/mcp_registry.rs`, returns `instructions`, answers `ping` | 858de51; ADR 0045 amendment |
+| 2026-10-20 | Stdio `initialize` advertised `2024-11-05` (before tool annotations), returned no `instructions` and had no `ping` | Stdio negotiates 2025-11-25 / 2025-06-18 through the shared helpers in `src/mcp_registry.rs`, returns `instructions`, answers `ping` | d4cddad; ADR 0045 amendment |
 
 ### Open items (follow-ups, not in the MVP)
 
@@ -526,7 +526,7 @@ Keep each debug/live run's state out of the project root (added 2026-10-19).
   column, `list --tmux` only those running in a session (2026-10-19, tmux made opt-in 2026-10-20).
   `clear-data <profile> [--all] [--dry-run] [--yes]` empties a profile's message data and keeps its pairing:
   it refuses while the daemon runs, prints the exact SQL, asks y/N and then for the profile name, and backs up
-  to `whatsapp.db.pre-clear-<UTC>.bak` first (b9c7dd2, 2026-10-21).
+  to `whatsapp.db.pre-clear-<UTC>.bak` first (548d1d8, 2026-10-21).
   Docs: HOWTO §3 "Run profiles" (incl. a demo playbook).
 - [x] Approach decision — A: profile folders + launcher script (owner, 2026-10-19)
 - [x] Script + Makefile target + docs — done 2026-10-19
