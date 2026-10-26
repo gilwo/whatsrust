@@ -665,6 +665,470 @@ cursors all stay in `whatsapp.db` (ADR 0043).
 
 ---
 
+## 3b. Run as a service (launchd / systemd)
+
+**Goal:** run the daemon in the background. Start it again after a crash.
+
+**When to use it:** for the instance that you keep running. Use `scripts/run-profile.sh` (§3, "Run profiles") for
+development runs. Use `scripts/deploy.sh` for deployment.
+
+**Rule: an unpaired instance never runs unattended.** A service has no terminal, so nobody can scan a QR code in it.
+Only two commands start an unpaired instance: `run` and `re-pair`. They start it while your terminal shows the QR
+code. If you press Ctrl+C, or if nobody scans the code in 5 minutes, the script stops the service again.
+
+**How the rule is enforced: the start gate.** The unit does not start the daemon. It starts
+`<directory>/bin/start-if-paired`, a small script. The gate checks the database
+(`sqlite3 -readonly whatsapp.db "SELECT pn FROM device WHERE id = 1"`):
+
+| Case | The gate |
+|---|---|
+| Paired | starts the daemon (`exec bin/whatsrust`, so the exit codes below stay the same) |
+| Not paired, and a QR flow of `run` or `re-pair` is active | starts the daemon |
+| Not paired, no QR flow | writes one line to the log (`whatsrust <instance>: not paired, not starting; run: scripts/deploy.sh run <instance>`) and exits 0. Neither launchd nor systemd restarts after exit 0. |
+| Cannot read the DB (locked, no permission, damaged) | tries 3 times (3 s wait each, 1 s apart), then **fails closed**: logs `whatsrust <instance>: cannot read whatsapp.db (<reason>); not starting` and exits 0 |
+| `sqlite3` is not installed | cannot tell: starts the daemon and writes a warning to the log (the only start without proof) |
+
+The gate reads only the standard output of `sqlite3 -batch -init /dev/null -readonly`, so a `~/.sqliterc` (for example
+`.headers on`) cannot make an unpaired DB look paired.
+
+A QR flow is marked by `<directory>/.qr-flow` (mode 600). It holds the PID of the `deploy.sh` process that runs the
+flow and that process's start time (`ps -o lstart=`). The gate counts the flow as active only when all of these hold:
+the PID is a number above 1; the file is not older than 15 minutes; the process is alive (`kill -0`, which sends no
+signal); and it still has the recorded start time. So a PID that another program reuses does not count. A stale file is ignored and removed. `run` and
+`re-pair` remove the file on every way out (success, timeout, Ctrl+C, closed terminal, error). If `run` or `re-pair`
+exits for any reason other than a link (also through an error), its exit handler stops the service that it started
+for the QR flow. So a crash, a login (autostart), a reboot or a manual `launchctl` or `systemctl` start cannot start
+an unpaired instance. **Install `sqlite3`.** Without it the gate cannot tell, so it starts the daemon after every restart (with a
+warning in the log). `install` warns when `sqlite3` is missing.
+
+**Known limit.** If you unlink the device on the phone WHILE the daemon runs, the daemon keeps running and shows a QR
+code until its next restart. The gate runs only at a start. Only a change in the daemon could close that gap. `status`
+warns when the service runs on an unpaired database. Stop it with `stop`, then pair it again with `run`.
+
+A SIGKILL or a power loss of `deploy.sh` during a QR flow cannot be trapped. The service then keeps running until the
+next `stop` or reboot. The gate keeps it from starting again: it honours a marker only while that process lives and is
+`deploy.sh`, and for 15 minutes at most.
+
+`scripts/deploy.sh` renders a template from `deploy/supervisor/` and loads it into launchd (macOS LaunchAgent) or
+systemd (Linux user unit). It signals the daemon only through the supervisor (`launchctl`, `systemctl`). It manages
+only the units that it creates. It never touches `runs/` or the repo's own `whatsapp.db`. Run
+`scripts/deploy.sh --help` for the overview and `scripts/deploy.sh <command> --help` for one command.
+
+| You need | For |
+|---|---|
+| `make release` (`target/release/whatsrust`) | every instance |
+| `make embedder-build` (`embedder-rs/target/release/whatsrust-embedder`) | semantic search only |
+| A terminal | `install` (questions), `run` and `re-pair` (QR code) |
+| `sqlite3` (strongly advised) | the start gate and `paired:`. Without it, `paired` is `unknown` and the gate starts the daemon with only a warning. |
+| `openssl` | the tokens (`openssl rand -base64 32`) |
+
+### Instance directory and registry
+
+Each instance has its own directory outside the repo. The daemon starts in it, so all its state goes there.
+
+| | macOS | Linux |
+|---|---|---|
+| Default directory | `~/Library/Application Support/whatsrust/<instance>/` | `${XDG_DATA_HOME:-~/.local/share}/whatsrust/<instance>/` |
+| Unit | `<directory>/local.whatsrust.<instance>.plist`. `autostart on` copies it to `~/Library/LaunchAgents/`. | `${XDG_CONFIG_HOME:-~/.config}/systemd/user/whatsrust-<instance>.service` |
+| Label or unit name | `local.whatsrust.<instance>` | `whatsrust-<instance>.service` |
+| Logs | `<directory>/logs/daemon.log` | the journal |
+
+An instance name has lower-case letters, digits and `-` (1 to 32 characters, not starting with `-`). The directory has
+this layout:
+
+```
+<instance directory>/
+  bin/whatsrust                      a COPY of the release binary (mode 755)
+  bin/start-if-paired                the start gate that the unit runs (mode 755)
+  bin/whatsrust-embedder             a copy of the embedder (semantic search only)
+  .whatsrust-deploy                  the ownership marker (mode 600): "managed by scripts/deploy.sh; instance=<name>"
+  .qr-flow                           only during a QR flow of run / re-pair: the PID that runs it (mode 600)
+  .env                               the config (mode 600): ports, tokens, device name
+  deploy.conf                        the deploy choices (mode 600): autostart, binary sources
+  local.whatsrust.<instance>.plist   macOS only: the unit that `run` loads
+  logs/daemon.log                    macOS only (mode 600)
+  whatsapp.db (+ -wal, -shm)         the database: this is the pairing, keep it safe
+  whatsapp.db.backups/               the daemon's backups
+  whatsapp.db.instance.lock          the instance lock
+  re-pair-backup-<UTC>/              made by `re-pair` (mode 700)
+```
+
+`install` also writes a **registry file**: `${XDG_CONFIG_HOME:-~/.config}/whatsrust/deploy/<instance>.dir`. It has one
+line: the absolute path of the instance directory. Every other command finds the directory there. `uninstall`
+removes the file. A command for an instance without a registry file stops with "is not installed".
+
+### Commands
+
+```bash
+scripts/deploy.sh install main                 # wizard: directory, ports, tokens, ... Starts nothing.
+scripts/deploy.sh run main                     # start it. Paired: wait for the connection. Not paired: show the QR code.
+scripts/deploy.sh status main                  # paired, connected, state, PID, last exit, restarts, autostart
+scripts/deploy.sh logs main -n 100 --follow    # the last 100 lines, then new lines (Ctrl+C stops)
+scripts/deploy.sh stop main                    # graceful stop; the service stays installed
+scripts/deploy.sh restart main                 # graceful restart
+scripts/deploy.sh upgrade main                 # copy the new binary over the installed one, restart if it ran
+scripts/deploy.sh autostart main on            # start at login (only a paired instance)
+scripts/deploy.sh re-pair main                 # link to the phone again (wizard)
+scripts/deploy.sh uninstall main               # remove the unit; ask whether to delete the data (wizard)
+```
+
+| Command | What it does |
+|---|---|
+| `install [<instance>]` | Wizard (10 steps). Writes the directory, the ownership marker, the binary copy, the start gate, `.env`, `deploy.conf`, the registry file and the unit. **Starts nothing.** Repeat it to change a setting. |
+| `run <instance>` | Starts the service. Refuses when it runs already. Paired: waits up to 60 s for `connected: true`. Not paired: shows the QR code until you scan it. |
+| `stop <instance>` | Graceful stop. macOS: `launchctl bootout`. Linux: `systemctl --user stop`. |
+| `restart <instance>` | Graceful restart (details below). Refuses a stopped or unpaired instance. |
+| `re-pair <instance>` | Wizard: mode `fresh` or `keep-history`, device name, confirmation. Then the QR flow of `run`. |
+| `autostart <instance> on\|off` | Start the service at login. `on` refuses an unpaired instance. |
+| `uninstall <instance>` | Stops the service, removes the unit and the registry file. Then asks about the data. |
+| `status <instance>` | `paired: yes\|no\|unknown`, `start gate:` (open or closed), `connected:`, state, PID, last exit, restarts, `autostart:`, directory, binary checksum. When the DB is unpaired, it also switches autostart off. |
+| `logs <instance> [-n N] [--follow]` | macOS: `tail` of `logs/daemon.log`. Linux: `journalctl --user -u whatsrust-<instance>.service`. |
+| `upgrade <instance> [--binary <path>] [--embedder <path>]` | Copies the new binary (and the embedder) atomically, prints the old and new SHA-256, restarts if it ran. |
+
+Options for all commands that change something: `--dry-run` prints the plan and the commands and changes nothing.
+`--platform launchd|systemd` selects the platform. Without `--dry-run` it must match the host. So you can review the
+Linux unit on a Mac with `scripts/deploy.sh install demo --yes --dry-run --platform systemd`.
+
+Exit codes of the script: 0 = done, 1 = failed (not installed, no binary, supervisor error, not linked in time,
+aborted), 2 = usage error (also: no answer on stdin).
+
+### The install wizard
+
+`install` asks one step at a time. Each step shows its default. Press Enter to take it. Type a number to pick from a
+list. Type text to set a value. A wrong answer is asked again. At the end, `install` prints a summary of all values
+(tokens only as "generated", "kept" or "none") and asks `Write it? [y/N]`. The prompts read stdin, so you can pipe
+the answers. If stdin ends before an answer, the command stops with exit 2: `no answer: use the flags and --yes`.
+
+| Step | Default | Flag |
+|---|---|---|
+| 1. Instance name | the argument, else `main` | the `<instance>` argument |
+| 2. Directory | the per-OS default above, or a custom absolute path (see "Which directory `install` accepts") | `--dir <path>` |
+| 3. Daemon binary | `<repo>/target/release/whatsrust`, or a path. The wizard shows its SHA-256. | `--binary <path>` |
+| 4. REST port | the first free port from 7280 in steps of 10. A port is taken when something listens on it, or when another deploy instance has it in its `.env`. The wizard shows the taken ports. | `--port <n>` |
+| 5. REST API token | generate. Or `none` (loopback only), `keep` (re-install), regenerate. | `--api-token generate\|none\|keep` |
+| 6. MCP HTTP listener | off. On: port = REST port + 1, a generated token (kept on re-install). | `--mcp on\|off`, `--mcp-port <n>` |
+| 7. Semantic search | off. On: model `bge-m3` or `minilm`, and the embedder binary (default `<repo>/embedder-rs/target/release/whatsrust-embedder`). The wizard copies it into `<directory>/bin/`. | `--semantic on\|off`, `--model bge-m3\|minilm`, `--embedder <path>` |
+| 8. Device name | `whatsrust`. WhatsApp reads it once, at pairing (§3a). On a paired instance a change needs `re-pair`. | `--device-name <name>` |
+| 9. Store the pairing history | on (ADR 0048) | `--pairing-history on\|off` |
+| 10. Autostart at login | off. The wizard applies it only for a paired instance. | `--autostart on\|off` |
+
+Other options: `--yes` takes the default of every step that has no flag, and skips the confirmation. `--dry-run`
+prints the summary, the rendered unit and the steps, and writes nothing. A flag for a step skips the questions of
+that step.
+
+Example without questions:
+
+```bash
+scripts/deploy.sh install main --yes --port 7280 --mcp on --semantic on --model bge-m3 --device-name whatsrust-main
+```
+
+**Which directory `install` accepts.** A directory that does not exist, is empty, or already holds the ownership marker
+`.whatsrust-deploy`. `install` writes the marker (mode 600, content `managed by scripts/deploy.sh; instance=<name>`)
+right after it creates the directory. A non-empty directory is accepted only when its marker names **this** instance.
+So `uninstall main --keep-data` followed by `install other --dir <main's directory>` is refused: it would adopt the
+paired database and the tokens of `main`. Install it again under its old name, or edit the marker on purpose. The
+directory must not equal, lie inside or contain the directory of another registered instance. `install` refuses every
+other directory too, for example a `~/.cargo` that holds a file `bin/whatsrust`. It checks again right before it
+writes. All checks compare **physical paths** (symbolic links resolved with `pwd -P`): the directory must not
+be `/`, `$HOME` or a parent of it, or the repo or a parent of it. On macOS the paths are compared case-folded (APFS is
+usually case-insensitive); on Linux they are compared exactly. A path with `@`,
+`..`, `"`, `\`, `$`, a backtick or a control character is refused. To adopt a directory that you made yourself, create
+the marker first: `printf 'managed by scripts/deploy.sh; instance=main\n' > <directory>/.whatsrust-deploy`.
+
+**Foreign units.** Every unit file that the script writes carries a marker: `managed-by: scripts/deploy.sh` (plist: an
+XML comment, and the label names the instance; systemd: a comment line with the instance). The script refuses to
+install over, overwrite, remove, stop or boot out a unit file, a `~/Library/LaunchAgents` copy or a loaded launchd
+label that has no marker or no registry entry. A symbolic link (even a dangling one) at a unit path is refused. On
+Linux, a new instance is also refused when a unit of that name is active, or comes from another place than the
+script's own unit file (for example `/etc/systemd/user`). Move such a file away yourself if it is yours.
+
+**Supervisor check.** Before `run`, `stop`, `restart`, `re-pair`, `upgrade`, `autostart`, `uninstall` or a real
+`install` change anything, the script asks launchd (`launchctl print gui/<uid>`) or the systemd user instance whether
+it answers. If it does not (no login session, no user bus), the command stops with "cannot reach ... Nothing was
+changed". "Not loaded" is an answer. "Cannot ask" is not, and the script never guesses it means "not running".
+
+**What `install` writes.** The directory tree (mode 700), the ownership marker, the binary copy (and the embedder
+copy), the start gate, `.env` (mode 600), `deploy.conf` (mode 600), the registry file and the unit. A new `.env` has the managed keys first, then a comment that
+points to `.env.example` for the other options. The tokens come from `openssl rand -base64 32`. `install` never prints
+a token, never puts one in a command line and never copies one into `deploy.conf`.
+
+The managed keys are `WHATSRUST_PORT`, `WHATSRUST_API_TOKEN`, `WHATSRUST_MCP_PORT`, `WHATSRUST_MCP_TOKEN`,
+`WHATSRUST_EMBEDDER_CMD`, `WHATSRUST_EMBEDDER_ARGS`, `WHATSRUST_DEVICE_NAME` and `WHATSRUST_STORE_PAIRING_HISTORY`.
+
+**Re-install.** Run `install` again for an existing instance. The wizard starts with the current values (from `.env`
+and `deploy.conf`) as defaults. `install` then:
+
+- changes only the managed keys in `.env`, in place, and keeps every other line (a feature that you switch off gets
+  its keys commented out; "pairing history on" is the default, so it comments that key out);
+- keeps the installed binary (`upgrade` replaces it) and the directory (to move it, `uninstall` first, keep the data,
+  and `install` again with `--dir`), and writes the start gate and the unit again;
+- restarts the service gracefully, if it was running.
+
+### Pair and start: `run`
+
+`run` refuses when the service runs already.
+
+| The instance is | `run` does |
+|---|---|
+| **Paired** | Starts the service. Waits up to 60 s until `status` reports `connected: true`. Prints the PID. Applies autostart if `deploy.conf` says `on`. |
+| **Not paired** (or unknown) | Switches autostart off (if it was on), writes `<directory>/.qr-flow`, then starts the service. Waits up to 30 s for the REST API. Then every 2 s it draws the QR code from `whatsrust qr` in your terminal. It redraws only when the code changes. |
+
+The waits use wall-clock time. A signal during the QR flow (Ctrl+C, a closed terminal, a closed output pipe, SIGQUIT,
+SIGTERM) first stops the service, then prints a message. A broken terminal or pipe never keeps the script from
+stopping the service. The script removes `.qr-flow` on every way out.
+
+For an unpaired instance, scan the code with **WhatsApp → Settings → Linked devices → Link a device**. When the phone
+confirms, `run` prints `linked as <device name>; the service runs in the background` and the PID, and applies
+autostart. If you press Ctrl+C, or if nobody scans in 5 minutes, `run` stops the service gracefully and prints that
+nothing unpaired is left running (exit 1). The QR flow needs the REST API: `run` refuses to show a QR code for an
+instance with `WHATSRUST_PORT=0`.
+
+How `run` decides: it reads `SELECT pn FROM device WHERE id = 1` with `sqlite3 -readonly` (a non-empty value means
+paired; no database file means not paired). If the instance is paired but the phone has unlinked the device, the
+daemon clears its credentials at the next connect. `run` sees that, switches autostart off, and continues with the QR
+flow.
+
+### Re-pair
+
+Use `re-pair` to link the instance to the phone again, for example to change the device name (§3a).
+
+| Mode | What happens | When |
+|---|---|---|
+| `fresh` (default) | Stops the service. Moves `whatsapp.db` (+ `-wal`, `-shm`) to `<directory>/re-pair-backup-<UTC>/` (mode 700). Sets the device name. Runs the QR flow of `run` on an empty database. Tells you to remove the OLD device on the phone. | Normal case. It avoids the open bug below. The message history starts empty. |
+| `keep-history` | Tells you to unlink the device on the phone first and asks `done? [y/N]`. Stops the service. **Copies** the database files to the backup folder. Sets the device name. Runs the QR flow. | You need the old history. It may hit the bug below. |
+
+**Open bug (roadmap P1).** A re-pair that keeps the database keeps the old app-state data. The new link then gets no
+push name and no archive or read-state events. A pairing from an empty database avoids it. That is why `fresh` is the
+default.
+
+In `keep-history` mode the daemon may connect with the old link: there is no QR code within about 30 s and
+`connected` is `true`. Then `re-pair` prints `the device is still linked: unlink it on the phone, then run re-pair
+again` and leaves the service running. Autostart is off during a `re-pair` and comes back when the new link works.
+`re-pair --mode fresh|keep-history --device-name <name> --yes` runs without questions.
+
+### Autostart
+
+| | macOS | Linux |
+|---|---|---|
+| `autostart <instance> on` | Copies the plist from the instance directory to `~/Library/LaunchAgents/`. launchd loads it at your next login. | `systemctl --user enable`. Prints the linger hint. |
+| `autostart <instance> off` | Removes that copy. | `systemctl --user disable` |
+
+`on` refuses an unpaired instance (run it first): autostart must never start an unpaired instance. The start gate
+backs this up: even with autostart on, an unpaired instance does not start at login. `run`, `re-pair`, `status`
+and `install` switch autostart off while the database is unpaired (`deploy.conf` keeps your choice, and the next
+successful link applies it again). Neither command starts or stops the service now. The choice goes into `deploy.conf`. A LaunchAgent runs only while you are logged in.
+A systemd user service stops when your last session ends. To start it at boot and keep it after logout, run
+`loginctl enable-linger "$USER"` once. The script prints this hint and never runs it.
+
+### Uninstall
+
+`uninstall` stops the service gracefully, removes the unit (macOS: both plist copies; Linux: the unit file, then
+`daemon-reload`) and the registry file. Then it asks `Delete the instance data (DB, pairing, backups)? [y/N]`.
+
+| Answer | Result |
+|---|---|
+| No (default) | Prints the data directory. The data stays. `install <instance> --dir <that directory>` uses it again. |
+| Yes | Asks `Back up the data first? [Y/n]` and where (default `~/whatsrust-backups/<instance>-<UTC>.tar.gz`). It writes the archive (mode 600, in a parent folder of mode 700), checks it (`tar -tzf` lists files), prints its path and size. Then you type the instance name. Only then it deletes the directory. |
+
+Before `rm -rf`, the script checks the directory by its physical path. It must be the registered one, absolute, not
+`/`, not `$HOME` or a parent of it, not inside the repo or a parent of it, no symbolic link, not overlapping the
+directory of another registered instance, and it must hold `bin/whatsrust` **and the ownership marker
+`.whatsrust-deploy` with this instance's name**. Otherwise it refuses and keeps the data. The script checks this
+first: when the check fails, it asks no data question. It runs the check again, and resolves the physical path
+again, right before `rm -rf`. It removes the registry entry LAST, so a failed backup leaves an instance that a second
+`uninstall` can finish. A backup file inside the directory (by physical path) is refused too. With flags, the script refuses
+bad values (`--confirm`, `--backup`, a directory that fails the checks) before it changes anything.
+
+Options for scripts: `--keep-data`, `--delete-data`, `--backup <path>`, `--no-backup`, `--confirm <instance>` (it
+replaces the typed name; required with `--delete-data` when nobody can type). Deleting local data does not unlink the
+device: remove it on the phone (WhatsApp → Settings → Linked devices).
+
+### Restart policy and exit codes
+
+The supervisor restarts the daemon after every exit that is not status 0. It waits at least 10 s between two starts.
+It does not restart after exit 0.
+
+| Setting | launchd | systemd |
+|---|---|---|
+| Restart | `KeepAlive` with `SuccessfulExit=false` | `Restart=on-failure` |
+| Wait | `ThrottleInterval` 10 | `RestartSec=10` |
+| Give up | never | `StartLimitIntervalSec=300`, `StartLimitBurst=5` |
+| Stop | SIGTERM, SIGKILL after `ExitTimeOut` 30 | `KillSignal=SIGTERM`, `TimeoutStopSec=30` |
+| Start | `RunAtLoad` true: `launchctl bootstrap` starts the job | `systemctl --user start`; `StandardInput=null`; `WantedBy=default.target` |
+| Program | `ProgramArguments`: `<directory>/bin/start-if-paired` | `ExecStart="<directory>/bin/start-if-paired"` |
+
+| Exit | Meaning | Restart? |
+|---|---|---|
+| 0 | Graceful stop: SIGINT or SIGTERM. The daemon drains, backs up the DB and exits. | No |
+| 1 | Startup refusal (unsafe API or MCP config, port in use, another instance holds the lock) or an error returned by the daemon. | Yes, after 10 s |
+| 101 | Panic. The panic hook logs one `ERROR whatsrust::panic` line, then exits. | Yes, after 10 s |
+| 0 from the start gate | The instance is not paired and no QR flow is active. One log line says so. | No (by design) |
+| killed by a signal | For example SIGKILL from the out-of-memory killer. | Yes |
+
+`restart` is graceful. macOS: `launchctl kill SIGTERM`, then it waits up to 35 s until the process is gone (exit 0 is
+not restarted by `KeepAlive`), then `launchctl kickstart`. If the daemon does not stop in 35 s, it falls back to
+`kickstart -k` and says so. Linux: `systemctl --user restart`.
+
+**Known consequence.** A config error (exit 1) makes the daemon fail again at every start, so it restarts every 10 s
+until you fix it. systemd gives up after 5 starts in 300 s: `status` then shows `failed` with result
+`start-limit-hit`. After you fix the cause, run `scripts/deploy.sh run <instance>`. It resets the failed state
+(`systemctl --user reset-failed whatsrust-<instance>.service`) and starts the service again. launchd never gives up
+and keeps trying. In both cases `status` shows the last exit code (1 = config or startup refusal, 101 = panic) and
+`logs` shows the reason.
+
+### Logs
+
+- macOS: launchd writes standard output and standard error to `<directory>/logs/daemon.log`. The log has no colour
+  codes (`NO_COLOR=1`). **launchd does not rotate this file.** Check its size with `du -h "<directory>/logs/daemon.log"`.
+  To rotate it by hand, run these commands (the daemon keeps writing to the moved file until it restarts):
+  ```bash
+  LOG="<directory>/logs/daemon.log"
+  mv "$LOG" "$LOG.1" && (umask 077 && : > "$LOG")
+  scripts/deploy.sh restart <instance>
+  ```
+- Linux: the journal keeps the logs and rotates them. Use `scripts/deploy.sh logs <instance>`.
+
+### Upgrade
+
+```bash
+make release                        # and: make embedder-build, if semantic search is on
+scripts/deploy.sh upgrade main
+```
+
+The service runs its own copy of the binary (`bin/whatsrust`), so `make release` alone does not change a running
+service. `upgrade` copies the new binary atomically (to `bin/whatsrust.new`, then a rename) and prints the old and the
+new SHA-256. When semantic search is on and the embedder source exists, it replaces the embedder copy the same way.
+It also writes `bin/start-if-paired` again from the template. If the service ran, `upgrade` restarts it gracefully.
+If it was stopped, `upgrade` only replaces the files. The source
+is `--binary`, else the path that `install` recorded in `deploy.conf`, else `target/release/whatsrust`.
+
+### Rules to know
+
+- **Unlink on the phone while it runs.** See "Known limit" at the top of this section.
+- **Re-pair and signals.** `re-pair` ignores Ctrl+C and the other signals while it moves or copies the DB files, so
+  an interrupt cannot split the database between two directories. A failed move is rolled back.
+- **Instance lock.** The service holds `whatsapp.db.instance.lock` in its directory. A second daemon on the same
+  database refuses to start (exit 1). Never run a dev daemon in the instance directory.
+- **Ports.** The daemon default is 7270. `install` proposes the first free port from 7280. Dev profiles (§3) use 9270
+  and up. Two instances, or an instance and a dev profile, must not share `WHATSRUST_PORT` or `WHATSRUST_MCP_PORT`.
+- **Config.** The service does not read your shell environment. It reads the instance's `.env` (the unit sets
+  `WHATSRUST_ENV_FILE` to it) and `NO_COLOR=1`. The daemon keeps the **first** value that it sees for a key in a
+  `.env`, and real environment variables win over the file. The daemon reads the `.env` only at start: after an edit,
+  run `scripts/deploy.sh restart <instance>`. `WHATSRUST_EMBEDDER_CMD` must be an absolute path (`install` writes the
+  path of the copy in `bin/`). The `.env` holds tokens: keep it at mode 600.
+- **No REPL.** The service gives the daemon no terminal input (stdin is `/dev/null`). The REPL ends and the daemon
+  keeps running. Drive it with the CLI (§4).
+- **The CLI does not read `.env`.** Give it the port and the token as environment variables, never as arguments:
+  ```bash
+  INST="$HOME/Library/Application Support/whatsrust/main"     # Linux: "${XDG_DATA_HOME:-$HOME/.local/share}/whatsrust/main"
+  export WHATSRUST_PORT=$(sed -n 's/^WHATSRUST_PORT=//p' "$INST/.env" | head -1)
+  export WHATSRUST_API_TOKEN=$(sed -n 's/^WHATSRUST_API_TOKEN=//p' "$INST/.env" | head -1)   # empty when the token is "none"
+  "$INST/bin/whatsrust" status
+  ```
+- **macOS login.** A LaunchAgent runs only while you are logged in.
+- **Linux linger.** A systemd user service stops when your last session ends, unless lingering is on (see Autostart).
+
+| Symptom | Likely cause and fix |
+|---|---|
+| `launchctl bootstrap failed` | A job with this label is loaded already, or you are not in a login session. Run `scripts/deploy.sh stop <instance>`, then `run` again. |
+| `the REST API did not answer within 30 s` | The daemon fails at start (exit 1) or listens on another port. Run `scripts/deploy.sh logs <instance>`. |
+| `status` shows `WARNING: ... not paired` while the service runs | The phone unlinked the device. Run `scripts/deploy.sh stop <instance>`, then `run` (QR code). |
+| `run` shows no QR code and no connection | The daemon cannot reach WhatsApp (network). `run` stops the service after 5 minutes. |
+
+### Move an existing live state into an instance (one-time checklist for the owner)
+
+Use this to move a live daemon from the repo root (`SRC=.`) or from `runs/main/` (`SRC=runs/main`) to a service.
+
+1. Stop the old daemon with Ctrl+C in its terminal. This stops it gracefully: it drains, backs up the DB and exits 0.
+2. Install the instance. Port 7270 is fine now, because the old daemon is stopped: answer `7270` at step 4. Set the
+   MCP and semantic search steps like the old `.env`. Leave autostart off for now.
+   ```bash
+   scripts/deploy.sh install main
+   ```
+3. Copy the state into the instance directory. Copy `-wal` and `-shm` only if they exist. The service is not running
+   yet, so nothing holds the database:
+   ```bash
+   SRC=.    # or runs/main
+   INST="$HOME/Library/Application Support/whatsrust/main"    # Linux: "${XDG_DATA_HOME:-$HOME/.local/share}/whatsrust/main"
+   for f in whatsapp.db whatsapp.db-wal whatsapp.db-shm; do if [ -e "$SRC/$f" ]; then cp -p "$SRC/$f" "$INST/"; fi; done
+   if [ -d "$SRC/whatsapp.db.backups" ]; then cp -Rp "$SRC/whatsapp.db.backups" "$INST/"; fi
+   ```
+   Install first, then copy: `install` accepts only a missing, an empty or a marked directory. If you copied the files
+   before `install`, create the marker as described in "Which directory `install` accepts".
+4. Merge the old `.env` settings into `$INST/.env`. Copy only the settings that `install` does not manage (for example
+   `RUST_LOG`, `WHATSAPP_ALLOWED`, the backfill knobs). Put them below the managed keys. Do not copy the managed keys:
+   the daemon keeps the first value that it sees, and `install` sets them. Use absolute paths.
+5. Start it: `scripts/deploy.sh run main`. The database is paired, so there is no QR code: the service starts in the
+   background, `run` waits for `connected: true` and prints the PID.
+6. Check it: `scripts/deploy.sh status main` shows `paired: yes` and `connected: yes`. `scripts/deploy.sh logs main -n 50`
+   shows a connection and **no** QR code. Then switch autostart on: `scripts/deploy.sh autostart main on`.
+7. Keep the old copy until you have verified the service for a few days. **Never start the old copy while the service
+   runs:** never run two copies of the same paired DB at once (§3, caveat). Then delete the old copy.
+
+### Demo playbook: install, pair, crash, re-pair, uninstall
+
+**Goal:** see the whole life of an instance on a throwaway instance named `demo`. Each step shows the expected
+result.
+
+**Warning: the demo links one extra device to your WhatsApp account.** WhatsApp allows up to 4 linked devices. The
+device stays linked until you remove it on the phone (WhatsApp → Settings → Linked devices → the device → Log out).
+Step 9 links a second one. Remove both at the end.
+
+1. **Build.** `make release`. Expected: `target/release/whatsrust` exists.
+2. **Install.** `scripts/deploy.sh install demo`. Press Enter at every step. At step 8, you can type `whatsrust-demo` to
+   find the device on the phone. Type `y` at `Write it? [y/N]`. Expected, at the end (macOS; the paths differ on Linux):
+   ```
+   installed instance 'demo' (launchd):
+     directory:       /Users/you/Library/Application Support/whatsrust/demo
+     unit file:       /Users/you/Library/Application Support/whatsrust/demo/local.whatsrust.demo.plist
+     .env:            /Users/you/Library/Application Support/whatsrust/demo/.env (mode 600)
+
+   next: scripts/deploy.sh run demo
+   ```
+   Nothing runs yet. `scripts/deploy.sh status demo` shows `paired: no`, `start gate: closed (not paired) ...` and
+   `state: stopped (not loaded; ...)`. The directory holds `bin/start-if-paired` and `.whatsrust-deploy`.
+3. **Run and scan.** `scripts/deploy.sh run demo`. Expected: `service started; waiting for the REST API ...`, then
+   the QR code with the line `WhatsApp → Settings → Linked devices → Link a device, then scan this code:`. Scan it.
+   Expected after the scan: `linked as whatsrust-demo; the service runs in the background` and `PID: <number>`.
+4. **Status.** `scripts/deploy.sh status demo`. Expected:
+   ```
+   instance 'demo' (launchd, local.whatsrust.demo)
+     paired:          yes
+     start gate:      open (paired): the service starts
+     connected:       yes (device name: whatsrust-demo)
+     state:           running
+     PID:             <PID 1>
+     restarts:        0 (runs since load: 1)
+     autostart:       off
+   ```
+   On Linux: `state: active (running)` and `restarts: 0`. Note the PID.
+5. **Crash.** SIGKILL is not a clean exit, so the supervisor restarts the daemon:
+   ```bash
+   launchctl kill SIGKILL gui/$(id -u)/local.whatsrust.demo     # macOS
+   systemctl --user kill -s SIGKILL whatsrust-demo               # Linux
+   ```
+6. **Restart check.** Wait about 10 s (the minimum time between two starts): `sleep 12`. Then
+   `scripts/deploy.sh status demo`. Expected: `state: running`, a **new** PID, and `restarts: 1` (macOS:
+   `restarts: 1 (runs since load: 2)`). `scripts/deploy.sh logs demo -n 30` shows the start-up lines twice.
+7. **Stop, then run again.** `scripts/deploy.sh stop demo`. Expected: `stopped instance 'demo' (graceful)`, and
+   `status` shows `stopped`. Then `scripts/deploy.sh run demo`. Expected: **no QR code**, because the instance is paired:
+   `connected; the service runs in the background` and a PID.
+8. **Autostart.** `scripts/deploy.sh autostart demo on`. Expected: `autostart of instance 'demo' is on`. Check:
+   macOS `ls ~/Library/LaunchAgents/local.whatsrust.demo.plist`; Linux `systemctl --user is-enabled whatsrust-demo.service`
+   (`enabled`). `status` shows `autostart: on`. Then `scripts/deploy.sh autostart demo off`. The macOS file is gone,
+   and Linux says `disabled`.
+9. **Re-pair.** `scripts/deploy.sh re-pair demo`. Choose mode 1 (`fresh`), press Enter for the device name, answer `y`.
+   Expected: the service stops, `moved the DB files to .../re-pair-backup-<UTC>`, the QR code appears. Scan it. Expected:
+   `linked as ...` and `re-paired. Also remove the OLD device on the phone`. Now WhatsApp lists the old and the new
+   device. Remove the **old** one on the phone.
+10. **Uninstall.** `scripts/deploy.sh uninstall demo`. Answer `y` to delete the data. Answer `Y` to the backup (Enter takes
+    the default path). Expected: `backup written and verified:` with a path and a size, then you type `demo`, then
+    `deleted <directory>`. If you answer `n` to the first question, the data stays and the command prints its path.
+    Remove the demo device on the phone too. `scripts/deploy.sh status demo` now fails with
+    `instance 'demo' is not installed`.
+
+---
+
 ## 4. Use the CLI
 
 **Goal:** drive a running daemon from the command line (every CLI command

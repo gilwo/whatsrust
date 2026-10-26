@@ -43,6 +43,7 @@ Where else to look:
 | [F7](FEATURES.md#f7) | Richer read tools | ⚪ Planned | Sender names, counts, contacts, groups and search pagination in the read surfaces. |
 | [F8](FEATURES.md#f8) | Documentation overhaul | 🟡 Started (planning docs + CHANGELOG) | README = the what, an operations guide = the how, ARCHITECTURE with diagrams. |
 | [F9](FEATURES.md#f9) | Dev run profiles | 🟢 Done; owner step open | Each debug run keeps its DB, logs and `.env` in `runs/<profile>/`. |
+| [F10](FEATURES.md#f10) | Deployment as a service | 🟢 Built (not live-tested) | `scripts/deploy.sh`: a launchd/systemd user service per instance that restarts after a crash; an unpaired instance never runs unattended. |
 
 <a id="priority-backlog"></a>
 ## Priority backlog
@@ -57,10 +58,10 @@ priority is the pick-up order.** Detail lives where the "Source" column points.
 | P | Item | Effort | Source | Depends on | Why this rank | Status |
 |---|---|---|---|---|---|---|
 | P0 | Rebuild and restart the live daemon on the fixed binary | – | ops | – | a running pre-fix binary can still abort on a long multi-byte reply | 👤 open |
-| P0 | Supervisor restart (launchd/systemd) documented | S | Q-PANIC | – | nothing restarted the daemon after the 2026-10-19 crash | ⚪ (planned with the F8 operations guide) |
 | P1 | On-demand media download for stored history (REST/CLI/MCP, from `media_refs`; an expired link can be recovered through a re-upload by the phone) | M | F1 open items; ADR 0005 | – | history rows keep media refs but no bytes; agreed as next | ⚪ |
 | P1 | Re-pair bug: logout + re-pair keeps the old device's app-state and Signal data (`clear_device` deletes only the device row and name), so the new device's app-state sync looks broken (no push name, no archive/read-state events). Confirm with a pairing from an empty DB, then wipe the device-scoped tables on logout (keep messages, `lid_pn_mapping`, `tc_tokens`) | M | F1 issues; HOWTO §3a | 👤 confirm first | the documented re-pair path breaks archive seeding, the push name, presence and (later) address-book names | ⚪ |
 | P1 | Live check of archive-key seeding | – | F1 open items | re-pair bug | the code is done (2768412); the check needs a device whose app-state sync works | 👤 open |
+| P1 | Live check of `scripts/deploy.sh` on real launchd and systemd (HOWTO §3b demo playbook) | – | F10 open items | – | built and tested only with stubs; the owner chose no smoke test on 2026-10-26; added 2026-10-26, re-rank with the owner | 👤 open |
 | P1 | Rate limiting for network-touching reads (`groups`, `group_info` cache misses) and chat-management via MCP | M | F3 open items | – | an LLM loop can hammer WhatsApp; anti-ban is a core promise | ⚪ |
 | P1 | wa-rs upgrade check | M | Q-WARS | – | the pin is from 2026-07-01 and upstream has moved | ⚪ |
 | P1 | Move the root run state into `runs/main/` | – | F9 | daemon stopped | protects the main DB while experimenting | 👤 open |
@@ -71,6 +72,7 @@ priority is the pick-up order.** Detail lives where the "Source" column points.
 | P2 | ARCHITECTURE update with Mermaid diagrams | M | F8 | README split | follows the README split | ⚪ |
 | P2 | CONTRIBUTING update | S | F8 | – | align with Makefile targets, ignored tests, commit and ADR rules, and the doc-update checklist | ⚪ |
 | P2 | Sidecar auto-respawn | M | F2 open items | – | semantic search silently stays off after a sidecar crash | ⚪ |
+| P2 | Daemon option to exit when it is unlinked (`LoggedOut`) while it runs as a service, so a supervised instance never waits unpaired | S | F10 open items | – | the start gate in `scripts/deploy.sh` stops an unpaired start, but an unlink on the phone during a run leaves the daemon showing a QR code until its next restart; added 2026-10-25, re-rank with the owner | ⚪ |
 | P2 | M2 review: bounded sidecar line read (reviewer M6) | S | F2 issues | – | a runaway sidecar could exhaust memory before the 16 MiB cap fires; Med → P2 (2026-10-23) | ⚪ |
 | P2 | M2 review: timeout on `fetch_embeddings_for_candidates` (reviewer H2); apply to the whole single-connection storage layer, not only the semantic path | M | F1 open items | – | the query embed is bounded, the candidate fetch is not; Med → P2 (2026-10-23) | ⚪ |
 | P2 | ADR 0047 job_id cell (a spawned enqueue publishes the `job_id`) | M | F3 open items | – | rare now that the tool budget starts after the body | ⚪ |
@@ -88,6 +90,7 @@ priority is the pick-up order.** Detail lives where the "Source" column points.
 | P3 | M2 review, low: cosine epsilon `< 1e-9` (M4); `max_input_tokens` floor (M2); purge non-INCREMENTAL warning in the response (M1); poison-pill-at-tail log (M3); nits L1–L4 | S | F1, F2 open items | – | defense in depth; Low/Nit → P3 (2026-10-23) | ⚪ |
 | P3 | `MsgSecretStore` for history-delivered edits, reactions and poll votes | M | F1 issues | – | added 2026-10-23 (a Phase 0 deferral no list tracked); not ranked by the owner | ⚪ |
 | P3 | F4 multi-account and F6 encryption at rest: investigation + design | L | F4, F6 | – | not ranked by the owner; each needs a design first | ⚪ |
+| P3 | Port `scripts/deploy.sh` to a Rust `whatsrust deploy` subcommand | L | F10 open items | – | the script is about 3500 lines of bash (wizard, in-place `.env` edits, QR flow, two platforms); Rust has the HTTP client and config parsing already; proposed 2026-10-25, re-rank with the owner | ⚪ |
 
 <a id="project-health"></a>
 ## Project health (not ranked)
@@ -106,7 +109,7 @@ backlog.
 | Q-DOCS | `docs/INDEX.md` / onboarding guide | Many .md files; discoverability gap (partly addressed by the doc matrix, now in `AGENTS.md`) | S–M | Med | 🟡 Partial (CLAUDE.md matrix 2026-06-17, change checklist 2026-10-23) |
 | Q-TRACE | Structured `#[instrument]` spans on `handle_event` / `execute_job` | Debugging "message didn't send / backfill stuck" means grepping flat logs | M | Med | ⚪ |
 | Q-SPLIT | Split the 900-line `extract_content_inner` / 700-line `handle_event` | Maintainability | L | Low | ⏸️ Deferred (stack-overflow history — risky) |
-| Q-PANIC | Panic visibility + recovery: a panic hook that logs the message and location before the release-mode abort, and a documented supervisor (launchd/systemd restart) | A UTF-8 slicing panic (fixed in a763838) killed a 9 h live session on 2026-10-19; `panic = "abort"` gives no log line of its own | S | High | 🟡 Hook done (219697d); supervisor docs → backlog P0 |
+| Q-PANIC | Panic visibility + recovery: a panic hook that logs the message and location before the release-mode abort, and a documented supervisor (launchd/systemd restart) | A UTF-8 slicing panic (fixed in a763838) killed a 9 h live session on 2026-10-19; `panic = "abort"` gives no log line of its own | S | High | 🟢 Done: hook (219697d) + supervised restart (`scripts/deploy.sh`, F10, ADR 0049) |
 | Q-F2B | fail2ban reference + optional helper script (install filter/jail, plain-text log via `NO_COLOR=1`) | HOWTO §5a documents a filter and jail; a script makes direct exposure safer | S | Low | → backlog P3 |
 | Q-WARS | wa-rs dependency upgrade check | Pin `9e8c70e2` (2026-07-01); upstream HEAD `7c4021d4` seen 2026-10-18. Follow AGENTS.md "To upgrade wa-rs". The untracked `wa-rs-upgrade-impact-analysis.txt` (2026-06-29) pre-dates the pin and is advisory only | M | Med | → backlog P1 |
 
@@ -118,6 +121,7 @@ recorded milestone dates; `CHANGELOG.md` sections use commit dates, which can be
 
 | Date | What | Feature / source | Reference |
 |---|---|---|---|
+| 2026-10-26 | Deployment as a service: `scripts/deploy.sh` (install wizard, `run` with the QR code in the terminal, start gate, re-pair, autostart, uninstall wizard), launchd/systemd templates, HOWTO §3b; not live-tested | F10, P0 supervisor restart, Q-PANIC | ADR 0049 |
 | 2026-10-25 | Doc hashes remapped after the 2026-10-23 rebase-merge; `scripts/remap-doc-hashes.sh` added, with the "after a merge" step in AGENTS.md | docs | – |
 | 2026-10-23 | Planning docs restructured (FEATURES = detail, this roadmap = map/order/completed), `CHANGELOG.md` started, doc-update checklist; project instructions split into `AGENTS.md` (tool-neutral) + `CLAUDE.md` (imports it) | F8 | – |
 | 2026-10-22 | fetch-history: store the pairing history and late on-demand answers; live-verified 2026-10-22 | F1 | b15aeec; ADR 0048 |

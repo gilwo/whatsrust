@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- managed-by: scripts/deploy.sh -->
+<!-- launchd LaunchAgent for one whatsrust instance. Rendered by scripts/deploy.sh install from
+     deploy/supervisor/whatsrust.plist.in: edit the template, not this file. The rendered file stays in
+     the instance directory. `run` loads it with launchctl bootstrap; `autostart on` copies it to
+     ~/Library/LaunchAgents/, so that launchd loads it at login. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@LABEL@</string>
+	<!-- The start gate, not the daemon: it starts bin/whatsrust only for a paired instance or during a QR flow. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>@START@</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>@DIR@</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>WHATSRUST_ENV_FILE</key>
+		<string>@ENV_FILE@</string>
+		<key>NO_COLOR</key>
+		<string>1</string>
+	</dict>
+	<!-- Start the daemon as soon as the job is loaded: launchctl bootstrap (run) or login (autostart). -->
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Restart after any exit that is not status 0 (a panic exits 101); never after a clean stop. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<!-- Wait at least 10 s between starts. -->
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<!-- Time the daemon gets after SIGTERM to drain and back up the DB before launchd sends SIGKILL. -->
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+	<key>StandardOutPath</key>
+	<string>@LOG@</string>
+	<key>StandardErrorPath</key>
+	<string>@LOG@</string>
+</dict>
+</plist>
