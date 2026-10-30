@@ -6,6 +6,9 @@ This file tracks notable changes to the whatsrust experimental fork. The project
 
 Work on branch `feature/media-download`, not yet on `main`.
 
+### Added
+- Design for the on-demand media download of stored history (per-chat folders, background fetch, a media file listener with short-lived URLs, schema v9): `docs/plans/2026-10-29-on-demand-media-download-design.md`, ADR 0050 (Proposed), ADR 0005 amendment; not built yet
+
 ## 2026-10-26 — Deployment as a service, doc hash remap
 
 Merged from `ops/supervisor` (rebase-merge; main commits 60596a5 and 829a62a).

@@ -203,18 +203,19 @@ a real account)
 | 2026-10-21 | Fresh profiles had no anchors; late on-demand answers were dropped | Store the pairing package and late answers | b15aeec; ADR 0048 |
 | 2026-10-22 | After logout + re-pair, the device gets no push name and no archive/read-state events (seen as an empty history after an archive/unarchive test) | **Open.** Suspected cause: `Store::clear_device` deletes only the device row and name, so the old device's app-state and Signal data stay. Confirm with a pairing from an empty DB | roadmap P1; HOWTO §3a |
 | 2026-10-22 | A pairing-package DM without `pnJid` stays under its `@lid` JID, while live messages from that contact go under the phone JID | **Open** (the `@lid` split below) | roadmap P2 |
+| 2026-10-29 | Media download design v1, cold review: needs rework (1 blocking, 10 major). Blocking: files served inline with the sender's MIME type on the API's origin could run script that reads the history. Major, among others: whole-file response buffering, no stall timeout, a disk check that trusts the sender's size, an unproven re-upload path, no permanent failure states, a false "no schema change", missing references | v2 (2026-10-30): a dedicated media file listener with hardened headers, streaming, a watchdog, a 20 GB reserve, a re-upload lane with a breaker, schema v9, `no_reference` states | `_reviewer/design/2026-10-29-on-demand-media-download.md`; ADR 0050 |
+| 2026-10-30 | Should wa-rs be upgraded before the media download? A first report recommended v0.7.0, but most commits it cited came after v0.7.0 (checked with the GitHub compare API) | A compile spike measured 165 errors (v0.7.0) and 298 (`main`), and v0.7.0 lacks the media-related changes; the owner deferred the upgrade, and the media work isolates the wa-rs parts in one adapter | roadmap Q-WARS |
 
 ### Open items
 
-- [ ] **On-demand media download** for stored history: REST/CLI/MCP download from `media_refs`
-  (roadmap P1, next). **Findings (2026-10-23, wa-rs pin `9e8c70e`):** `Client::download_from_params`
-  needs the media type, which `media_refs` does not store, but `messages.content_kind`
-  (image/audio/video/document/sticker) maps 1:1 to it, so no schema change is needed; the plaintext
-  hash is checked only for unencrypted (newsletter) media. An expired CDN link can be recovered:
-  `client.media_reupload().request(...)` asks the phone to re-upload and returns a new `direct_path`
-  (the phone must be online). `media_refs.hydrated_path` exists and nothing uses it yet. Open design
-  questions: where the bytes go (a file, the response, or both), whether to re-upload automatically,
-  a size limit, and what MCP returns.
+- [ ] **On-demand media download** for stored history (roadmap P1, next). **Designed** 2026-10-29 → 30:
+  `docs/plans/2026-10-29-on-demand-media-download-design.md` (v2, owner-approved) and ADR 0050 (Proposed):
+  per-chat folders under `media/` with a name file, a background download (no size cap, a 20 GB free-space
+  reserve), re-upload of expired links through the owner's phone in its own lane, a dedicated media file
+  listener with short-lived URLs for a remote agent, schema v9 (`file_name`, `file_sha256`, `static_url`,
+  `remote_jid`, `participant`), deleted content kept and marked `.deleted`. Built on the current wa-rs pin.
+  Next: a follow-up cold review, then the owner's live re-upload test (phase 1), then the build on branch
+  `feature/media-download`. Live media stays out of scope.
 - [ ] **Live check of archive-key seeding** (roadmap P1, owner): archive and unarchive a chat with no
   stored message, then fetch it. The code is done (2768412). The 2026-10-22 runs never received an
   archive event because the device had been re-paired (issue above). Retest on a device paired from
