@@ -4,14 +4,18 @@ This file tracks notable changes to the whatsrust experimental fork. The project
 
 ## [Unreleased]
 
-Work on branch `ops/supervisor`, not yet on `main`.
+Work on branch `feature/media-download`, not yet on `main`.
+
+## 2026-10-26 — Deployment as a service, doc hash remap
+
+Merged from `ops/supervisor` (rebase-merge; main commits 60596a5 and 829a62a).
 
 ### Added
-- `scripts/deploy.sh`: run the daemon as a service that restarts after a crash (launchd LaunchAgent on macOS, systemd user unit on Linux; ADR 0049). `install` is a step-by-step wizard (directory, binary, ports, API/MCP tokens, semantic model, device name, pairing history, autostart; every step also a flag, `--yes`, `--dry-run`) and starts nothing; `run` starts a paired instance in the background, or shows the QR code in the terminal until the device is linked; a start gate (`bin/start-if-paired`) keeps an unpaired instance from ever running unattended (login, crash restarts, upgrades); also `stop`, `re-pair` (fresh or keep-history), `autostart on|off`, `uninstall` (wizard: keep the data, or delete it after an optional verified backup), `status`, `logs`, `restart` (graceful), `upgrade`. Each instance lives outside the repo with its own copy of the binary and an ownership marker; restart on any non-zero exit (1 = startup refusal, 101 = panic) with a 10 s throttle; templates in `deploy/supervisor/`; HOWTO §3b; not live-tested yet
-- `scripts/remap-doc-hashes.sh`: after a rebase-merge, finds commit hashes cited in the docs that are no longer in `main`'s history and maps each to its rebased twin (same subject and author date); report-only by default, `--apply` rewrites
+- `scripts/deploy.sh`: run the daemon as a service that restarts after a crash (launchd LaunchAgent on macOS, systemd user unit on Linux; ADR 0049). `install` is a step-by-step wizard (directory, binary, ports, API/MCP tokens, semantic model, device name, pairing history, autostart; every step also a flag, `--yes`, `--dry-run`) and starts nothing; `run` starts a paired instance in the background, or shows the QR code in the terminal until the device is linked; a start gate (`bin/start-if-paired`) keeps an unpaired instance from ever running unattended (login, crash restarts, upgrades); also `stop`, `re-pair` (fresh or keep-history), `autostart on|off`, `uninstall` (wizard: keep the data, or delete it after an optional verified backup), `status`, `logs`, `restart` (graceful), `upgrade`. Each instance lives outside the repo with its own copy of the binary and an ownership marker; restart on any non-zero exit (1 = startup refusal, 101 = panic) with a 10 s throttle; templates in `deploy/supervisor/`; HOWTO §3b; not live-tested yet (829a62a)
+- `scripts/remap-doc-hashes.sh`: after a rebase-merge, finds commit hashes cited in the docs that are no longer in `main`'s history and maps each to its rebased twin (same subject and author date); report-only by default, `--apply` rewrites (60596a5)
 
 ### Fixed
-- Commit hashes cited in the docs that the 2026-10-23 rebase-merge left pointing at branch-only commits now point at the `main` commits
+- Commit hashes cited in the docs that the 2026-10-23 rebase-merge left pointing at branch-only commits now point at the `main` commits (60596a5)
 
 ### Security
 - Live media ingest no longer downloads a media message whose `direct_path` could send the request, with the media auth token, to another host (anything but one leading `/` followed by printable ASCII without spaces, `@`, `\` or `#`), or that carries a sender-supplied `static_url` (wa-rs would fetch it as-is); the message is skipped like an over-size file (marked done, not retried), with one WARN that does not quote the value
