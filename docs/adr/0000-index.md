@@ -62,6 +62,7 @@ This directory contains Architecture Decision Records (ADRs) for the whatsrust p
 | [0047](0047-sync-send-timeout-returns-job-id.md) | Sync send timeout returns job_id and says "do not retry" | 2026-10-15 | Accepted |
 | [0048](0048-store-pairing-history-sync-messages.md) | Store the messages of the pairing history sync, and late on-demand answers | 2026-10-22 | Accepted |
 | [0049](0049-deploy-as-supervised-user-service-with-start-gate.md) | Deploy as a supervised user service, with a start gate for unpaired instances | 2026-10-26 | Accepted |
+| [0050](0050-on-demand-media-download.md) | On-demand media download: chat folders, background fetch, a media file listener | 2026-10-29 | Proposed |
 
 ## Revised ADRs
 

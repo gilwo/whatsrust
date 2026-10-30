@@ -40,3 +40,17 @@ Old directPaths that expire → **best-effort**. If fetch fails, return error to
 ## Amendment (2026-10-22)
 
 The decision is now carried out for history rows. Messages stored from history (the package the phone sends at pairing, and on-demand fetches) download no media: each media message is stored with a label built from the proto's `file_length` (for example `[image 12.1KB] caption`) and a `media_refs` row (`media_key`, `direct_path`, `file_enc_sha256`, `mimetype`, `file_length`, `width`, `height`; `hydrated_path` stays NULL). Media whose link has expired is therefore stored too. Live ingest is unchanged: it still downloads eagerly, because the bytes feed the inbound event, and writes no `media_refs` row. The on-demand download from `media_refs` (REST, CLI and MCP) is not built yet; it is on the ROADMAP backlog. Deleting a message or a chat deletes its `media_refs` rows. See ADR 0048.
+
+## Amendment (2026-10-29, proposed; revised 2026-10-30)
+
+The on-demand download is designed in ADR 0050 (status Proposed; detail in
+`docs/plans/2026-10-29-on-demand-media-download-design.md`). Three points of this ADR change with it:
+
+- **"Future options" is now concrete.** wa-rs exposes the re-request API: `client.media_reupload()` asks the
+  owner's own phone to upload an expired file again and returns a new `direct_path`. The phone must be online
+  and still hold the file.
+- **Bytes are stored on disk after all**, on request only: one file per message under
+  `media/<prefix>_<number>/` beside `whatsapp.db`, recorded in `media_refs.hydrated_path` (relative to
+  `media/`). The DB still holds no media bytes, and nothing is downloaded unless a client asks for that message.
+- **The reference gains fields** (schema v9): `file_name`, `file_sha256`, `static_url`, `remote_jid`,
+  `participant`, for new history rows. Live media still gets no reference (out of scope for now).
