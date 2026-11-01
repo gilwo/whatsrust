@@ -29,6 +29,10 @@ required-features = ["fake-embedder"]
 
 [features]
 fake-embedder = []
+# Dev-only live probe for the on-demand media download (design 2026-10-29 §13 phase 1):
+# adds the `media-probe` REPL command, which downloads a stored message's media, asks the
+# owner's phone to re-upload it, and downloads it again. Never in a release build.
+media-probe = []
 
 [dependencies]
 aes-gcm = "0.10"

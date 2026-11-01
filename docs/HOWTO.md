@@ -617,6 +617,33 @@ at a time: the QR image and HTML files go to the system temp directory under fix
 The old `whatsapp.db.instance.lock` can stay in the root (it is git-ignored) or be deleted; the daemon creates
 a fresh one in `runs/main/`.
 
+### Media re-upload probe (dev build only)
+
+A REPL command for the media download's live test (design `docs/plans/2026-10-29-on-demand-media-download-design.md`
+§13 phase 1). For each message it runs three steps: **A** downloads the media from the stored path; **B** asks your
+phone to re-upload it; **C** downloads it again from the new path. It prints each step and one `RESULT` line per
+message. It is compiled only with the Cargo feature `media-probe`, never in a release build.
+
+1. Build: `cargo build --features media-probe`.
+2. Start the daemon from the binary itself. `scripts/run-profile.sh daemon` rebuilds without the feature, so do not use it:
+   - repo root: `./target/debug/whatsrust`
+   - run profile: `cd runs/<profile> && WHATSRUST_ENV_FILE="$PWD/.env" ../../target/debug/whatsrust`
+3. Type `status` until it shows connected. Keep the phone online, with WhatsApp open.
+4. Find candidates: `media-probe list`.
+   - Stored history media: the newest and oldest per chat class, up to 20 MB. These rows come from the pairing
+     package or from `fetch-history`.
+   - Live media from the in-memory cache, shown with age `live`. Live ingest stores no reference, and the cache
+     holds the last 256 messages, so send the media after the daemon starts.
+5. Probe: `media-probe <message-id> …` (at most 10 IDs; message IDs, not JIDs).
+   - Each message tries up to three addresses: `stored`, `alt` (the phone-number↔LID alternate) and `web`
+     (sent to your own LID).
+   - The probe sends one request per 30 s and at most 20 per daemon run.
+6. Read the `B re-upload` and `RESULT` lines. Stop with `quit` or Ctrl+C.
+7. Delete the downloaded files: `rm -r "$TMPDIR/whatsrust-media-probe"`.
+
+Result of 2026-11-01: only `web` works at the current wa-rs pin. The pin's own request goes to the account's
+phone number, and the phone does not answer it.
+
 ---
 
 ## 3a. Re-pairing (rename the device, or after a logout)
@@ -1640,6 +1667,9 @@ make test-all     # cargo test --features fake-embedder — also runs the
                    # non-default `fake-embedder` Cargo feature so a plain
                    # `cargo build`/`cargo test` never touches that sidecar
                    # binary)
+cargo test --features media-probe   # also runs the dev media probe's tests
+                   # (src/media_probe.rs and its storage queries; 11 extra
+                   # tests per target, verified 2026-11-01)
 
 make lint         # cargo clippy — reports lints, non-fatal. The crate
                    # currently carries ~30 pre-existing findings, so this is

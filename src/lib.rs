@@ -16,6 +16,8 @@ pub mod instance_lock;
 pub mod mcp;
 pub mod mcp_http;
 pub mod mcp_registry;
+#[cfg(feature = "media-probe")]
+pub mod media_probe;
 pub mod media_utils;
 pub mod outbound;
 pub mod polls;
