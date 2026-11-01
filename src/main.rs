@@ -25,6 +25,8 @@ mod embedder;
 mod instance_lock;
 mod mcp_http;
 mod mcp_registry;
+#[cfg(feature = "media-probe")]
+mod media_probe;
 mod media_utils;
 mod outbound;
 mod polls;
@@ -714,6 +716,8 @@ async fn async_main() -> Result<()> {
         println!("  recording <jid>                — show recording indicator");
         println!("  stop-recording <jid>           — cancel recording indicator");
         println!("  status                         — show bridge state");
+        #[cfg(feature = "media-probe")]
+        println!("  media-probe [list [n] | <id>…] — dev probe: download, phone re-upload, download (help: media-probe)");
         println!("  quit                           — shut down");
         println!();
 
@@ -1431,6 +1435,11 @@ async fn async_main() -> Result<()> {
                                 Ok(id) => println!(">> status revoked (id: {id})"),
                                 Err(e) => println!("!! status-revoke failed: {e}"),
                             }
+                        }
+                        #[cfg(feature = "media-probe")]
+                        "media-probe" => {
+                            let args: Vec<&str> = line.split_whitespace().skip(1).collect();
+                            bridge_for_repl.media_probe(&args).await;
                         }
                         "quit" | "q" | "exit" => {
                             cancel_for_repl.cancel();

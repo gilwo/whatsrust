@@ -1609,6 +1609,23 @@ impl WhatsAppBridge {
         self.state() == BridgeState::Connected && get_client_handle(&self.client_handle).is_some()
     }
 
+    /// Run the dev-only media probe (the `media-probe` REPL command; design 2026-10-29 §13
+    /// phase 1). It prints its own report; see `crate::media_probe`.
+    #[cfg(feature = "media-probe")]
+    pub async fn media_probe(&self, args: &[&str]) {
+        let client = if self.is_connected() { get_client_handle(&self.client_handle) } else { None };
+        let live: Vec<(String, crate::storage::MediaRefRow)> = {
+            let cache = self.msg_cache.lock();
+            cache
+                .order
+                .iter()
+                .rev()
+                .filter_map(|id| cache.map.get(id).and_then(|m| cached_media_ref(m)).map(|r| (id.clone(), r)))
+                .collect()
+        };
+        crate::media_probe::run(client, &self.store, &live, args).await;
+    }
+
     /// Semantic search with FTS5 fallback (M2.4.3-4, ADR 0042). When an embedder is
     /// configured+healthy AND vectors exist for the active model: (1) embed query, (2) FTS5
     /// recall widened to ~200 candidates, (3) fetch vectors, (4) cosine-rerank, (5) truncate
@@ -4140,18 +4157,43 @@ impl MediaMode<'_> {
                 }
             }
             Self::Reference { media_ref } => {
-                *media_ref = Some(crate::storage::MediaRefRow {
-                    media_key: media.media_key().map(<[u8]>::to_vec),
-                    direct_path: media.direct_path().map(str::to_owned),
-                    file_enc_sha256: media.file_enc_sha256().map(<[u8]>::to_vec),
-                    mimetype: Some(mime.to_owned()),
-                    file_length: media.file_length().and_then(|n| i64::try_from(n).ok()),
-                    width: width.map(i64::from),
-                    height: height.map(i64::from),
-                });
+                *media_ref = Some(media_ref_row(media, Some(mime), width, height));
                 Ok(Arc::from(Vec::<u8>::new()))
             }
         }
+    }
+}
+
+/// The `media_refs` row that describes one media message (ADR 0005): what a later download needs.
+fn media_ref_row(media: &dyn Downloadable, mime: Option<&str>, width: Option<u32>, height: Option<u32>) -> crate::storage::MediaRefRow {
+    crate::storage::MediaRefRow {
+        media_key: media.media_key().map(<[u8]>::to_vec),
+        direct_path: media.direct_path().map(str::to_owned),
+        file_enc_sha256: media.file_enc_sha256().map(<[u8]>::to_vec),
+        mimetype: mime.map(str::to_owned),
+        file_length: media.file_length().and_then(|n| i64::try_from(n).ok()),
+        width: width.map(i64::from),
+        height: height.map(i64::from),
+    }
+}
+
+/// The media reference of a cached live message, for the dev-only media probe: the five media
+/// kinds, after the ephemeral, view-once and document-with-caption wrappers. Live ingest stores
+/// no reference (ADR 0050 decision 10), so the in-memory message cache is the only source.
+#[cfg(feature = "media-probe")]
+fn cached_media_ref(msg: &wa::Message) -> Option<crate::storage::MediaRefRow> {
+    let inner = unwrap_to_inner(msg);
+    let inner = inner.document_with_caption_message.as_ref().and_then(|d| d.message.as_deref()).unwrap_or(inner);
+    if let Some(m) = inner.image_message.as_deref() {
+        Some(media_ref_row(m, m.mimetype.as_deref(), m.width, m.height))
+    } else if let Some(m) = inner.video_message.as_deref() {
+        Some(media_ref_row(m, m.mimetype.as_deref(), m.width, m.height))
+    } else if let Some(m) = inner.audio_message.as_deref() {
+        Some(media_ref_row(m, m.mimetype.as_deref(), None, None))
+    } else if let Some(m) = inner.document_message.as_deref() {
+        Some(media_ref_row(m, m.mimetype.as_deref(), None, None))
+    } else {
+        inner.sticker_message.as_deref().map(|m| media_ref_row(m, m.mimetype.as_deref(), m.width, m.height))
     }
 }
 
@@ -4536,7 +4578,7 @@ async fn extract_content_inner(
 
 /// Try to find the alternate form of a chat JID (PN→LID or LID→PN).
 /// Used for poll key lookups that may have been stored under a different JID format.
-async fn resolve_alternate_chat_jid(chat_jid: &str, store: &Store) -> Option<String> {
+pub(crate) async fn resolve_alternate_chat_jid(chat_jid: &str, store: &Store) -> Option<String> {
     let (user_part, server) = chat_jid.split_once('@')?;
     let bare_user = user_part.split(':').next().unwrap_or(user_part);
 
@@ -4827,7 +4869,7 @@ async fn handle_outbound(
 
 /// Parse a JID string (phone@s.whatsapp.net or raw phone number).
 /// Handles formatted phone numbers like "+1 (555) 123-4567" → "15551234567@s.whatsapp.net".
-fn parse_jid(s: &str) -> Result<Jid> {
+pub(crate) fn parse_jid(s: &str) -> Result<Jid> {
     if s.contains('@') {
         Jid::from_str(s).map_err(|e| anyhow::anyhow!("bad JID: {e}"))
     } else {

@@ -985,6 +985,95 @@ pub struct MediaRefRow {
     pub height: Option<i64>,
 }
 
+/// A stored media message as the dev-only media probe reads it: the message's addressing plus its
+/// `media_refs` row (design 2026-10-29 §13 phase 1; `media-probe` feature only).
+#[cfg(feature = "media-probe")]
+#[derive(Debug, Clone)]
+pub struct ProbeMediaRow {
+    pub message_id: String,
+    pub chat_jid: String,
+    pub sender_jid: String,
+    pub from_me: bool,
+    pub content_kind: String,
+    pub timestamp_secs: i64,
+    pub media: MediaRefRow,
+}
+
+/// The columns [`probe_row_from`] reads, in order; shared by both probe queries (`m` = messages,
+/// `r` = media_refs).
+#[cfg(feature = "media-probe")]
+const PROBE_COLUMNS: &str = "m.message_id, m.chat_jid, m.sender_jid, m.from_me, m.content_kind, m.timestamp,
+     r.media_key, r.direct_path, r.file_enc_sha256, r.mimetype, r.file_length, r.width, r.height";
+
+#[cfg(feature = "media-probe")]
+fn probe_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProbeMediaRow> {
+    Ok(ProbeMediaRow {
+        message_id: r.get(0)?,
+        chat_jid: r.get(1)?,
+        sender_jid: r.get(2)?,
+        from_me: r.get::<_, i64>(3)? != 0,
+        content_kind: r.get(4)?,
+        timestamp_secs: r.get(5)?,
+        media: MediaRefRow {
+            media_key: r.get(6)?,
+            direct_path: r.get(7)?,
+            file_enc_sha256: r.get(8)?,
+            mimetype: r.get(9)?,
+            file_length: r.get(10)?,
+            width: r.get(11)?,
+            height: r.get(12)?,
+        },
+    })
+}
+
+#[cfg(feature = "media-probe")]
+impl Store {
+    /// The probe row of message `message_id`, or `None` for an unknown message. A message with no
+    /// `media_refs` row (live media) comes back with an empty `media`.
+    pub async fn probe_media_row(&self, message_id: &str) -> Result<Option<ProbeMediaRow>> {
+        let mid = message_id.to_owned();
+        self.run(move |c| {
+            let sql = format!(
+                "SELECT {PROBE_COLUMNS} FROM messages m LEFT JOIN media_refs r ON r.message_id = m.message_id
+                 WHERE m.message_id = ?1"
+            );
+            c.query_row(&sql, params![mid], probe_row_from)
+                .optional()
+                .map_err(db_err)
+        })
+        .await
+    }
+
+    /// Probe candidates: for each chat class (`chat`, `lid`, `group`), the `per_class` newest and
+    /// the `per_class` oldest media messages with a complete reference and a size from 1 byte to
+    /// `max_bytes`. Returns `(class, "new" | "old", row)`; a message is listed once.
+    pub async fn probe_media_candidates(&self, per_class: i64, max_bytes: i64) -> Result<Vec<(String, String, ProbeMediaRow)>> {
+        self.run(move |c| {
+            let mut out: Vec<(String, String, ProbeMediaRow)> = Vec::new();
+            for (class, pattern) in [("chat", "%@s.whatsapp.net"), ("lid", "%@lid"), ("group", "%@g.us")] {
+                for (age, order) in [("new", "DESC"), ("old", "ASC")] {
+                    let sql = format!(
+                        "SELECT {PROBE_COLUMNS} FROM messages m JOIN media_refs r ON r.message_id = m.message_id
+                         WHERE m.chat_jid LIKE ?1 AND r.media_key IS NOT NULL AND r.direct_path IS NOT NULL
+                           AND r.file_enc_sha256 IS NOT NULL AND COALESCE(r.file_length, 0) BETWEEN 1 AND ?2
+                         ORDER BY m.timestamp {order} LIMIT ?3"
+                    );
+                    let mut stmt = c.prepare(&sql).map_err(db_err)?;
+                    let rows = stmt.query_map(params![pattern, max_bytes, per_class], probe_row_from).map_err(db_err)?;
+                    for row in rows {
+                        let row = row.map_err(db_err)?;
+                        if !out.iter().any(|(_, _, r)| r.message_id == row.message_id) {
+                            out.push((class.to_string(), age.to_string(), row));
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+}
+
 /// Statistics from a prune operation.
 #[derive(Debug, Clone)]
 pub struct PruneStats {
@@ -5336,6 +5425,52 @@ mod tests {
         assert_eq!(media_ref_count(&dir), 1, "only the other chat's reference is left");
         assert_eq!(store.delete_inbound_chat("b@s.whatsapp.net").await.unwrap(), 1);
         assert_eq!(media_ref_count(&dir), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The media probe's queries: a row by id; candidates per chat class, newest and oldest,
+    /// only complete references within the size limit, each message listed once.
+    #[cfg(feature = "media-probe")]
+    #[tokio::test]
+    async fn test_probe_media_queries() {
+        let (store, dir) = open_b2a_store("media-probe");
+        let rows = [
+            ("a@s.whatsapp.net", "c-old", 100, 1234),
+            ("a@s.whatsapp.net", "c-mid", 200, 1234),
+            ("a@s.whatsapp.net", "c-new", 300, 1234),
+            ("a@s.whatsapp.net", "c-big", 400, 50_000_000),
+            ("9@lid", "l-only", 150, 1234),
+            ("g@g.us", "g-1", 500, 1234),
+        ];
+        for (chat, id, ts, len) in rows {
+            store.insert_message(chat, "s@s.whatsapp.net", id, "image", Some("[image]"), ts, false, "bootstrap", "skipped").await.unwrap();
+            store.insert_media_ref(id, &MediaRefRow { file_length: Some(len), ..sample_media_ref() }).await.unwrap();
+        }
+        store.insert_message("a@s.whatsapp.net", "s@s.whatsapp.net", "c-nokey", "image", None, 50, false, "bootstrap", "skipped").await.unwrap();
+        store.insert_media_ref("c-nokey", &MediaRefRow { media_key: None, ..sample_media_ref() }).await.unwrap();
+
+        let row = store.probe_media_row("g-1").await.unwrap().expect("g-1 has a reference");
+        assert_eq!((row.chat_jid.as_str(), row.sender_jid.as_str(), row.timestamp_secs), ("g@g.us", "s@s.whatsapp.net", 500));
+        assert_eq!(row.media.direct_path.as_deref(), Some("/v/t62/x"));
+        assert!(store.probe_media_row("missing").await.unwrap().is_none());
+        store.insert_message("g@g.us", "s", "live-1", "image", Some("[image]"), 600, true, "live", "skipped").await.unwrap();
+        let live = store.probe_media_row("live-1").await.unwrap().expect("a live row without a reference is found");
+        assert_eq!((live.from_me, live.media), (true, MediaRefRow::default()), "no media_refs row: empty media");
+
+        let found: Vec<(String, String, String)> = store
+            .probe_media_candidates(1, 20 * 1024 * 1024)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(class, age, r)| (class, age, r.message_id))
+            .collect();
+        let expect = |c: &str, a: &str, id: &str| (c.to_string(), a.to_string(), id.to_string());
+        assert_eq!(
+            found,
+            vec![expect("chat", "new", "c-new"), expect("chat", "old", "c-old"), expect("lid", "new", "l-only"), expect("group", "new", "g-1")],
+            "no oversized or keyless rows; a single-row class is listed once"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
