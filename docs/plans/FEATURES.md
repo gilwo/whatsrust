@@ -205,17 +205,26 @@ a real account)
 | 2026-10-22 | A pairing-package DM without `pnJid` stays under its `@lid` JID, while live messages from that contact go under the phone JID | **Open** (the `@lid` split below) | roadmap P2 |
 | 2026-10-29 | Media download design v1, cold review: needs rework (1 blocking, 10 major). Blocking: files served inline with the sender's MIME type on the API's origin could run script that reads the history. Major, among others: whole-file response buffering, no stall timeout, a disk check that trusts the sender's size, an unproven re-upload path, no permanent failure states, a false "no schema change", missing references | v2 (2026-10-30): a dedicated media file listener with hardened headers, streaming, a watchdog, a 20 GB reserve, a re-upload lane with a breaker, schema v9, `no_reference` states | `_reviewer/design/2026-10-29-on-demand-media-download.md`; ADR 0050 |
 | 2026-10-30 | Should wa-rs be upgraded before the media download? A first report recommended v0.7.0, but most commits it cited came after v0.7.0 (checked with the GitHub compare API) | A compile spike measured 165 errors (v0.7.0) and 298 (`main`), and v0.7.0 lacks the media-related changes; the owner deferred the upgrade, and the media work isolates the wa-rs parts in one adapter | roadmap Q-WARS |
+| 2026-10-30 | Media download design v2, follow-up cold review: approve with changes (2 blocking, 7 major). Blocking: the startup check treats a message missing from the DB as deleted, which marks every file after `clear-data`, a fresh re-pair or a restore; expiry detection expects error texts that never occur, because at this pin every 4xx/5xx arrives as `http status: <n>` | Design v3 (2026-11-01): tag only on observed deletes and revokes, from the deleted rows, through an intent journal; whatsrust's own HTTP transfer with a (phase, status) → reason table | `_reviewer/design/2026-10-30-on-demand-media-download-v2.md`; design v3 |
+| 2026-10-31 | Live re-upload test: `media-probe list` found nothing. Live media gets no `media_refs` row (ADR 0050 decision 10), and a new test group has no older history to fetch | The probe also takes live media from the in-memory message cache | `src/media_probe.rs` |
+| 2026-10-31 → 11-01 | Live re-upload test: the pin's `client.media_reupload()` sends the request to the account's **phone number**, and the phone never answered (0 of 10). Live rows also store `from_me = 0` for the account's own messages (`Store::insert_inbound`) | The same request sent to the account's own **LID** (chat and participant in LID form, as WhatsApp Web and upstream wa-rs `main` do) worked 3 of 3: a 1:1 photo, a group photo from a member, and the account's own group photo. The ACK came in 0.2 s and the answer in about 1 s, and the new file had the same sha256. In groups only `to` differed, so `to` = own LID is the fix. The `from_me` bug is **open** (roadmap) | HOWTO §3 "Media re-upload probe"; ADR 0050 note |
 
 ### Open items
 
 - [ ] **On-demand media download** for stored history (roadmap P1, next). **Designed** 2026-10-29 → 30:
-  `docs/plans/2026-10-29-on-demand-media-download-design.md` (v2, owner-approved) and ADR 0050 (Proposed):
+  `docs/plans/2026-10-29-on-demand-media-download-design.md` (**v3**, 2026-11-01) and ADR 0050 (Proposed):
   per-chat folders under `media/` with a name file, a background download (no size cap, a 20 GB free-space
-  reserve), re-upload of expired links through the owner's phone in its own lane, a dedicated media file
-  listener with short-lived URLs for a remote agent, schema v9 (`file_name`, `file_sha256`, `static_url`,
-  `remote_jid`, `participant`), deleted content kept and marked `.deleted`. Built on the current wa-rs pin.
-  Next: a follow-up cold review, then the owner's live re-upload test (phase 1), then the build on branch
-  `feature/media-download`. Live media stays out of scope.
+  reserve) with whatsrust's own HTTP transfer, re-upload of expired links through the owner's phone in its own
+  lane (a request whatsrust builds and sends to the account's own LID), a dedicated media file listener with
+  short-lived URLs for a remote agent, schema v9 (`file_name`, `file_sha256`, `remote_jid`, `participant`),
+  deleted and revoked content kept and marked `.deleted` (only on observed events). Built on the current wa-rs
+  pin. Follow-up cold review 2026-10-30: approve with changes (2 blocking), folded into v3. Phase 1 live test
+  2026-11-01: a re-upload works only when the request goes to the account's own LID. Still open from phase 1:
+  old, expired history files (phone retention and the CDN's answer). Next: owner approval of v3, then the build
+  on branch `feature/media-download`. Live media stays out of scope.
+- [ ] **Live rows store `from_me = 0` for the account's own messages** (roadmap P1): `Store::insert_inbound`
+  hard-codes `false`, so `history` and `search` show messages sent from the owner's phone as received.
+  Found by the 2026-11-01 probe.
 - [ ] **Live check of archive-key seeding** (roadmap P1, owner): archive and unarchive a chat with no
   stored message, then fetch it. The code is done (2768412). The 2026-10-22 runs never received an
   archive event because the device had been re-paired (issue above). Retest on a device paired from
