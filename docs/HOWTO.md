@@ -639,6 +639,9 @@ message. It is compiled only with the Cargo feature `media-probe`, never in a re
      (sent to your own LID).
    - The probe sends one request per 30 s and at most 20 per daemon run.
 6. Read the `B re-upload` and `RESULT` lines. Stop with `quit` or Ctrl+C.
+   - Each run first prints `own account: …1234@s.whatsapp.net / …5678@lid` (masked): the linked account's phone
+     number and LID. To see only that line, type `media-probe x` (`x` is not a message ID, so nothing is sent). A
+     `?` in place of the LID means that the account has no LID yet.
 7. Delete the downloaded files: `rm -r "$TMPDIR/whatsrust-media-probe"`.
 
 Result of 2026-11-01: only `web` works at the current wa-rs pin. The pin's own request goes to the account's

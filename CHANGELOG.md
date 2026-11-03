@@ -7,7 +7,7 @@ This file tracks notable changes to the whatsrust experimental fork. The project
 Work on branch `feature/media-download`, not yet on `main`.
 
 ### Added
-- Design for the on-demand media download of stored history (per-chat folders, background fetch with whatsrust's own HTTP transfer, re-upload requests sent to the account's own LID, a media file listener with short-lived URLs, schema v9): `docs/plans/2026-10-29-on-demand-media-download-design.md` (v3, 2026-11-01, after two cold reviews and the phase 1 live test), ADR 0050 (Proposed), ADR 0005 amendment; not built yet
+- Design for the on-demand media download of stored history (per-chat folders, background fetch with whatsrust's own HTTP transfer, re-upload requests sent to the account's own LID, a media file listener with short-lived URLs, schema v9): `docs/plans/2026-10-29-on-demand-media-download-design.md` (v4, 2026-11-03, after three cold reviews and the phase 1 live test), ADR 0050 (Proposed), ADR 0005 amendment; not built yet
 - Dev-only `media-probe` REPL command (Cargo feature `media-probe`, never in a release build) for the media download's live test. It downloads a stored or live-cached message's media, asks the owner's phone to re-upload it (the wa-rs request, and a `web` request sent to the account's own LID), downloads it again, and prints each step; HOWTO §3 "Media re-upload probe". Live result 2026-11-01: only the request sent to the own LID works at the current wa-rs pin (`src/media_probe.rs`; ADR 0050 note)
 
 ## 2026-10-26 — Deployment as a service, doc hash remap
