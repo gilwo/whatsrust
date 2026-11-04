@@ -1,8 +1,8 @@
 # 0050. On-demand media download: chat folders, background fetch, a media file listener
 
-**Status:** Proposed (v4, 2026-11-03: the v3 follow-up cold review folded in; next: owner approval of v4, then the
-build)
-**Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4)
+**Status:** Proposed (v5, 2026-11-04: the v4 follow-up cold review and a ureq timeout spike folded in; next: the
+old-file test matrix, then the build)
+**Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4), 2026-11-04 (v5)
 
 ## Context
 
@@ -16,7 +16,8 @@ Facts that shape the design (checked in the code, the wa-rs pin `9e8c70e` and a 
 - wa-rs exposes the parts of a download (media connection, per-host URLs, streaming decryption with the MAC check
   at the end, about 40 KB of memory). Its own `download_to_writer` hides HTTP statuses at this pin: the shared ureq
   client turns every 4xx/5xx into `http status: <n>`. It also seeks the writer to 0 on each host and retries writer
-  errors. The HTTP client has no body timeout.
+  errors. The shared HTTP client has no body timeout. ureq's own `timeout_recv_body` restarts on every read (an
+  idle limit), and `timeout_global` runs from the start of the call (a total limit).
 - An expired CDN link can be recovered by a re-upload request to **the owner's own phone**; the phone must be
   online and still hold the file. Most history media is probably expired, so this is a main path. **The pin's
   `client.media_reupload()` sends the request to the account's phone number and got no answer on the owner's
@@ -32,41 +33,49 @@ Facts that shape the design (checked in the code, the wa-rs pin `9e8c70e` and a 
 1. **The media ID is the message ID.**
 2. **Schema v9** (owner-authorised): `media_refs` gains `file_name`, `file_sha256`, `remote_jid`, `participant`,
    `revoked_at` and `view_once`, written by history ingest for new rows. The message and its reference are written
-   in one transaction. A duplicate (a re-fetched message) fills an existing row, and creates a missing one when the
-   stored message is not live. Staged migration per ADR 0028–0032. No backfill. The schema phase may be merged on
-   its own first.
+   in one transaction. A duplicate (a re-fetched message) whose chat, sender, `from_me` and kind match the stored
+   row fills an existing reference, and creates a missing one when the stored message is not live; a mismatch
+   changes nothing. Staged migration per ADR 0028–0032. No backfill. **There is no supported way back after a healthy
+   migration** (`--rollback` serves only failed ones), so the schema phase is merged only after the old-file test
+   matrix passes.
 3. **Files on disk, one folder per chat,** under `media/` beside `whatsapp.db`: `chat_<number>/`,
    `group_<number>/`, `lid_<number>/`. One name file per folder (`_group_<name>.txt` / `_chat_<name>.txt`,
-   sanitised incl. Unicode control/format characters, at most 64 bytes; the group file lists the participants'
+   sanitised by a std allow-list of letters, digits, `-` and `.`, at most 64 bytes; the group file lists the participants'
    phone numbers; a group name lookup never blocks a download). File names: `<sender phone>_<epoch>_<id>.<ext>` in
    a group, `<epoch>_<id>.<ext>` elsewhere (an ID that is too long or has other characters becomes a hash), a
    document's sanitised original name as a suffix. **The extension comes only from a MIME allowlist** (else `bin`);
-   on macOS files get the quarantine attribute. `hydrated_path` is relative to `media/`. An existing final file of
-   the expected size is adopted. Each chat folder may hold one reserved subfolder, `_deleted/` (decision 9).
+   on macOS files get the quarantine attribute. `hydrated_path` is relative to `media/`. An existing final file is
+   found by the ID part of its name and adopted when its hash or size matches. Each chat folder may hold one reserved subfolder, `_deleted/` (decision 9).
 4. **Background download, no size cap, transfer owned by whatsrust.** A download lane (one worker, bounded queue)
-   runs the HTTP GET with a media-only ureq agent (statuses as values, no redirects, a body timeout scaled to the
-   file size and clamped to a transfer limit, default 2 h) from wa-rs's public parts, and streams the decryption
-   into `<file>.part` through a position-based writer with a sticky abort (cancel, reserve, over-claim, stall).
+   runs the HTTP GET with a media-only ureq agent from wa-rs's public parts: statuses as values, no redirects, and
+   ureq's own limits only (no custom transport): `timeout_recv_body` as the idle limit (60 s) and `timeout_global`
+   as the total limit (scaled to the file size, clamped to 2 h by default). It streams the decryption into
+   `<file>.part` through a position-based writer with a sticky abort (cancel, reserve). The response's
+   `Content-Length` is the hard size cap; the sender's `file_length` is only a hint.
    One table maps each (phase, status) to an action or a reason; 404/410 (and 401/403 after a rate-limited
    media-connection refresh) mean expired; a decryption error is retried once on another host. `direct_path` is
    checked before every request. There is no resume. A **fixed free-space reserve (20 GB, configurable)** is checked before and during the write. A
    separate **re-upload lane** builds the re-upload request itself and sends it to the **account's own LID**, with
    the chat and the participant in LID form (the raw key JID, else the LID mapping). Whether the stored phone JID
    may be sent when no LID form exists is decided by the old-file test matrix, which gates the engine; until then
-   such an item fails as `address_unresolved` without contacting the phone. A 30 s wait never blocks downloads. Both reach WhatsApp only through two adapters, `MediaTransfer` and `MediaReuploader`.
-5. **Bounded contact with the phone.** Re-upload pacing (1 per 30 s), an hourly request cap (20), an hourly byte
-   budget (1 GB of requested files), a circuit breaker after consecutive timeouts or expiries after a re-upload,
+   such an item fails as `address_unresolved` without contacting the phone. An account without a LID falls back to
+   the pin's own request. A 30 s wait never blocks downloads. Both reach WhatsApp only through two adapters, `MediaTransfer` and `MediaReuploader`.
+5. **Bounded contact with the phone.** Re-upload pacing (1 per 30 s), one hourly window of 20 requests and 1 GB of
+   requested files (a lone larger file is admitted into an empty window; the bytes are an honest-sender guard), a
+   fresh re-upload path kept for 1 h across restarts, a per-item backoff, a circuit breaker after consecutive
+   timeouts or expiries after a re-upload,
    `not_on_phone` remembered for 24 h (1 h with a stored-form address), and a kill switch that is **off by
    default**. These persist in the `metadata` table across restarts, one small key per entry. Every re-upload
    result and ACK error maps to a reason; a second expiry right after a re-upload is its own reason. Final states
    (`no_reference`, `incomplete_reference`, `revoked`, `view_once`, `integrity`) are never retried. Downloads have
    no token bucket: one worker limits the rate.
-6. **Two calls plus cancel.** `POST /api/media/get {id}`: ready → a short-lived URL (and the local path for
-   loopback REST callers); not ready → it queues the work and answers HTTP 202 with `ok: false`, `retryable`,
+6. **Two calls plus cancel.** `POST /api/media/get {id}`: ready → a short-lived URL (and the local path for local
+   callers only: direct callers of the loopback REST listener such as the CLI; the MCP HTTP listener and the stdio
+   MCP server, which marks its REST requests, are remote); not ready → it queues the work and answers HTTP 202 with `ok: false`, `retryable`,
    `retry_after_ms`; every retryable failure is also a 202, every final one a 4xx, so an MCP agent polls instead of
    giving up. `GET /api/media/status?id=` reports the state with byte counts. `POST /api/media/cancel` (one item, or
    all). `get` and `cancel` are POSTs because they can make the daemon contact WhatsApp. Without the media file
-   listener, an MCP `get` answers `url_unavailable` and starts nothing.
+   listener, a remote `get` answers `url_unavailable` and starts nothing.
 7. **A dedicated media file listener** (opt-in; own port, bind, `ALLOW_REMOTE` and public base URL, required off
    loopback; startup rules like the MCP listener) serves only `GET /media-files/<token>/<file>`. Its purpose is
    resource isolation and a URL a remote agent can reach without the REST API. Its pipeline: a connection cap, a
@@ -82,10 +91,12 @@ Facts that shape the design (checked in the code, the wa-rs pin `9e8c70e` and a 
 9. **Deleted and revoked content keeps its files.** A delete still removes the DB rows, but each downloaded file
    is moved into its chat's reserved `_deleted/` folder by one idempotent `tag` primitive; "deleted" is a path
    property, never a part of a file name (a chat whose rows are all deleted gets a `deleted: <epoch>` line in its
-   name file). **Only an observed delete or a valid revoke tags a file.** A revoke is valid only when the revoker
-   is the target's sender (an admin's delete does not count); it is resolved once at ingest into `revoked_at`. The
-   file set comes from the rows actually deleted, through a per-event intent journal in `metadata` that startup
-   replays. A message missing from the DB is never treated as deleted. A revoked message is never downloaded. A
+   name file). **Only an observed delete or a valid revoke tags a file.** A revoke is judged by identities, not by
+   the stored `from_me`: the revoker must be the target's author (the owner's own account for an own message), and
+   the revoke key's `from_me`/`participant` must match the target (an admin's delete does not count). It is
+   resolved once at ingest into `revoked_at`, and the migration runs a one-time pass over stored revoke rows. The
+   file set comes from the rows actually deleted (a message delete also matches the chat), through per-event,
+   chunked intent keys in `metadata` that startup replays. A message missing from the DB is never treated as deleted. A revoked message is never downloaded. A
    message that comes back is moved back and adopted. **This narrows ADR 0012 for media:** a delete no longer
    removes the bytes.
 10. **Out of scope:** live media (no reference: `no_reference`), view-once media (refused: `view_once`), bulk
@@ -104,7 +115,9 @@ Facts that shape the design (checked in the code, the wa-rs pin `9e8c70e` and a 
 - Any stored history media can be fetched later, as long as the CDN still has it or the owner's phone can
   re-upload it; a remote agent gets it through one short-lived URL.
 - Memory stays flat for any file size; disk use grows with what clients request, bounded by the free-space
-  reserve, not by a quota. Every transfer thread has a bounded life.
+  reserve, not by a quota. Every transfer thread ends within the idle limit of its last byte or at the total limit.
+- The v8 → v9 migration is one-way: after a healthy migration the only revert is restoring the pre-migration backup
+  by hand, which loses newer data and the Signal session state (HOWTO documents it).
 - whatsrust owns two pieces of protocol work at this pin: the media HTTP transfer and the re-upload request. Both
   sit behind one adapter each. The wa-rs upgrade (roadmap Q-WARS) can hand them back to the library: upstream
   `main` has typed download errors and sends the re-upload to the own LID. A 2026-10-30 compile spike measured 165
@@ -137,4 +150,6 @@ a path only, MCP resources, folders by name or bare number, a GET that starts th
 extension, one lane for downloads and re-uploads, a folder quota with eviction, wa-rs `download_to_writer`, the
 pin's `client.media_reupload()`, tagging at startup by absence, `Range`/`HEAD`, a download token bucket,
 HMAC-signed stateless URLs, a bounded wait inside `get`, storing live references now, an async HTTP client, a
-`.deleted` marker in the file name, trusting any revoke row, a small-file lane.
+`.deleted` marker in the file name, trusting any revoke row, a small-file lane, a custom ureq transport (it works,
+but uses ureq's `unversioned` API), a deny-list sanitiser with two Unicode crates, matching duplicates by message
+ID alone, judging a revoke by the stored `from_me`.
