@@ -34,14 +34,16 @@ git clone https://github.com/199-biotechnologies/whatsrust
 cd whatsrust
 
 # Debug build (fast, unoptimized) — verified working
-make build          # == cargo build
-# binary: target/debug/whatsrust
+make build          # cargo build, then names the binary with its version
+# binary: target/debug/whatsrust-<version>-<commit>[-dirty][-<features>],
+#         e.g. target/debug/whatsrust-0.3.0-55cbe70; target/debug/whatsrust is a symlink to the newest
+make build FEATURES=media-probe   # Cargo features: ...-55cbe70-media-probe
 
 # Release build (optimized: opt-level=z, LTO, codegen-units=1, panic=abort,
 # stripped — see [profile.release] in Cargo.toml). Noticeably slower to
 # compile than debug because of LTO; this is expected.
-make release         # == cargo build --release
-# binary: target/release/whatsrust
+make release         # cargo build --release, then versioned like `make build` (FEATURES= works too)
+# binary: target/release/whatsrust-<version>-<commit>[-dirty][-<features>]; target/release/whatsrust -> it
 
 # Release build of BOTH the daemon and the embedder sidecar (embedder-rs/) — the
 # two binaries a deployment needs. Reuses `release` + `embedder-build`; equally slow.
@@ -51,11 +53,25 @@ make release-all
 # Collects both of the above into dist/ and prints their paths plus a ready-to-use
 # WHATSRUST_EMBEDDER_CMD hint — handy for copying a self-contained deployment elsewhere.
 make dist
-# dist/whatsrust, dist/whatsrust-embedder
+# dist/whatsrust-<version>-<commit>[-dirty], dist/whatsrust-embedder-<version>-<commit>[-dirty],
+# each with a plain-name symlink (dist/whatsrust, dist/whatsrust-embedder)
 ```
+
+**Versioned binaries:**
+- `<version>` is the crate version from `Cargo.toml`, `<commit>` the short commit hash, `-dirty` is added when
+  tracked files have uncommitted changes, and `-<features>` lists the Cargo features of a `FEATURES=` build.
+- The real file carries the version; the plain name is a symlink to the newest build, so `run-profile.sh`,
+  `deploy.sh` (which copies the real file) and MCP client configs keep using `target/<profile>/whatsrust`.
+  Older builds stay on disk next to it; delete them by hand when no longer needed.
+- The same string is compiled in: `whatsrust --version` prints it, and the startup log line shows it
+  (`whatsrust v0.3.0-55cbe70`).
+- A plain `cargo build` (also the one `run-profile.sh daemon` runs) writes an unversioned
+  `target/<profile>/whatsrust` over the symlink and reports only the crate version; the next `make build`
+  restores the symlink.
 
 **Verification:**
 ```bash
+./target/debug/whatsrust --version   # e.g. "whatsrust 0.3.0-55cbe70"
 ./target/debug/whatsrust --help
 ```
 This prints the full command list and exits 0 — it does **not** require a

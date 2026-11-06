@@ -89,9 +89,10 @@ Check every row before committing a feature or a fix; update the docs that apply
 - `src/qr.rs` — QR rendering (terminal/PNG/HTML/SVG)
 - `src/instance_lock.rs` — single-instance file lock
 - `src/lib.rs` — library crate entry: all modules pub (consumed by habb)
-- `src/main.rs` — binary: daemon mode (REPL + API) + CLI client (50 commands) + MCP mode
+- `src/main.rs` — binary: daemon mode (REPL + API) + CLI client (50 commands) + MCP mode; `--version` prints the build version (`BUILD_VERSION`, from `WHATSRUST_BUILD_SUFFIX` set by the Makefile, else the crate version)
 
 ## Patterns
+- Versioned builds: `make build` / `make release` / `make dist` produce `whatsrust-<version>-<commit>[-dirty][-<features>]` (`FEATURES=a,b` for Cargo features) and a plain-name symlink to the newest; scripts keep using `target/<profile>/whatsrust`; a plain `cargo build` writes an unversioned binary over the symlink (HOWTO §1)
 - SQLite-first sends: all outbound ops enqueue to SQLite via `enqueue_job()`, worker executes via `execute_job()`
 - `enqueue_and_wait()` subscribes to broadcast BEFORE enqueue for sync send methods; times out after 30s (ADR 0047), returning `SendTimedOut { job_id }` so the caller (REST → 504 + job_id + "do not retry") can report it without the job being cancelled (it stays queued and is usually delivered later)
 - `parse_jid()` for JID normalization (phone → @s.whatsapp.net, group → @g.us)

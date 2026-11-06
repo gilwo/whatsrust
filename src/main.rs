@@ -40,6 +40,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+
+/// This build's version: `<crate version>-<commit>[-dirty][-<features>]` when built through the Makefile
+/// (`make build`, `make release`, `make dist` set `WHATSRUST_BUILD_SUFFIX`), else the plain crate version
+/// (a direct `cargo build`). Shown by `whatsrust --version` and in the startup log.
+const BUILD_VERSION: &str = match option_env!("WHATSRUST_BUILD_SUFFIX") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -378,6 +386,11 @@ fn log_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
 async fn async_main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    if matches!(args.get(1).map(String::as_str), Some("--version" | "-V")) {
+        println!("whatsrust {BUILD_VERSION}");
+        return Ok(());
+    }
+
     // --rollback and --migrate are maintenance subcommands that operate on the DB
     // directly (they must run BEFORE the daemon's instance lock and before cli_main,
     // which would forward the command to a running daemon via HTTP).
@@ -417,7 +430,7 @@ async fn async_main() -> Result<()> {
 
     install_panic_logging();
 
-    info!("whatsrust v{}", env!("CARGO_PKG_VERSION"));
+    info!("whatsrust v{BUILD_VERSION}");
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel(256);
     let cancel = CancellationToken::new();
@@ -2166,7 +2179,9 @@ fn print_json_result(status: u16, body: &[u8]) -> Result<()> {
 }
 
 fn print_cli_help() {
-    println!("whatsrust v{}", env!("CARGO_PKG_VERSION"));
+    println!("whatsrust v{BUILD_VERSION}");
+    println!();
+    println!("  whatsrust --version                    Print the build version and exit");
     println!();
     println!("DAEMON MODE:");
     println!("  whatsrust                              Start bridge with REPL + API server");
