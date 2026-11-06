@@ -5,6 +5,37 @@
 
 .DEFAULT_GOAL := help
 
+# Versioned binaries. `make build`, `make release` and `make dist` name each binary
+# whatsrust-<crate version>-<commit>[-dirty][-<features>] and point a `whatsrust` symlink at the
+# newest, so scripts that run target/<profile>/whatsrust keep working and older builds stay on disk.
+# The same string is compiled in (WHATSRUST_BUILD_SUFFIX): the startup log and `whatsrust --version`
+# show it. A plain `cargo build` still writes an unversioned target/<profile>/whatsrust.
+# FEATURES=a,b adds Cargo features (e.g. make build FEATURES=media-probe).
+comma := ,
+empty :=
+space := $(empty) $(empty)
+TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
+CRATE_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+EMBEDDER_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' embedder-rs/Cargo.toml | head -n 1)
+GIT_HASH := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+GIT_DIRTY := $(if $(filter nogit,$(GIT_HASH)),,$(shell git diff --quiet HEAD -- 2>/dev/null || echo -dirty))
+FEATURES ?=
+FEATURE_LIST := $(subst $(space),$(comma),$(strip $(FEATURES)))
+FEATURE_ARGS := $(if $(FEATURE_LIST),--features $(FEATURE_LIST))
+BUILD_VERSION := $(CRATE_VERSION)-$(GIT_HASH)$(GIT_DIRTY)$(if $(FEATURE_LIST),-$(subst $(comma),+,$(FEATURE_LIST)))
+EMBEDDER_BUILD_VERSION := $(EMBEDDER_VERSION)-$(GIT_HASH)$(GIT_DIRTY)
+
+# version_link <dir>: name cargo's fresh binary whatsrust-$(BUILD_VERSION) (a hard link, so it survives
+# the next build) and point the `whatsrust` symlink at it. When cargo found nothing to rebuild,
+# `whatsrust` is still the symlink of the last make build, and only the symlink is refreshed.
+define version_link
+	@cd $(1) && \
+	if [ ! -L whatsrust ]; then ln -f whatsrust whatsrust-$(BUILD_VERSION) 2>/dev/null || cp -p whatsrust whatsrust-$(BUILD_VERSION); fi && \
+	if [ ! -e whatsrust-$(BUILD_VERSION) ]; then echo "error: $(1)/whatsrust-$(BUILD_VERSION) is missing; run: rm $(1)/whatsrust, then build again" >&2; exit 1; fi && \
+	ln -sfn whatsrust-$(BUILD_VERSION) whatsrust && \
+	echo "Binary: $(1)/whatsrust-$(BUILD_VERSION) (whatsrust -> it)"
+endef
+
 .PHONY: help build release release-all dist run embedder-build run-semantic new-profile run-profile attach-profile embedder-smoke calibrate test test-all lint lint-strict fmt fmt-check clean py-sidecar-setup py-sidecar-smoke run-semantic-py
 
 # Model for the Rust embedder sidecar: bge-m3 (default, stronger multilingual/cross-language
@@ -26,11 +57,13 @@ help: ## Show this help (default target)
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-build: ## Build the debug binary (cargo build)
-	cargo build
+build: ## Build the debug binary as target/debug/whatsrust-<version>-<commit>[-dirty][-<features>] + a whatsrust symlink (FEATURES=a,b)
+	WHATSRUST_BUILD_SUFFIX=$(BUILD_VERSION) cargo build $(FEATURE_ARGS)
+	$(call version_link,$(TARGET_DIR)/debug)
 
-release: ## Build the optimized release binary (cargo build --release; slow: LTO + codegen-units=1)
-	cargo build --release
+release: ## Build the optimized release binary, versioned like `build` (slow: LTO + codegen-units=1; FEATURES=a,b)
+	WHATSRUST_BUILD_SUFFIX=$(BUILD_VERSION) cargo build --release $(FEATURE_ARGS)
+	$(call version_link,$(TARGET_DIR)/release)
 
 # `cargo run` starts the DAEMON: interactive REPL + REST API on :7270 (loopback
 # by default). On first run it prints a QR code to scan (or use
@@ -54,12 +87,14 @@ release-all: release embedder-build ## Build the daemon AND the embedder sidecar
 # Copies the two release-mode binaries `release-all` produces into dist/, so a deployment
 # only needs to ship that one folder. Prints the resulting paths plus a ready-to-use
 # WHATSRUST_EMBEDDER_CMD hint for wiring the sidecar into a copied-elsewhere daemon.
-dist: release-all ## Collect the release binaries (daemon + embedder sidecar) into dist/
+dist: release-all ## Collect the versioned release binaries (daemon + embedder sidecar) into dist/, each with a plain-name symlink
 	@mkdir -p dist
-	cp target/release/whatsrust dist/whatsrust
-	cp embedder-rs/target/release/whatsrust-embedder dist/whatsrust-embedder
-	@echo "Daemon:           $(CURDIR)/dist/whatsrust"
-	@echo "Embedder sidecar: $(CURDIR)/dist/whatsrust-embedder"
+	cp -p $(TARGET_DIR)/release/whatsrust-$(BUILD_VERSION) dist/whatsrust-$(BUILD_VERSION)
+	ln -sfn whatsrust-$(BUILD_VERSION) dist/whatsrust
+	cp -p embedder-rs/target/release/whatsrust-embedder dist/whatsrust-embedder-$(EMBEDDER_BUILD_VERSION)
+	ln -sfn whatsrust-embedder-$(EMBEDDER_BUILD_VERSION) dist/whatsrust-embedder
+	@echo "Daemon:           $(CURDIR)/dist/whatsrust-$(BUILD_VERSION) (whatsrust -> it)"
+	@echo "Embedder sidecar: $(CURDIR)/dist/whatsrust-embedder-$(EMBEDDER_BUILD_VERSION) (whatsrust-embedder -> it)"
 	@echo "Hint: WHATSRUST_EMBEDDER_CMD=$(CURDIR)/dist/whatsrust-embedder"
 
 # Runs the daemon with semantic search enabled via the Rust embedder sidecar

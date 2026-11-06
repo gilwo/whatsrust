@@ -9,6 +9,7 @@ Work on branch `feature/media-download`, not yet on `main`.
 ### Added
 - Design for the on-demand media download of stored history (per-chat folders, background fetch with whatsrust's own HTTP transfer, re-upload requests sent to the account's own LID, a media file listener with short-lived URLs, schema v9): `docs/plans/2026-10-29-on-demand-media-download-design.md` (v5, 2026-11-04, after four cold reviews, the phase 1 live test and a ureq timeout spike), ADR 0050 (Proposed), ADR 0005 amendment; not built yet
 - Dev-only `media-probe` REPL command (Cargo feature `media-probe`, never in a release build) for the media download's live test. It downloads a stored or live-cached message's media, asks the owner's phone to re-upload it (the wa-rs request, and a `web` request sent to the account's own LID), downloads it again, and prints each step; `--web` sends only the working request; HOWTO §3 "Media re-upload probe". Live result 2026-11-01: only the request sent to the own LID works at the current wa-rs pin (`src/media_probe.rs`; ADR 0050 note)
+- Versioned binaries: `make build`, `make release` and `make dist` name each binary `whatsrust-<version>-<commit>[-dirty][-<features>]` and point a plain-name symlink at the newest, so scripts and MCP configs keep working and older builds stay; `FEATURES=a,b` adds Cargo features; the same version string is compiled in (`whatsrust --version`, the startup log); a plain `cargo build` is unchanged (HOWTO §1)
 
 ## 2026-10-26 — Deployment as a service, doc hash remap
 
