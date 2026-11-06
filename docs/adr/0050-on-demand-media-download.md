@@ -1,8 +1,9 @@
 # 0050. On-demand media download: chat folders, background fetch, a media file listener
 
 **Status:** Proposed (v5, 2026-11-04: the v4 follow-up cold review and a ureq timeout spike folded in; the old-file
-test matrix passed 2026-11-05, GO 2026-11-06; next: phase 2)
-**Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4), 2026-11-04 (v5)
+test matrix passed 2026-11-05, GO 2026-11-06; v5.1 2026-11-06: the own-message attribution fix folded into phase 2;
+next: phase 2)
+**Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4), 2026-11-04 (v5), 2026-11-06 (v5.1)
 
 ## Context
 
@@ -35,7 +36,10 @@ Facts that shape the design (checked in the code, the wa-rs pin `9e8c70e` and a 
    `revoked_at` and `view_once`, written by history ingest for new rows. The message and its reference are written
    in one transaction. A duplicate (a re-fetched message) whose chat, sender, `from_me` and kind match the stored
    row fills an existing reference, and creates a missing one when the stored message is not live; a mismatch
-   changes nothing. Staged migration per ADR 0028–0032. No backfill. **There is no supported way back after a healthy
+   changes nothing. Staged migration per ADR 0028–0032. No backfill of the new columns. Phase 2 first fixes the
+   own-message attribution (live rows store the event's `from_me`; own history messages store the own phone JID as
+   the sender), and the migration repairs the stored rows before the one-time revoke pass (owner-authorised
+   2026-11-06). **There is no supported way back after a healthy
    migration** (`--rollback` serves only failed ones), so the schema phase is merged only after the old-file test
    matrix passes.
 3. **Files on disk, one folder per chat,** under `media/` beside `whatsapp.db`: `chat_<number>/`,
@@ -178,6 +182,16 @@ failures are fresh messages of one chat, where the phone handled the media with 
 from history; their links are still valid, and the engine re-uploads only after a 403, so it does not block the
 build (an open item; a MAC mismatch after a re-upload ends as `integrity`). Across both runs, 13 of 15 `web` requests
 succeeded, for files up to 4.8 years old.
+
+**2026-11-06: the own-message attribution fix moves into phase 2** (owner). History ingest uses the key's
+`remote_jid` as the sender of every message without a participant, so own history messages name the group (in
+groups) or the other person (in 1:1 chats) as the sender, and live rows store `from_me = 0` for own messages. The
+duplicate rule and the revoke rule (decision 9) compare these values; an own revoke stored from history would
+never count. Phase 2 therefore starts with the fix, and the v9 migration repairs the stored rows (live rows whose
+sender is the owner's number or LID get `from_me = 1`; history rows with `from_me = 1` whose sender is the chat
+JID get the own phone JID),
+before the one-time revoke pass. The owner authorised this repair; it is undone only by the manual revert. The
+"live media security" fix stays on its own branch from `main` (design §11).
 
 ## Alternatives considered
 
