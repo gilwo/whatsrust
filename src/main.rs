@@ -321,6 +321,58 @@ fn install_panic_logging() {
     }));
 }
 
+/// Directives used when `RUST_LOG` is unset or invalid.
+const DEFAULT_LOG_FILTER: &str = "whatsrust=info,whatsapp_rust=info";
+
+/// Log directives that always apply, whatever `RUST_LOG` says (see `log_filter`).
+///
+/// Each silences a log target that can print a media download URL or the media-connection auth
+/// token (`auth=...`), which a shared log file would expose. Found by surveying wa-rs at the
+/// pinned rev (`9e8c70e`) and the HTTP client under it. Repeat the survey when wa-rs is upgraded.
+const FORCED_LOG_DIRECTIVES: &[&str] = &[
+    // wa-rs src/download.rs:162 and :230, WARN: "Failed to download from URL {url}", the full URL
+    // with `auth=` and `token=`.
+    "whatsapp_rust::download=off",
+    // wa-rs src/client/node_io.rs:333, DEBUG: every received stanza, including the
+    // media-connection reply (`<media_conn auth="...">`). Its WARN lines (a frame that cannot be
+    // decoded) carry no stanza and stay.
+    "Client/Recv=warn",
+    // wa-rs src/handlers/iq.rs:38, DEBUG: a late IQ reply, which can be that same reply. The WARN
+    // line there (an unhandled IQ request) never is a reply and stays.
+    "whatsapp_rust::handlers::iq=warn",
+    // ureq (HTTP client) src/run.rs:147, :168 and :597, DEBUG: the request URI. It is redacted
+    // unless TRACE is on for `ureq::util`, so `RUST_LOG=trace` would print the query.
+    "ureq::run=off",
+    // ureq-proto src/util.rs:75, TRACE: a hex dump of the request head, which holds the same URI.
+    "ureq_proto::util=off",
+];
+
+/// The daemon's log filter: `rust_log` (the value of `RUST_LOG`, passed in so that tests need no
+/// environment) when it is set and valid, else `DEFAULT_LOG_FILTER`; then `FORCED_LOG_DIRECTIVES`
+/// on top, so that no `RUST_LOG` can bring the media token into the log.
+///
+/// How the forced directives win:
+/// - `EnvFilter` decides an event by the most specific matching directive (longest target), and
+///   `add_directive` replaces a directive with the same target. So `whatsapp_rust::download=trace`
+///   is overwritten, and a broader one (`trace`, `whatsapp_rust=trace`) loses.
+/// - A directive with a field or span filter (`target[{message}]=trace`) counts as more specific
+///   than a plain one for the same target and would win. Any directive with `[`, `]`, `{` or `}`
+///   is therefore dropped from `rust_log`. The daemon creates no spans, so nothing is lost.
+///
+/// Library consumers (`src/lib.rs`) set up tracing themselves and are not covered.
+fn log_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+
+    let from_env = rust_log.and_then(|dirs| {
+        let plain: Vec<&str> = dirs.split(',').filter(|d| !d.contains(['[', ']', '{', '}'])).collect();
+        EnvFilter::builder().parse(plain.join(",")).ok()
+    });
+    let base = from_env.unwrap_or_else(|| DEFAULT_LOG_FILTER.parse().expect("default log filter is valid"));
+    FORCED_LOG_DIRECTIVES.iter().fold(base, |filter, directive| {
+        filter.add_directive(directive.parse().expect("forced log directive is valid"))
+    })
+}
+
 async fn async_main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -358,10 +410,7 @@ async fn async_main() -> Result<()> {
 
     // Daemon mode
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "whatsrust=info,whatsapp_rust=info".parse().unwrap()),
-        )
+        .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
 
     install_panic_logging();
@@ -2408,6 +2457,176 @@ mod panic_logging_tests {
         assert!(output.contains("panic_message=\"boom ש\""), "{output}");
 
         assert!(seen.lock().unwrap().iter().any(|n| n == THREAD), "previous hook was not called");
+    }
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A `MakeWriter` target that collects everything the fmt subscriber writes.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Everything `emit` logs on this thread while `filter` is installed.
+    fn capture(filter: tracing_subscriber::EnvFilter, emit: impl FnOnce()) -> String {
+        let buf = SharedBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        output
+    }
+
+    /// Emits a download URL carrying the token on `$target` at every level.
+    macro_rules! token_at_every_level {
+        ($target:literal) => {
+            tracing::error!(target: $target, "https://h/x?auth=SECRET");
+            tracing::warn!(target: $target, "https://h/x?auth=SECRET");
+            token_below_warn!($target);
+        };
+    }
+
+    /// Emits a stanza carrying the token on `$target` at INFO, DEBUG and TRACE.
+    macro_rules! token_below_warn {
+        ($target:literal) => {
+            tracing::info!(target: $target, "<media_conn auth=\"SECRET\"/>");
+            tracing::debug!(target: $target, "<media_conn auth=\"SECRET\"/>");
+            tracing::trace!(target: $target, "<media_conn auth=\"SECRET\"/>");
+        };
+    }
+
+    /// Every line wa-rs (and the HTTP client under it) can print the token on, at the levels it
+    /// prints it. The WARN lines of the two capped targets are not here: they carry no token.
+    fn emit_token_lines() {
+        token_at_every_level!("whatsapp_rust::download");
+        token_at_every_level!("ureq::run");
+        token_at_every_level!("ureq_proto::util");
+        token_below_warn!("Client/Recv");
+        token_below_warn!("whatsapp_rust::handlers::iq");
+    }
+
+    /// `RUST_LOG` values to try: unset, broad, aimed at the forced targets, and the forms that
+    /// would out-rank a plain directive (field or span filters).
+    const RUST_LOG_VALUES: &[Option<&str>] = &[
+        None,
+        Some(""),
+        Some("trace"),
+        Some("debug"),
+        Some("info"),
+        Some("whatsapp_rust=trace"),
+        Some("whatsapp_rust::download=trace"),
+        Some("whatsapp_rust::download=trace,whatsapp_rust=trace,trace"),
+        Some("Client/Recv=trace"),
+        Some("Client=trace,whatsapp_rust::handlers::iq=trace"),
+        Some("ureq=trace,ureq::run=trace,ureq_proto=trace,ureq_proto::util=trace"),
+        Some("whatsapp_rust::download[{message}]=trace"),
+        Some("Client/Recv[{message}]=trace,ureq::run[{message}]=trace,ureq_proto::util[{message}]=trace"),
+        Some("whatsapp_rust::handlers::iq[{message=.*}]=trace"),
+        Some("[{message}]=trace"),
+        Some("[some_span]=trace"),
+        Some("whatsapp_rust::download[x]=trace,whatsapp_rust::download{y}=trace"),
+        // Invalid: a bad level, a bad first character.
+        Some("whatsapp_rust::download=loud"),
+        Some("%%%"),
+    ];
+
+    #[test]
+    fn the_token_never_reaches_the_log_with_any_rust_log() {
+        for rust_log in RUST_LOG_VALUES {
+            let output = capture(log_filter(*rust_log), emit_token_lines);
+            assert!(!output.contains("SECRET"), "RUST_LOG={rust_log:?} leaked the token:\n{output}");
+        }
+    }
+
+    #[test]
+    fn the_capture_sees_the_token_without_the_forced_directives() {
+        // Without this, the test above would pass for an empty capture too.
+        let output = capture(tracing_subscriber::EnvFilter::new("trace"), emit_token_lines);
+        assert_eq!(output.matches("SECRET").count(), 3 * 5 + 2 * 3, "{output}");
+    }
+
+    #[test]
+    fn a_forced_directive_replaces_a_rust_log_directive_for_the_same_target() {
+        let emit = || tracing::warn!(target: "whatsapp_rust::download", "https://h/x?auth=SECRET");
+        let rust_log = "whatsapp_rust::download=trace";
+        // On its own, the `RUST_LOG` directive lets the line through ...
+        let unforced = capture(tracing_subscriber::EnvFilter::new(rust_log), emit);
+        assert!(unforced.contains("SECRET"), "{unforced}");
+        // ... and the forced one replaces it.
+        let forced = capture(log_filter(Some(rust_log)), emit);
+        assert!(!forced.contains("SECRET"), "{forced}");
+    }
+
+    #[test]
+    fn a_field_filter_directive_would_out_rank_the_forced_one_so_it_is_dropped() {
+        let emit = || tracing::warn!(target: "whatsapp_rust::download", "https://h/x?auth=SECRET");
+        let rust_log = "whatsapp_rust::download[{message}]=trace";
+        // Unforced and kept, the more specific directive wins over a plain `off` ...
+        let kept = tracing_subscriber::EnvFilter::new(rust_log)
+            .add_directive("whatsapp_rust::download=off".parse().unwrap());
+        assert!(capture(kept, emit).contains("SECRET"));
+        // ... which is why `log_filter` drops it.
+        assert!(!capture(log_filter(Some(rust_log)), emit).contains("SECRET"));
+    }
+
+    #[test]
+    fn the_capped_targets_keep_their_warnings() {
+        let emit = || {
+            tracing::warn!(target: "Client/Recv", "kept-recv-warning");
+            tracing::warn!(target: "whatsapp_rust::handlers::iq", "kept-iq-warning");
+            tracing::debug!(target: "Client/Recv", "dropped-recv-debug");
+            tracing::debug!(target: "whatsapp_rust::handlers::iq", "dropped-iq-debug");
+        };
+        for rust_log in [None, Some("trace"), Some("Client/Recv=trace,whatsapp_rust::handlers::iq=trace")] {
+            let output = capture(log_filter(rust_log), emit);
+            assert!(output.contains("kept-recv-warning") && output.contains("kept-iq-warning"), "{rust_log:?}: {output}");
+            assert!(!output.contains("dropped"), "{rust_log:?}: {output}");
+        }
+    }
+
+    #[test]
+    fn rust_log_still_controls_every_other_target() {
+        let emit = || {
+            tracing::info!(target: "whatsrust::bridge", "info-line");
+            tracing::debug!(target: "whatsrust::bridge", "debug-line");
+            tracing::debug!(target: "tokio", "tokio-debug-line");
+        };
+        // Default: whatsrust at INFO.
+        let output = capture(log_filter(None), emit);
+        assert!(output.contains("info-line") && !output.contains("debug-line") && !output.contains("tokio-debug-line"), "{output}");
+        // A valid `RUST_LOG` replaces the default.
+        let output = capture(log_filter(Some("whatsrust=debug")), emit);
+        assert!(output.contains("info-line") && output.contains("debug-line") && !output.contains("tokio-debug-line"), "{output}");
+        let output = capture(log_filter(Some("trace")), emit);
+        assert!(output.contains("debug-line") && output.contains("tokio-debug-line"), "{output}");
+        // An invalid one (any directive) falls back to the default.
+        for invalid in ["whatsrust=loud", "whatsrust=debug,%%%"] {
+            let output = capture(log_filter(Some(invalid)), emit);
+            assert!(output.contains("info-line") && !output.contains("debug-line"), "{invalid}: {output}");
+        }
+    }
+
+    #[test]
+    fn directives_around_a_dropped_field_filter_directive_still_apply() {
+        let emit = || tracing::debug!(target: "whatsrust::bridge", "debug-line");
+        let output = capture(log_filter(Some("whatsrust=debug,whatsapp_rust::download[{message}]=trace")), emit);
+        assert!(output.contains("debug-line"), "{output}");
     }
 }
 

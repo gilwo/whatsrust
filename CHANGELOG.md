@@ -13,6 +13,10 @@ Work on branch `ops/supervisor`, not yet on `main`.
 ### Fixed
 - Commit hashes cited in the docs that the 2026-10-23 rebase-merge left pointing at branch-only commits now point at the `main` commits
 
+### Security
+- Live media ingest no longer downloads a media message whose `direct_path` could send the request, with the media auth token, to another host (anything but one leading `/` followed by printable ASCII without spaces, `@`, `\` or `#`), or that carries a sender-supplied `static_url` (wa-rs would fetch it as-is); the message is skipped like an over-size file (marked done, not retried), with one WARN that does not quote the value
+- The media auth token no longer reaches the daemon's log under any `RUST_LOG`: the wa-rs download-failure warning (full URL with `auth=`), the DEBUG stanza dumps that include the media-connection reply, and the HTTP client's request-URI traces are always filtered; `RUST_LOG` directives with `[...]` or `{...}` (field or span filters) are ignored, because they would out-rank the filter
+
 ## 2026-10-23 — Fetch-history anchors and pairing history, MCP HTTP listener, run profiles, planning docs
 
 Merged from `feature/mcp-streamable-http` (rebase-merge; the hashes below are the `main` commits).

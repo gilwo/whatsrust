@@ -988,6 +988,8 @@ and keeps trying. In both cases `status` shows the last exit code (1 = config or
   ```
 - Linux: the journal keeps the logs and rotates them. Use `scripts/deploy.sh logs <instance>`.
 
+Whatever `RUST_LOG` says, the daemon never writes the wa-rs media download URL lines (and the few related stanza and HTTP request traces), because they carry the media auth token.
+
 ### Upgrade
 
 ```bash
