@@ -1,7 +1,8 @@
 # On-demand media download — design and plan
 
 **Status:** v5 (2026-11-04): the v4 follow-up cold review and a ureq timeout spike folded in, with the owner's
-decisions of 2026-11-04 (§9). Next: the old-file test matrix (§11), then the build. History: v1 2026-10-29 (cold
+decisions of 2026-11-04 (§9). The old-file test matrix passed (2026-11-05, GO 2026-11-06). Next: phase 2, and a
+short retest of two cells (§11.1), done 2026-11-06. History: v1 2026-10-29 (cold
 review: needs rework); v2 2026-10-30 (approve with changes, 2 blocking); v3 2026-11-01 (approve with changes,
 0 blocking); v4 2026-11-03 (approve with changes, 0 blocking).
 **Decision record:** ADR 0050 (Proposed); ADR 0005 amendment of 2026-10-29.
@@ -111,6 +112,9 @@ short-lived URL and fetches the file over the network.
 | The re-upload request is a `server-error` receipt with an encrypted payload and an `<rmr jid from_me participant>` child; the phone answers with a `mediaretry` notification: `Success { direct_path }`, `NotFound` (code 2), `DecryptionError` (code 3), `GeneralError`; the server ACKs the receipt, with an `error` attribute when it rejects it | `wacore/src/media_retry.rs`; upstream `main` `src/features/media_reupload.rs` **[wa-rs]** |
 | **The pin's `client.media_reupload()` sends the receipt `to` the account's phone number. On the owner's LID-migrated account the phone never answered (0 of 10). The same receipt `to` the account's own LID (`client.get_lid()` without the device part), with the chat and the participant in LID form, worked 3 of 3** (1:1, group from a member, the account's own group message); ACK in 0.2 s, answer in about 1 s; no size mismatch on 5 photos. Upstream `main` does the same and keeps a PN chat when no mapping is known. The parts are public at the pin: `encrypt_media_retry_receipt`, `build_media_retry_receipt`, `parse_media_retry_notification`, `client.send_node`, `client.wait_for_node(NodeFilter)` | phase 1 live test 2026-11-01 (HOWTO §3 "Media re-upload probe"; ADR 0050 Notes) **[wa-rs]** |
 | Most history media is probably expired: CDN links live hours to days | ADR 0005 |
+| **Old-file test matrix (2026-11-05, the owner's second account, which has a LID):** expired links answer **`http status: 403`** (4 of 4; not 404/410). The `web` request recovered files up to **4.8 years old** (1:1 chats and a group video, 4 of 4), with the chat and the group participant sent in **phone-JID form** (no LID mapping existed), so the stored form works when `to` is the own LID. Failures: an own group message, because history stores the **group JID as the sender of own group messages** (the key has no participant), and the server did not ACK a request naming the group as participant; and one fresh `@lid` chat, where the phone answered within 1 s but its answer did not decrypt with the media key that had just downloaded the file | `runs/dev-live/whatsrust-probe.log`; ADR 0050 Notes |
+| **Retest (2026-11-06):** own group messages succeed with the own LID as the participant (3 of 3, up to 1606 d); `@lid` chats succeed (2 of 2 old, one an own message). Two fresh messages of one `@lid` chat failed: one answer did not decrypt, one re-uploaded file failed its MAC, so the phone used another media key than the one stored from history; their links were still valid. Across both runs, 13 of 15 `web` requests succeeded | ADR 0050 Notes |
+| wa-rs logs every failed CDN download at WARN with the **full URL, including the media-connection `auth=` token** (60 of 60 such lines in the probe log); the pin also appends `?auth=…` after a path that already has a query string (a double `?`), which the CDN accepts | `runs/dev-live/whatsrust-probe.log`; wa-rs `src/download.rs` (the "Trying next host" warning), `wacore/src/download.rs:291-293` |
 | MCP tool budget 40 s; CLI client timeout 45 s; MCP turns an HTTP status ≥ 400 into `isError` | `src/mcp_http.rs` `TOOL_BUDGET`; `src/bridge.rs` `SYNC_CLIENT_TIMEOUT`; `src/mcp_registry.rs` (~477) |
 | The REST response type buffers the whole body (`ApiResponse.body: Vec<u8>`); only SSE streams, with a write timeout | `src/api.rs` |
 | Every REST route passes the Origin/Host/Content-Type gate, then the bearer-token check when a token is set; the gate blocks cross-site POSTs, not cross-site GETs. `CallContext.loopback_file_access` is the REST listener's bind (`cfg.is_loopback`), not the peer; the MCP HTTP runner sets false | `src/api.rs` `reject_from_head`, `CallContext` (~2126, ~2264); ADR 0044 |
@@ -377,7 +381,8 @@ Failure reasons:
   `get` inside that time answers the stored failure again and does not restart the download. Without it, a
   persistent stall on a large file would become an endless full re-download loop (there is no resume).
 - `detail` comes from a closed vocabulary (status numbers, reason words); it is never built from raw error text,
-  because CDN URLs carry the media `auth` token.
+  because CDN URLs carry the media `auth` token. The engine runs its own transfer and logs only that vocabulary;
+  wa-rs's own download warnings (which print full URLs, §2) are filtered out of the log (roadmap P1).
 
 ### 6.2 Lanes
 
@@ -452,9 +457,11 @@ upgrade cannot silently move them into another reason.
   LID (`lid_pn_mapping`).
 - `participant` (groups only): the sender's LID: the raw `participant` when it is a LID, else the mapped LID;
   without the device part.
-- **No LID form** for the 1:1 chat or the group sender: whether the stored phone JID is sent instead is decided by
-  the phase 4 gate (§11, §13). Until the gate shows that the stored form works, the item fails as
-  `address_unresolved` without contacting the phone.
+- **No LID form** for the 1:1 chat or the group sender: the stored phone JID is sent; the old-file matrix showed it
+  works (§2). Only an item with neither form (for example a sender stored as a bare LID user with no mapping and no
+  raw key) fails as `address_unresolved` without contacting the phone.
+- **Own messages in a group:** the participant is the account's own LID without the device part, never the stored
+  sender (history stores the group JID there, §2), as upstream `main` does.
 - `from_me`: the stored key value (history rows carry the correct one).
 - It waits up to 10 s for the server's ACK (an `error` attribute → `reupload_rejected`), then up to 30 s in total
   for the `mediaretry` notification.
@@ -760,21 +767,14 @@ No other new crate: the sanitiser uses the standard library (§5.3), and the qua
 
 ## 11. Open items
 
-1. **The old-file test matrix: the gate for merging phase 2** (and so for everything after it; owner; the probe is
-   ready, HOWTO §3 "Media re-upload probe"). Fetch chats with old media, then probe stored rows of each class:
-   - a 1:1 chat with a mapped LID; a group sender with a mapped LID;
-   - a row with no LID form (it decides whether the stored phone JID may be sent; until then `address_unresolved`);
-   - an own message;
-   - **a known-good control:** a fresh history file (not yet expired) downloaded with 200 through the pin's URL
-     assembly, so that a 403 or 404 on old files is not a URL-building fault (some paths carry a query string, and
-     the pin appends `?auth=…` unconditionally).
-   Record what the CDN answers for expired links of several ages (the expected `http status: 404`/`410`, or 403)
-   and how long the phone keeps files. The matrix goes into ADR 0050.
-   **Go/no-go:** go when the mapped 1:1 or the mapped group addressing recovers files older than one week. Otherwise
-   the scope shrinks to "history files whose link has not expired yet", and the re-upload lane is reconsidered.
-2. **A second account** (owner: there is one): check whether it has a LID (HOWTO §3 probe: `media-probe x` prints
-   the `own account:` line), and include it in the matrix when it is paired. An account without a LID uses the pin's
-   phone-number request (§6.2), which the matrix then tests.
+1. **The old-file test matrix: done 2026-11-05, decision GO** (owner, 2026-11-06); **retest 2026-11-06 done.**
+   Results in §2 and ADR 0050 Notes: expired links answer 403; the phone re-uploaded files up to 4.8 years old with
+   phone-JID addressing; own group messages work with the own LID as the participant (3 of 3); `@lid` chats work
+   (2 of 2 old). **Open, not blocking:** fresh messages of one `@lid` chat, where the phone used another media key
+   than the stored one (a re-upload is attempted only after a 403, and a MAC mismatch ends as `integrity`). A mapped
+   1:1 chat or group sender was not exercised; the unmapped form, the harder case, works.
+2. **A second account:** it has a LID (checked 2026-11-05), and the matrix ran on it. An account without a LID
+   still uses the pin's phone-number request (§6.2); no such account is available to test it.
 3. **The HTTPS check of the native limits:** the spike proved the idle limit over HTTP only. Phase 4's tests run
    both limits over HTTPS against a local TLS server (§14).
 4. **Related, outside this feature** (roadmap rows): live ingest downloads from the same unchecked `direct_path`
@@ -828,7 +828,7 @@ No other new crate: the sanitiser uses the standard library (§5.3), and the qua
 |---|---|---|
 | 0 | Branch from `main`; the "after a merge" step | ✅ committed; 0 stale doc hashes |
 | 1 | **The live re-upload test** with the dev probe (`media-probe`, HOWTO §3) | ✅ 2026-11-01: addressing for fresh messages settled (own LID), recorded in FEATURES F1 and ADR 0050 |
-| 1b | **The old-file test matrix** (§11.1; owner, with the probe) | the matrix recorded in ADR 0050; the go/no-go decision taken |
+| 1b | **The old-file test matrix** (§11.1; owner, with the probe) | ✅ 2026-11-05: recorded in ADR 0050 and §2; **GO** (2026-11-06); retest of two cells done 2026-11-06 (§11.1) |
 | 2 | Schema v9 (6 columns; staged migration, tests per ADR 0028–0032); the message and its reference in one transaction; history ingest writes the new columns and the `view_once` flag; the duplicate rule (match, then fill, or create when not live); the revoke extraction (key `from_me`/`participant`), its resolution at ingest (`revoked_at`) and the one-time pass; the HOWTO manual-revert section. **Merged only after phase 1b** | migration tests (fresh DB, v8 → v9, the failed-migration path, the one-time revoke pass); the manual revert rehearsed on a copy; ingest, duplicate (match and mismatch) and revoke tests (own, valid, forged, before the target) |
 | 3 | Layout: pure functions for folders, file names (bounded IDs), sanitising (byte limits), the MIME allowlist, the name file; the `tag`/`untag` primitive; the macOS quarantine attribute | unit and property tests for every row of §5.2 and §5.4, Cc/Cf/bidi stripping, Hebrew, empty names, 64-byte cuts, long and hostile IDs, executable extensions → `bin`, the §5.5 transition table |
 | 4 | The engine: `MediaTransfer` (ureq's own idle and total limits) and `MediaReuploader` (own-LID request, the pin's request for a LID-less account) with fakes; the two lanes; the reserve; the re-upload window, breaker and memories (persisted per key); the states and the per-item backoff; cancel and cancel all; the delete hook (matched by chat) with the chunked intent journal; startup cleanup and the counts; adoption by ID and un-tag | fake-driven tests for every state and reason; the real agent against local HTTP **and HTTPS** servers (both limits); journal replay with concurrent events; the races "deleted while downloading" and "revoked while downloading"; queue full; disconnected and no-LID waits |
