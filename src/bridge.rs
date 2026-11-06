@@ -3389,7 +3389,7 @@ async fn handle_event(
                     let embed_status = inbound.content.embed_status();
                     if let Err(e) = store.insert_inbound(
                         &inbound.jid, &inbound.sender, &inbound.id,
-                        inbound.content.kind(), body_opt, inbound.timestamp, embed_status,
+                        inbound.content.kind(), body_opt, inbound.timestamp, inbound.is_from_me, embed_status,
                     ).await {
                         debug!(error = %e, "failed to insert inbound history (may be duplicate)");
                     }
@@ -5232,6 +5232,11 @@ impl PersistCounts {
 ///
 /// `dm_alt` is the phone JID of a `@lid` direct chat (the conversation's `pnJid`): it resolves
 /// the sender of a DM message like the chat itself, as live messages use `sender_alt`.
+///
+/// An own message (`from_me`) whose key has no participant stores the account's own phone JID
+/// (`Store::own_phone_jid`, read once per call) as the sender: its `remote_jid` names the group
+/// or the other person, not the sender. Without a known own number the `remote_jid` stays the
+/// fallback.
 async fn persist_history_messages(
     store: &Store,
     embed_notify: &tokio::sync::Notify,
@@ -5241,6 +5246,10 @@ async fn persist_history_messages(
     source: &str,
 ) -> PersistCounts {
     let mut counts = PersistCounts::default();
+    let own_phone_jid = store.own_phone_jid().await.unwrap_or_else(|e| {
+        debug!(error = %e, "history persist: own phone JID lookup failed");
+        None
+    });
 
     for web in messages {
         // Skip messages with no payload
@@ -5259,11 +5268,16 @@ async fn persist_history_messages(
         // messageTimestamp is Unix seconds in the proto
         let ts_secs = web.message_timestamp.unwrap_or(0) as i64;
 
-        // For group messages the real sender is in `participant`; for DMs it's the remote JID.
+        // For group messages the real sender is in `participant`; for DMs it's the remote JID,
+        // except for an own message: its key has no participant and its `remote_jid` is the group
+        // or the other person, so the sender is the account's own phone JID.
         // Resolve @lid → @s.whatsapp.net so the stored sender matches the live path.
         let (sender_raw, sender_alt) = match web.key.participant.as_deref() {
             Some(participant) => (participant, None),
-            None => (web.key.remote_jid.as_deref().unwrap_or(""), dm_alt),
+            None => match own_phone_jid.as_deref() {
+                Some(own) if from_me => (own, None),
+                _ => (web.key.remote_jid.as_deref().unwrap_or(""), dm_alt),
+            },
         };
         let sender_resolved = resolve_chat_jid(sender_raw, sender_alt, store).await;
         let sender_jid = sender_resolved.as_str();
@@ -7572,7 +7586,7 @@ mod tests {
         let (store, dir) = open_seed_store("stored");
         let chat = "120363000000000001@g.us";
         store
-            .insert_inbound(chat, "2@s.whatsapp.net", "STORED1", "text", Some("hi"), 1_700_000_000, "pending")
+            .insert_inbound(chat, "2@s.whatsapp.net", "STORED1", "text", Some("hi"), 1_700_000_000, false, "pending")
             .await
             .unwrap();
         let range = sync_range(vec![sync_msg(Some("LAST1"), Some(false), Some(1_792_568_908))]);
@@ -8045,6 +8059,109 @@ mod history_storage_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Simulates a paired device the way `Store::is_paired` reads it: a `device` row with `pn`.
+    fn set_device_pn(dir: &Path, pn: &str) {
+        rusqlite::Connection::open(dir.join("wa.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO device (id, pn) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET pn = excluded.pn",
+                [pn],
+            )
+            .unwrap();
+    }
+
+    const OWN_JID: &str = "15550001111@s.whatsapp.net";
+
+    #[tokio::test]
+    async fn test_own_history_messages_without_a_participant_store_the_own_phone_jid_as_sender() {
+        let (store, dir) = open_store("own-sender");
+        // `Jid::to_string()` writes the device part of the paired number.
+        set_device_pn(&dir, "15550001111:12@s.whatsapp.net");
+        let mut own_with_participant = msg("OGP", GROUP_CHAT, true, 1_300, "own, participant named");
+        own_with_participant.key.participant = Some("100000000000009@lid".to_owned());
+        let mut received_in_group = msg("GR", GROUP_CHAT, false, 1_400, "received in group");
+        received_in_group.key.participant = Some("15559998888@s.whatsapp.net".to_owned());
+        let hs = chunk(vec![
+            conv(
+                GROUP_CHAT,
+                vec![
+                    msg("OG", GROUP_CHAT, true, 1_000, "own in group"),
+                    own_with_participant,
+                    received_in_group,
+                    msg("GRNP", GROUP_CHAT, false, 1_500, "received, no participant"),
+                ],
+            ),
+            conv(
+                PHONE_CHAT,
+                vec![msg("OD", PHONE_CHAT, true, 1_100, "own in dm"), msg("DR", PHONE_CHAT, false, 1_200, "received in dm")],
+            ),
+            conv_with_pn(
+                "100000000000001@lid",
+                "15551234567@s.whatsapp.net",
+                vec![
+                    msg("OL", "100000000000001@lid", true, 1_600, "own in lid dm"),
+                    msg("LR", "100000000000001@lid", false, 1_700, "received in lid dm"),
+                ],
+            ),
+        ]);
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.counts, PersistCounts { stored: 8, ..Default::default() });
+        let rows = rows(&dir);
+        assert_eq!(row(&rows, "OG").sender_jid, OWN_JID, "an own group message names the account, not the group");
+        assert_eq!(row(&rows, "OD").sender_jid, OWN_JID, "an own 1:1 message names the account, not the peer");
+        assert_eq!(
+            row(&rows, "OL").sender_jid,
+            OWN_JID,
+            "an own message in a LID chat names the account, not the peer",
+        );
+        assert_eq!(row(&rows, "OL").chat_jid, "15551234567@s.whatsapp.net", "the chat key is unchanged");
+        for id in ["OG", "OD", "OL", "OGP"] {
+            assert!(row(&rows, id).from_me, "{id}: from_me is kept");
+        }
+        // Unchanged: a participant on the key still names the sender.
+        assert_eq!(row(&rows, "OGP").sender_jid, "100000000000009@lid");
+        assert_eq!(row(&rows, "GR").sender_jid, "15559998888@s.whatsapp.net");
+        // Unchanged: received messages without a participant use the key's remote JID.
+        assert_eq!(row(&rows, "GRNP").sender_jid, GROUP_CHAT);
+        assert_eq!(row(&rows, "DR").sender_jid, PHONE_CHAT);
+        assert_eq!(row(&rows, "LR").sender_jid, "15551234567@s.whatsapp.net");
+        for id in ["GR", "GRNP", "DR", "LR"] {
+            assert!(!row(&rows, id).from_me, "{id}: from_me is kept");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_own_history_messages_keep_the_remote_jid_fallback_without_an_own_number() {
+        let (store, dir) = open_store("own-sender-unpaired");
+        let notify = tokio::sync::Notify::new();
+        let own_messages = |suffix: &str| {
+            chunk(vec![
+                conv(GROUP_CHAT, vec![msg(&format!("OG{suffix}"), GROUP_CHAT, true, 1_000, "own in group")]),
+                conv(PHONE_CHAT, vec![msg(&format!("OD{suffix}"), PHONE_CHAT, true, 1_100, "own in dm")]),
+            ])
+        };
+
+        // No device row at all.
+        store_chunk(&store, &notify, &own_messages("1"), SOURCE_BOOTSTRAP).await;
+        // A device row with an empty pn (unpaired).
+        set_device_pn(&dir, "");
+        store_chunk(&store, &notify, &own_messages("2"), SOURCE_BOOTSTRAP).await;
+
+        let rows = rows(&dir);
+        assert_eq!(rows.len(), 4);
+        for suffix in ["1", "2"] {
+            assert_eq!(row(&rows, &format!("OG{suffix}")).sender_jid, GROUP_CHAT, "the old fallback stays");
+            assert_eq!(row(&rows, &format!("OD{suffix}")).sender_jid, PHONE_CHAT, "the old fallback stays");
+            assert!(row(&rows, &format!("OG{suffix}")).from_me);
+            assert!(row(&rows, &format!("OD{suffix}")).from_me);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn test_media_messages_are_stored_with_a_label_and_a_media_ref_and_no_download() {
         let (store, dir) = open_store("media");
@@ -8169,7 +8286,7 @@ mod history_storage_tests {
     async fn test_a_media_message_that_arrived_live_keeps_its_row_and_gets_no_media_ref() {
         let (store, dir) = open_store("media-live-dup");
         store
-            .insert_inbound(PHONE_CHAT, "15557654321", "IMG1", "image", Some("[image 1.0KB]"), 1_000, "skipped")
+            .insert_inbound(PHONE_CHAT, "15557654321", "IMG1", "image", Some("[image 1.0KB]"), 1_000, false, "skipped")
             .await
             .unwrap();
         let hs = chunk(vec![conv(PHONE_CHAT, vec![web("IMG1", PHONE_CHAT, false, 1_000, image_message(500, None))])]);
@@ -8211,7 +8328,7 @@ mod history_storage_tests {
         let (store, dir) = open_store("duplicates");
         // Already stored live, before the package arrived.
         store
-            .insert_inbound(PHONE_CHAT, "15557654321", "P1", "text", Some("hi"), 1_000, "pending")
+            .insert_inbound(PHONE_CHAT, "15557654321", "P1", "text", Some("hi"), 1_000, false, "pending")
             .await
             .unwrap();
         let hs = chunk(vec![conv(

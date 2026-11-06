@@ -1208,6 +1208,21 @@ impl Store {
         .await
     }
 
+    /// The account's own phone JID, `<number>@s.whatsapp.net` with the device part removed, from
+    /// the `device` row (`pn` column, written by `save_device_to_db` as `Jid::to_string()`, so
+    /// `<number>[:<device>]@s.whatsapp.net`). `None` for a fresh DB with no `device` row, an
+    /// empty `pn` (unpaired) or a `pn` that is not a phone JID.
+    pub async fn own_phone_jid(&self) -> Result<Option<String>> {
+        self.run(|c| {
+            let pn: Option<String> = c
+                .query_row("SELECT pn FROM device WHERE id = 1", [], |row| row.get(0))
+                .optional()
+                .map_err(db_err)?;
+            Ok(pn.as_deref().and_then(phone_jid_without_device))
+        })
+        .await
+    }
+
     // -----------------------------------------------------------------------
     // Outbound queue — persistent message queue (crash-safe)
     // -----------------------------------------------------------------------
@@ -1489,8 +1504,10 @@ impl Store {
         .await
     }
 
-    /// Insert an inbound message into the history table. Duplicates (by message_id) are ignored.
-    /// Delegates to `insert_message` with `from_me=false` and `source="live"`.
+    /// Insert a live message into the history table. Duplicates (by message_id) are ignored.
+    /// Delegates to `insert_message` with `source="live"`. `from_me` is the live event's own
+    /// flag (`info.source.is_from_me`): an own message sent from another linked device or the
+    /// phone arrives as a live event too, and is stored as the account's own message.
     ///
     /// `embed_status`: see `insert_message` — the live-ingest call site classifies from the
     /// `InboundContent` before calling this wrapper (M2.2.2 blast-radius fix: this wrapper used to
@@ -1503,9 +1520,10 @@ impl Store {
         content_kind: &str,
         body_text: Option<&str>,
         timestamp: i64,
+        from_me: bool,
         embed_status: &str,
     ) -> Result<()> {
-        self.insert_message(chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, false, "live", embed_status).await
+        self.insert_message(chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, from_me, "live", embed_status).await
     }
 
     /// Store the media reference of message `message_id` (ADR 0005, `media_refs`). `Ok(true)` for
@@ -3007,6 +3025,21 @@ pub(crate) fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// `<number>@s.whatsapp.net` from a stored `device.pn` value (`<number>[:<device>]@s.whatsapp.net`,
+/// the wacore `Jid` display form: a phone JID never renders an agent). `None` for an empty value,
+/// an empty number, or any other server.
+fn phone_jid_without_device(pn: &str) -> Option<String> {
+    let (user_part, server) = pn.split_once('@')?;
+    if server != "s.whatsapp.net" {
+        return None;
+    }
+    let number = user_part.split(':').next().unwrap_or_default();
+    if number.is_empty() {
+        return None;
+    }
+    Some(format!("{number}@s.whatsapp.net"))
 }
 
 /// Save a Device to the database (shared by DeviceStore::save and ::create).
@@ -5340,25 +5373,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (b2a-5) insert_inbound still writes source='live' and from_me=0.
+    /// (b2a-5) insert_inbound writes source='live' and the live event's own `from_me` flag: 1
+    /// for the account's own message, 0 for a received one (own-message attribution fix).
     #[tokio::test]
-    async fn test_insert_inbound_still_writes_live_source_from_me_false() {
+    async fn test_insert_inbound_writes_live_source_and_the_events_from_me() {
         let (store, dir) = open_b2a_store("insert-inbound-compat");
 
         store.insert_inbound(
             "chat@s.whatsapp.net",
             "sender@s.whatsapp.net",
-            "live-msg-1",
+            "live-received",
             "text",
             Some("body"),
             500,
+            false,
+            "pending",
+        ).await.unwrap();
+        store.insert_inbound(
+            "chat@s.whatsapp.net",
+            "me@s.whatsapp.net",
+            "live-own",
+            "text",
+            Some("my body"),
+            600,
+            true,
             "pending",
         ).await.unwrap();
 
-        // Verify via get_oldest_message: from_me must be false
+        let stored = |id: &str| -> (i64, String, String) {
+            store
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT from_me, source, sender_jid FROM messages WHERE message_id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(stored("live-received"), (0, "live".to_owned(), "sender@s.whatsapp.net".to_owned()));
+        assert_eq!(stored("live-own"), (1, "live".to_owned(), "me@s.whatsapp.net".to_owned()));
+
+        // The anchor lookup (oldest message) reads the same flag.
         let row = store.get_oldest_message("chat@s.whatsapp.net").await.unwrap().unwrap();
-        assert_eq!(row.message_id, "live-msg-1");
-        assert!(!row.from_me, "insert_inbound must write from_me=false");
+        assert_eq!(row.message_id, "live-received");
+        assert!(!row.from_me, "a received message must be stored with from_me=false");
         assert_eq!(row.timestamp_secs, 500);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -5493,8 +5552,8 @@ mod tests {
     async fn test_fts_search_basic_english_term() {
         let (store, dir) = open_search_store("basic-en");
 
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "en-001", "text", Some("hello world"), 1000, "pending").await.unwrap();
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "en-002", "text", Some("goodbye moon"), 2000, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "en-001", "text", Some("hello world"), 1000, false, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "en-002", "text", Some("goodbye moon"), 2000, false, "pending").await.unwrap();
 
         let results = store.search_inbound(None, Some("hello"), 10, None).await.unwrap();
         assert_eq!(results.len(), 1, "FTS must return exactly one hit for 'hello'");
@@ -5509,8 +5568,8 @@ mod tests {
         let (store, dir) = open_search_store("hebrew");
 
         // Hebrew: "שלום" = shalom
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "heb-001", "text", Some("שלום עולם"), 1000, "pending").await.unwrap();
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "heb-002", "text", Some("להתראות"), 2000, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "heb-001", "text", Some("שלום עולם"), 1000, false, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "heb-002", "text", Some("להתראות"), 2000, false, "pending").await.unwrap();
 
         let results = store.search_inbound(None, Some("שלום"), 10, None).await.unwrap();
         assert_eq!(results.len(), 1, "FTS must find Hebrew token 'שלום'");
@@ -5525,8 +5584,8 @@ mod tests {
         let (store, dir) = open_search_store("arabic");
 
         // Arabic: "مرحبا" = hello/welcome
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "ara-001", "text", Some("مرحبا بالعالم"), 1000, "pending").await.unwrap();
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "ara-002", "text", Some("وداعا"), 2000, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "ara-001", "text", Some("مرحبا بالعالم"), 1000, false, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "ara-002", "text", Some("وداعا"), 2000, false, "pending").await.unwrap();
 
         let results = store.search_inbound(None, Some("مرحبا"), 10, None).await.unwrap();
         assert_eq!(results.len(), 1, "FTS must find Arabic token 'مرحبا'");
@@ -5540,7 +5599,7 @@ mod tests {
     async fn test_fts_search_adversarial_double_quote() {
         let (store, dir) = open_search_store("adv-quote");
 
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "adv-001", "text", Some("normal message"), 1000, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "adv-001", "text", Some("normal message"), 1000, false, "pending").await.unwrap();
 
         // A raw " must not cause a parse error (escaped as "" inside the phrase wrapper)
         let result = store.search_inbound(None, Some("\""), 10, None).await;
@@ -5556,10 +5615,10 @@ mod tests {
     async fn test_fts_search_adversarial_operators_are_literal() {
         let (store, dir) = open_search_store("adv-ops");
 
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-001", "text", Some("foo bar"), 1000, "pending").await.unwrap();
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-002", "text", Some("baz qux"), 2000, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-001", "text", Some("foo bar"), 1000, false, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-002", "text", Some("baz qux"), 2000, false, "pending").await.unwrap();
         // Extra message whose body contains the literal word "and" — for the AND test below.
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-003", "text", Some("cats and dogs"), 3000, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "op-003", "text", Some("cats and dogs"), 3000, false, "pending").await.unwrap();
 
         // "foo OR bar" must NOT match as FTS5 boolean — it should be a literal phrase.
         // No message contains the exact phrase "foo OR bar", so 0 hits expected.
@@ -5591,7 +5650,7 @@ mod tests {
     async fn test_fts_search_whitespace_and_quote_only_inputs() {
         let (store, dir) = open_search_store("adv-empty");
 
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "e-001", "text", Some("something"), 1000, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "e-001", "text", Some("something"), 1000, false, "pending").await.unwrap();
 
         // Whitespace-only
         let r1 = store.search_inbound(None, Some("   "), 10, None).await;
@@ -5609,8 +5668,8 @@ mod tests {
     async fn test_fts_search_chat_jid_scoping() {
         let (store, dir) = open_search_store("scoping");
 
-        store.insert_inbound("chatA@s.whatsapp.net", "s@s.whatsapp.net", "scope-001", "text", Some("apple pie"), 1000, "pending").await.unwrap();
-        store.insert_inbound("chatB@g.us",            "s@s.whatsapp.net", "scope-002", "text", Some("apple cider"), 2000, "pending").await.unwrap();
+        store.insert_inbound("chatA@s.whatsapp.net", "s@s.whatsapp.net", "scope-001", "text", Some("apple pie"), 1000, false, "pending").await.unwrap();
+        store.insert_inbound("chatB@g.us",            "s@s.whatsapp.net", "scope-002", "text", Some("apple cider"), 2000, false, "pending").await.unwrap();
 
         // Scoped to chatA — must only return chatA's message
         let r_a = store.search_inbound(Some("chatA@s.whatsapp.net"), Some("apple"), 10, None).await.unwrap();
@@ -5636,9 +5695,9 @@ mod tests {
     async fn test_search_inbound_none_query_is_chronological_desc() {
         let (store, dir) = open_search_store("history-browse");
 
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-001", "text", Some("first"), 100, "pending").await.unwrap();
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-002", "text", Some("second"), 200, "pending").await.unwrap();
-        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-003", "text", Some("third"), 300, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-001", "text", Some("first"), 100, false, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-002", "text", Some("second"), 200, false, "pending").await.unwrap();
+        store.insert_inbound("chat@s.whatsapp.net", "s@s.whatsapp.net", "h-003", "text", Some("third"), 300, false, "pending").await.unwrap();
 
         // query=None → chronological browse
         let results = store.search_inbound(None, None, 10, None).await.unwrap();
@@ -5709,14 +5768,14 @@ mod tests {
         // Timestamp 1000 → OLDER insertion order (would rank 2nd if ordering by ts-DESC or rowid).
         store.insert_inbound(
             "chat@s.whatsapp.net", "s@s.whatsapp.net",
-            "multi-occ", "text", Some("apple apple apple"), 1000, "pending",
+            "multi-occ", "text", Some("apple apple apple"), 1000, false, "pending",
         ).await.unwrap();
 
         // "single-occ": 1 occurrence of "apple" — lower BM25 score → less relevant.
         // Timestamp 2000 → NEWER insertion order (would rank 1st if ordering by ts-DESC or rowid).
         store.insert_inbound(
             "chat@s.whatsapp.net", "s@s.whatsapp.net",
-            "single-occ", "text", Some("apple pie"), 2000, "pending",
+            "single-occ", "text", Some("apple pie"), 2000, false, "pending",
         ).await.unwrap();
 
         let results = store.search_inbound(None, Some("apple"), 10, None).await.unwrap();
@@ -5744,11 +5803,11 @@ mod tests {
         // Two messages matching the same term, with different timestamps.
         store.insert_inbound(
             "chat@s.whatsapp.net", "s@s.whatsapp.net",
-            "ts-old", "text", Some("mango smoothie"), 1000, "pending",
+            "ts-old", "text", Some("mango smoothie"), 1000, false, "pending",
         ).await.unwrap();
         store.insert_inbound(
             "chat@s.whatsapp.net", "s@s.whatsapp.net",
-            "ts-new", "text", Some("mango shake"), 5000, "pending",
+            "ts-new", "text", Some("mango shake"), 5000, false, "pending",
         ).await.unwrap();
 
         // Cutoff at 3000: only ts-old (ts=1000) must be returned; ts-new (ts=5000) must be excluded.
@@ -5809,6 +5868,63 @@ mod tests {
         store.set_metadata("test_key_absent", "world").await.unwrap();
         let val = store.get_metadata("test_key_absent").await.unwrap();
         assert_eq!(val.as_deref(), Some("world"), "second set must overwrite");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // own_phone_jid — the account's own phone JID from the `device` row
+    // -------------------------------------------------------------------------
+
+    fn set_device_pn(store: &Store, pn: &str) {
+        store
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO device (id, pn) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET pn = excluded.pn",
+                [pn],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_phone_jid_without_device_strips_the_device_part_only() {
+        assert_eq!(
+            phone_jid_without_device("15551234567@s.whatsapp.net").as_deref(),
+            Some("15551234567@s.whatsapp.net"),
+        );
+        assert_eq!(
+            phone_jid_without_device("15551234567:75@s.whatsapp.net").as_deref(),
+            Some("15551234567@s.whatsapp.net"),
+            "the `:<device>` part Jid::to_string() writes is removed",
+        );
+        assert_eq!(phone_jid_without_device(""), None, "an unpaired device has an empty pn");
+        assert_eq!(phone_jid_without_device("15551234567"), None, "no server part");
+        assert_eq!(phone_jid_without_device("@s.whatsapp.net"), None, "no number");
+        assert_eq!(phone_jid_without_device(":75@s.whatsapp.net"), None, "no number before the device");
+        assert_eq!(phone_jid_without_device("100000000000001:75@lid"), None, "not a phone JID");
+    }
+
+    #[tokio::test]
+    async fn test_own_phone_jid_reads_the_device_row() {
+        let dir = unique_test_dir("own-phone-jid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::new(&dir.join("whatsapp.db")).unwrap();
+
+        assert_eq!(store.own_phone_jid().await.unwrap(), None, "a fresh DB has no device row");
+
+        set_device_pn(&store, "");
+        assert_eq!(store.own_phone_jid().await.unwrap(), None, "an empty pn is unpaired");
+
+        set_device_pn(&store, "15551234567:75@s.whatsapp.net");
+        assert_eq!(
+            store.own_phone_jid().await.unwrap().as_deref(),
+            Some("15551234567@s.whatsapp.net"),
+            "the device part of the stored pn is removed",
+        );
+
+        set_device_pn(&store, "15551234567@s.whatsapp.net");
+        assert_eq!(store.own_phone_jid().await.unwrap().as_deref(), Some("15551234567@s.whatsapp.net"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1341,7 +1341,7 @@ async fn test_rest_wire_golden_stateful_corpus() {
     // The fetch cases need a stored message in 1@g.us to start from (else 409 no_anchor).
     bridge
         .store()
-        .insert_inbound("1@g.us", "2@s.whatsapp.net", "ANCHOR1", "text", Some("hi"), 1_700_000_000, "pending")
+        .insert_inbound("1@g.us", "2@s.whatsapp.net", "ANCHOR1", "text", Some("hi"), 1_700_000_000, false, "pending")
         .await
         .unwrap();
     assert_golden(run_cases(&bridge, stateful_corpus()).await);
