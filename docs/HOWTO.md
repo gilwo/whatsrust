@@ -638,6 +638,10 @@ message. It is compiled only with the Cargo feature `media-probe`, never in a re
    - Each message tries up to three addresses: `stored`, `alt` (the phone-number↔LID alternate) and `web`
      (sent to your own LID).
    - The probe sends one request per 30 s and at most 20 per daemon run.
+   - `media-probe --web <message-id> …` sends only the `web` request, which is the one that works on accounts with a
+     LID (one request per file instead of up to three). For your own group messages it names your own LID as the
+     participant. When the phone's answer cannot be decrypted, the `bad_answer` line also shows what the answer
+     names (masked).
 6. Read the `B re-upload` and `RESULT` lines. Stop with `quit` or Ctrl+C.
    - Each run first prints `own account: …1234@s.whatsapp.net / …5678@lid` (masked): the linked account's phone
      number and LID. To see only that line, type `media-probe x` (`x` is not a message ID, so nothing is sent). A

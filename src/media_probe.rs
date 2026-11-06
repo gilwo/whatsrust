@@ -85,7 +85,16 @@ pub async fn run(client: Option<Arc<Client>>, store: &Store, live: &[(String, Me
             Ok(n) if (1..=LIST_MAX).contains(&n) => list(store, live, n).await,
             _ => println!("usage: media-probe list [1-{LIST_MAX}]"),
         },
-        ids => {
+        args => {
+            // `--web` sends only the request that works on LID accounts (one per file).
+            let (web_only, ids) = match args.split_first() {
+                Some((&"--web", rest)) => (true, rest),
+                _ => (false, args),
+            };
+            if ids.is_empty() {
+                println!("usage: media-probe [--web] <id> [<id> ...]");
+                return;
+            }
             if let Some(jid) = ids.iter().find(|a| a.contains('@')) {
                 println!("!! {jid} is a chat JID; media-probe takes message ids (see `media-probe list`)");
                 return;
@@ -108,7 +117,7 @@ pub async fn run(client: Option<Arc<Client>>, store: &Store, live: &[(String, Me
                 }
             };
             for (i, id) in ids.iter().enumerate() {
-                probe_one(&client, store, live, &dir, id, i + 1, ids.len()).await;
+                probe_one(&client, store, live, &dir, id, i + 1, ids.len(), web_only).await;
             }
             println!("files: {} (delete it when done: rm -r '{}')", dir.display(), dir.display());
         }
@@ -122,6 +131,7 @@ fn print_usage() {
     println!("                              B ask your phone to re-upload it (stored JIDs, then the PN<->LID");
     println!("                              alternate if that fails), C download from the new path.");
     println!("                              One re-upload request per 30 s, at most {MAX_REUPLOADS_PER_RUN} per daemon run.");
+    println!("media-probe --web <id> ...  — the same, but B sends only the `web` request (to the own LID).");
     println!("Live media (sent or received since the daemon started) has no stored reference; the probe");
     println!("takes it from the in-memory message cache (the last 256 messages, lost on restart).");
 }
@@ -157,7 +167,17 @@ async fn list(store: &Store, live: &[(String, MediaRefRow)], per_class: i64) {
     }
 }
 
-async fn probe_one(client: &Client, store: &Store, live: &[(String, MediaRefRow)], dir: &Path, id: &str, n: usize, total: usize) {
+#[allow(clippy::too_many_arguments)]
+async fn probe_one(
+    client: &Client,
+    store: &Store,
+    live: &[(String, MediaRefRow)],
+    dir: &Path,
+    id: &str,
+    n: usize,
+    total: usize,
+    web_only: bool,
+) {
     let mut row = match store.probe_media_row(id).await {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -215,7 +235,8 @@ async fn probe_one(client: &Client, store: &Store, live: &[(String, MediaRefRow)
     let mut b_codes = Vec::new();
     let mut new_path = None;
     let own_lid = client.get_lid().map(|j| j.to_non_ad());
-    for addressing in addressing_variants(&row, store, own_lid.is_some()).await {
+    let variants = addressing_variants(&row, store, own_lid.as_ref()).await;
+    for addressing in variants.into_iter().filter(|a| !web_only || a.via == Via::Web) {
         println!("  B re-upload [{}]", describe_addressing(&addressing));
         match reupload(client, &row, key, &addressing, own_lid.as_ref()).await {
             Reupload::Success(p) => {
@@ -385,7 +406,10 @@ async fn request_via_web(
     match tokio::time::timeout(NOTIFICATION_TIMEOUT.saturating_sub(started.elapsed()), notification).await {
         Ok(Ok(node)) => match parse_media_retry_notification(node.get(), media_key) {
             Ok(result) => retry_result(result, started.elapsed()),
-            Err(e) => Reupload::Failed { code: "bad_answer", detail: truncate(&format!("{e:#}")) },
+            Err(e) => Reupload::Failed {
+                code: "bad_answer",
+                detail: format!("{} | {}", truncate(&format!("{e:#}")), describe_notification(node.get())),
+            },
         },
         Ok(Err(_)) => Reupload::Failed { code: "error", detail: "the notification waiter was cancelled".to_string() },
         Err(_) => Reupload::Failed {
@@ -415,9 +439,29 @@ fn retry_result(result: MediaRetryResult, elapsed: Duration) -> Reupload {
     }
 }
 
+/// What the phone's undecryptable answer says about itself: who sent it, its children, and the
+/// chat and participant it names (masked). Used to diagnose a `bad_answer`.
+fn describe_notification(node: &wacore_binary::NodeRef<'_>) -> String {
+    let attr = |n: &wacore_binary::NodeRef<'_>, key: &str| n.get_attr(key).map(|v| mask_jid(&v.as_str()));
+    let children: Vec<String> =
+        node.children().map(|c| c.iter().map(|n| format!("{:?}", n.tag)).collect()).unwrap_or_default();
+    let rmr = node.get_optional_child_by_tag(&["rmr"]).map_or_else(String::new, |r| {
+        format!(
+            ", rmr jid {} participant {}",
+            attr(r, "jid").unwrap_or_else(|| "-".into()),
+            attr(r, "participant").unwrap_or_else(|| "-".into())
+        )
+    });
+    format!(
+        "answer from {}, children [{}]{rmr}",
+        attr(node, "from").unwrap_or_else(|| "?".into()),
+        children.join(", ")
+    )
+}
+
 /// The addressing variants to try for `row`: looks up the PN<->LID alternates, then
-/// [`variants_from`].
-async fn addressing_variants(row: &ProbeMediaRow, store: &Store, own_lid_known: bool) -> Vec<Addressing> {
+/// [`variants_from`]. `own_lid` is the account's LID without the device part.
+async fn addressing_variants(row: &ProbeMediaRow, store: &Store, own_lid: Option<&Jid>) -> Vec<Addressing> {
     let is_group = row.chat_jid.ends_with("@g.us");
     let participant = is_group.then(|| full_user_jid(&row.sender_jid));
     let alt_chat = if is_group { None } else { resolve_alternate_chat_jid(&row.chat_jid, store).await };
@@ -425,18 +469,23 @@ async fn addressing_variants(row: &ProbeMediaRow, store: &Store, own_lid_known: 
         Some(p) => resolve_alternate_chat_jid(p, store).await,
         None => None,
     };
-    variants_from(&row.chat_jid, participant, alt_chat, alt_participant, own_lid_known)
+    // History stores the group JID as the sender of the account's own group messages (the key has
+    // no participant), so the `web` request names the account's own LID instead, as upstream does.
+    let own_participant = if is_group && row.from_me { own_lid.map(ToString::to_string) } else { None };
+    variants_from(&row.chat_jid, participant, alt_chat, alt_participant, own_lid.is_some(), own_participant)
 }
 
 /// The addressing variants, in order: `stored` (the stored JIDs); `alt` (the PN<->LID alternate
 /// of the chat or the sender, when one is known and differs); `web` (the LID forms, sent to the
-/// account's own LID; only when the account has a LID).
+/// account's own LID; only when the account has a LID). `own_participant` replaces the `web`
+/// participant for the account's own group messages.
 fn variants_from(
     chat: &str,
     participant: Option<String>,
     alt_chat: Option<String>,
     alt_participant: Option<String>,
     own_lid_known: bool,
+    own_participant: Option<String>,
 ) -> Vec<Addressing> {
     let stored = Addressing { label: "stored", via: Via::WaRs, chat: chat.to_string(), participant };
     let alt = Addressing {
@@ -450,8 +499,9 @@ fn variants_from(
         label: "web",
         via: Via::Web,
         chat: lid_form(&stored.chat, &alt.chat),
-        participant: match (stored.participant.as_deref(), alt.participant.as_deref()) {
-            (Some(s), Some(a)) => Some(lid_form(s, a)),
+        participant: match (own_participant, stored.participant.as_deref(), alt.participant.as_deref()) {
+            (Some(own), Some(_), _) => Some(own),
+            (_, Some(s), Some(a)) => Some(lid_form(s, a)),
             _ => None,
         },
     };
@@ -704,7 +754,7 @@ mod tests {
 
     #[test]
     fn variants_end_with_the_web_form_when_the_account_has_a_lid() {
-        let group = variants_from("g@g.us", Some("111@s.whatsapp.net".into()), None, Some("999@lid".into()), true);
+        let group = variants_from("g@g.us", Some("111@s.whatsapp.net".into()), None, Some("999@lid".into()), true, None);
         let got: Vec<(&str, Via, &str, Option<&str>)> =
             group.iter().map(|a| (a.label, a.via, a.chat.as_str(), a.participant.as_deref())).collect();
         assert_eq!(
@@ -716,12 +766,21 @@ mod tests {
             ]
         );
 
-        let dm = variants_from("111@s.whatsapp.net", None, Some("999@lid".into()), None, true);
+        let dm = variants_from("111@s.whatsapp.net", None, Some("999@lid".into()), None, true, None);
         assert_eq!(dm.last().map(|a| (a.label, a.chat.as_str(), a.participant.clone())), Some(("web", "999@lid", None)));
 
-        let unmapped = variants_from("111@s.whatsapp.net", None, None, None, true);
+        let unmapped = variants_from("111@s.whatsapp.net", None, None, None, true, None);
         assert_eq!(unmapped.iter().map(|a| a.label).collect::<Vec<_>>(), vec!["stored", "web"], "web keeps the PN chat");
-        assert_eq!(variants_from("111@s.whatsapp.net", None, None, None, false).len(), 1, "no own LID: no web");
+        assert_eq!(variants_from("111@s.whatsapp.net", None, None, None, false, None).len(), 1, "no own LID: no web");
+    }
+
+    #[test]
+    fn an_own_group_message_names_the_own_lid_as_participant() {
+        // History stores the group JID as the sender of an own group message.
+        let own = variants_from("g@g.us", Some("g@g.us".into()), None, None, true, Some("555@lid".into()));
+        let web = own.iter().find(|a| a.via == Via::Web).expect("a web variant");
+        assert_eq!((web.chat.as_str(), web.participant.as_deref()), ("g@g.us", Some("555@lid")));
+        assert_eq!(own[0].participant.as_deref(), Some("g@g.us"), "the stored variant is unchanged");
     }
 
     #[test]

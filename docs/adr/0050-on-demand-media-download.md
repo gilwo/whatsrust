@@ -1,7 +1,7 @@
 # 0050. On-demand media download: chat folders, background fetch, a media file listener
 
-**Status:** Proposed (v5, 2026-11-04: the v4 follow-up cold review and a ureq timeout spike folded in; next: the
-old-file test matrix, then the build)
+**Status:** Proposed (v5, 2026-11-04: the v4 follow-up cold review and a ureq timeout spike folded in; the old-file
+test matrix passed 2026-11-05, GO 2026-11-06; next: phase 2)
 **Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4), 2026-11-04 (v5)
 
 ## Context
@@ -142,6 +142,42 @@ account's own group photo. The chat and the participant were in LID form, as Wha
 **Consequence for decision 4:** at this pin the re-upload lane builds and sends the request itself, behind the
 one wa-rs adapter. The wa-rs upgrade (roadmap Q-WARS) can replace it with the library call. Old, expired history
 files are not tested yet (design §11). Folded into v3 (the probe: HOWTO §3 "Media re-upload probe").
+
+**2026-11-05: the old-file test matrix (gate for phase 2).** Run with the dev probe on the owner's second account,
+which has a LID. All requests below are the `web` form (to the own LID); the pin's request to the phone number timed
+out 6 of 6 again.
+
+| Cell | Age | Stored link | Re-upload | New link |
+|---|---|---|---|---|
+| Control: 1:1, fresh, chat as phone JID | 4 d | 200 | success | 200, same SHA-256 |
+| 1:1, chat as phone JID (no mapping) | 1764 d | 403 | success | 200 |
+| 1:1, chat as phone JID (no mapping) | 1761 d | 403 | success | 200 |
+| Group video, participant as phone JID (no mapping) | 1466 d | 403 | success | 200 |
+| Group, own message, participant = the group JID (history stores it as the sender) | 1219 d | 403 | no ACK, timeout | – |
+| `@lid` chat, fresh | 2 d | 200 | the answer did not decrypt with the media key | – |
+
+Findings: expired links answer 403; the phone still holds files 4.8 years old; the stored phone-JID form works when
+`to` is the own LID, so `address_unresolved` is needed only when no form exists. **Decision: GO for phase 2** (owner,
+2026-11-06). Follow-ups for a short retest (design §11.1): own group messages with the own LID as the participant,
+and 2–3 more `@lid` rows.
+
+**2026-11-06: the retest** (same account, `media-probe --web`, only the `web` request):
+
+| Cell | Age | Stored link | Re-upload | New link |
+|---|---|---|---|---|
+| Group, own message, participant = own LID (the cell that failed) | 1220 d | 403 | success | 200 |
+| Group, own message (PDF), participant = own LID | 1606 d | 403 | success | 200 |
+| Group, own message (PDF), participant = own LID | 781 d | 403 | success | 200 |
+| `@lid` chat A, fresh (the cell that failed) | 2 d | 200 | the answer (from the own account, naming chat A) did not decrypt | – |
+| `@lid` chat A, fresh | 2 d | 200 | success | MAC mismatch |
+| `@lid` chat B | 80 d | 403 | success | 200 |
+| `@lid` chat B, own message | 80 d | 403 | success | 200 |
+
+Findings: the own-LID participant for own group messages works (3 of 3). `@lid` chats work (2 of 2 old). The two
+failures are fresh messages of one chat, where the phone handled the media with another key than the one stored
+from history; their links are still valid, and the engine re-uploads only after a 403, so it does not block the
+build (an open item; a MAC mismatch after a re-upload ends as `integrity`). Across both runs, 13 of 15 `web` requests
+succeeded, for files up to 4.8 years old.
 
 ## Alternatives considered
 
