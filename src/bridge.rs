@@ -4021,6 +4021,38 @@ fn extract_context_meta(msg: &wa::Message) -> ContextMeta {
 /// Maximum recursion depth for unwrapping ephemeral/view-once wrappers.
 const MAX_EXTRACT_DEPTH: u8 = 3;
 
+/// Whether `path` is safe to append to a media host in a download URL.
+///
+/// wa-rs builds the live-ingest download URL as `https://{host}{direct_path}?auth=...&token=...`
+/// from the sender's `direct_path`, with no check (wacore `download.rs`, pinned rev). A path that
+/// does not start with `/` (`@other.example/x`), starts with `//`, or carries `@` or `\`
+/// (userinfo and authority confusion) or `#` (fragment) can send the request, with the media
+/// auth token, to another host.
+///
+/// Accepted: one leading `/`, then printable ASCII without spaces, none of `@`, `\`, `#`. A real
+/// WhatsApp path with its query string (`/v/t62.7117-24/...?ccb=11-4&oh=...&oe=...`) passes.
+pub(crate) fn direct_path_is_safe(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && path.chars().all(|c| c.is_ascii_graphic() && !matches!(c, '@' | '\\' | '#'))
+}
+
+/// Why wa-rs must not build a download request for `media`, if so. The reason is a fixed text:
+/// it never contains the sender's path or URL, so it is safe to log.
+///
+/// Refused: a `static_url` (wa-rs requests it as-is, a sender-chosen URL to any host; it is meant
+/// for newsletter media), and a `direct_path` that is missing (wa-rs would only fail, after a
+/// media-connection round trip) or not `direct_path_is_safe`.
+fn unsafe_media_location(media: &dyn Downloadable) -> Option<&'static str> {
+    if media.static_url().is_some() {
+        Some("it carries a sender-supplied URL")
+    } else if media.direct_path().is_some_and(direct_path_is_safe) {
+        None
+    } else {
+        Some("its direct path is missing or malformed")
+    }
+}
+
 /// What `extract_content_inner` does with a media message's bytes.
 enum MediaMode<'a> {
     /// Live ingest: download the bytes (one slot of `dl_semaphore` at a time, size-limited); the
@@ -4035,6 +4067,8 @@ enum MediaMode<'a> {
 enum MediaSkip {
     /// Over `MAX_MEDIA_BYTES`: nothing to retry.
     TooLarge,
+    /// The media location is unsafe (`unsafe_media_location`): nothing to retry.
+    Refused,
     /// The download failed: may succeed on a redelivery.
     DownloadFailed,
 }
@@ -4042,7 +4076,7 @@ enum MediaSkip {
 impl From<MediaSkip> for ExtractResult {
     fn from(skip: MediaSkip) -> Self {
         match skip {
-            MediaSkip::TooLarge => ExtractResult::Unhandled,
+            MediaSkip::TooLarge | MediaSkip::Refused => ExtractResult::Unhandled,
             MediaSkip::DownloadFailed => ExtractResult::TransientFailure,
         }
     }
@@ -4066,9 +4100,10 @@ impl MediaMode<'_> {
     /// `width` and `height` are what the content will carry (kept in the reference).
     ///
     /// `Download`: refuse a file over `MAX_MEDIA_BYTES` (by its `file_length`, before downloading,
-    /// and by its size after), then download it. `Reference`: record the reference and return no
-    /// bytes. There is no size limit, because nothing is downloaded: the row only describes the
-    /// file.
+    /// and by its size after), refuse a media location that could send the request to another
+    /// host (`unsafe_media_location`; skipped as `Refused`, not retried, one WARN without the
+    /// value), then download it. `Reference`: record the reference and return no bytes. There is no size
+    /// limit, because nothing is downloaded: the row only describes the file.
     async fn bytes(
         &mut self,
         what: &str,
@@ -4084,6 +4119,10 @@ impl MediaMode<'_> {
                         warn!(size = len, "{what} exceeds size limit, skipping");
                         return Err(MediaSkip::TooLarge);
                     }
+                }
+                if let Some(reason) = unsafe_media_location(media) {
+                    warn!("not downloading {what}: {reason}");
+                    return Err(MediaSkip::Refused);
                 }
                 let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
                 match client.download(media).await {
@@ -8328,5 +8367,104 @@ mod history_storage_tests {
     #[test]
     fn test_store_pairing_history_defaults_to_true() {
         assert!(BridgeConfig::default().store_pairing_history);
+    }
+}
+
+#[cfg(test)]
+mod media_location_tests {
+    use super::*;
+
+    #[test]
+    fn direct_path_is_safe_accepts_real_whatsapp_paths() {
+        assert!(direct_path_is_safe(
+            "/v/t62.7117-24/12345_67890?ccb=11-4&oh=01_Q5Aa&oe=6700ABCD&_nc_sid=5e03e0&mms3=true"
+        ));
+        assert!(direct_path_is_safe("/v/t62/abc?ccb=11"));
+        assert!(direct_path_is_safe("/o1/v/t24/f2/m232/AQM"));
+        assert!(direct_path_is_safe("/a"));
+    }
+
+    #[test]
+    fn direct_path_is_safe_rejects_authority_and_host_tricks() {
+        // Empty, or not a path at all.
+        assert!(!direct_path_is_safe(""));
+        assert!(!direct_path_is_safe("v/t62/abc"));
+        assert!(!direct_path_is_safe("https://other.example/x"));
+        // `https://{host}@other.example/x`: the CDN host becomes userinfo.
+        assert!(!direct_path_is_safe("@other.example/x"));
+        // A second leading slash.
+        assert!(!direct_path_is_safe("//other.example/x"));
+        assert!(!direct_path_is_safe("//"));
+        // The three banned characters anywhere in the path.
+        assert!(!direct_path_is_safe("/x@other.example"));
+        assert!(!direct_path_is_safe("/x\\other.example"));
+        assert!(!direct_path_is_safe("/x#fragment"));
+    }
+
+    #[test]
+    fn direct_path_is_safe_rejects_whitespace_control_and_non_ascii() {
+        assert!(!direct_path_is_safe("/x y"));
+        assert!(!direct_path_is_safe("/x\ty"));
+        assert!(!direct_path_is_safe("/x\r\ny"));
+        assert!(!direct_path_is_safe("/x\0"));
+        assert!(!direct_path_is_safe("/caf\u{e9}"));
+        assert!(!direct_path_is_safe("/\u{5e9}"));
+    }
+
+    fn image(direct_path: Option<&str>, static_url: Option<&str>) -> wa::message::ImageMessage {
+        wa::message::ImageMessage {
+            direct_path: direct_path.map(str::to_owned),
+            static_url: static_url.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unsafe_media_location_allows_a_safe_direct_path() {
+        assert_eq!(unsafe_media_location(&image(Some("/v/t62/abc?ccb=11"), None)), None);
+        let doc = wa::message::DocumentMessage { direct_path: Some("/v/t62/doc".to_owned()), ..Default::default() };
+        assert_eq!(unsafe_media_location(&doc), None);
+    }
+
+    #[test]
+    fn unsafe_media_location_refuses_a_missing_or_malformed_direct_path() {
+        assert!(unsafe_media_location(&image(None, None)).is_some());
+        assert!(unsafe_media_location(&image(Some(""), None)).is_some());
+        assert!(unsafe_media_location(&image(Some("//other.example/x"), None)).is_some());
+        assert!(unsafe_media_location(&image(Some("@other.example/x"), None)).is_some());
+        let audio = wa::message::AudioMessage { direct_path: Some("/x#y".to_owned()), ..Default::default() };
+        assert!(unsafe_media_location(&audio).is_some());
+    }
+
+    #[test]
+    fn unsafe_media_location_refuses_a_sender_supplied_url_even_with_a_safe_path() {
+        // wa-rs requests a `static_url` as-is and ignores the direct path then.
+        let image = image(Some("/v/t62/abc"), Some("http://169.254.169.254/latest/meta-data"));
+        assert!(unsafe_media_location(&image).is_some());
+        let video = wa::message::VideoMessage {
+            direct_path: Some("/v/t62/vid".to_owned()),
+            static_url: Some("https://other.example/x".to_owned()),
+            ..Default::default()
+        };
+        assert!(unsafe_media_location(&video).is_some());
+    }
+
+    #[test]
+    fn media_skip_maps_to_the_dedup_outcome() {
+        // A refused location can never succeed on a redelivery: dedup it, like an over-size file.
+        assert!(matches!(ExtractResult::from(MediaSkip::Refused), ExtractResult::Unhandled));
+        assert!(matches!(ExtractResult::from(MediaSkip::TooLarge), ExtractResult::Unhandled));
+        // A failed download may succeed later: not deduped.
+        assert!(matches!(ExtractResult::from(MediaSkip::DownloadFailed), ExtractResult::TransientFailure));
+    }
+
+    #[test]
+    fn unsafe_media_location_reason_never_quotes_the_sender_value() {
+        let hostile = "//other.example/secret-path";
+        let with_url = unsafe_media_location(&image(Some(hostile), Some("https://other.example/url"))).unwrap();
+        let without_url = unsafe_media_location(&image(Some(hostile), None)).unwrap();
+        for reason in [with_url, without_url] {
+            assert!(!reason.contains("other.example") && !reason.contains("secret-path"), "{reason}");
+        }
     }
 }
