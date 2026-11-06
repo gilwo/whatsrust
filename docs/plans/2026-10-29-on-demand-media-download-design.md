@@ -1,6 +1,7 @@
 # On-demand media download — design and plan
 
-**Status:** v5 (2026-11-04): the v4 follow-up cold review and a ureq timeout spike folded in, with the owner's
+**Status:** v5.1 (2026-11-06): the own-message attribution fix and its row repair folded into phase 2 (owner,
+2026-11-06). v5 (2026-11-04): the v4 follow-up cold review and a ureq timeout spike folded in, with the owner's
 decisions of 2026-11-04 (§9). The old-file test matrix passed (2026-11-05, GO 2026-11-06). Next: phase 2, and a
 short retest of two cells (§11.1), done 2026-11-06. History: v1 2026-10-29 (cold
 review: needs rework); v2 2026-10-30 (approve with changes, 2 blocking); v3 2026-11-01 (approve with changes,
@@ -22,6 +23,13 @@ This document describes what is built and how. The owner's decisions are in §9;
 > upstream `main`). At this pin whatsrust runs the media HTTP transfer and builds the re-upload request itself, from
 > wa-rs's public parts (§6.2). Items marked **[wa-rs]** are where the upgrade changes this design; they sit behind
 > two adapters, `MediaTransfer` and `MediaReuploader`.
+
+### Changes in v5.1
+
+| Change | Why |
+|---|---|
+| Phase 2 starts with the own-message attribution fix: live rows store the event's `from_me`; a history message with `from_me` and no participant stores the account's own phone JID as the sender (§2, §4, §13) | the duplicate rule and the revoke rule compare the sender and `from_me`; history stored the key's `remote_jid` as the sender of own messages (the group in groups, the other person in 1:1 chats), so the owner's own revokes from history never counted |
+| The v9 migration repairs the stored rows before the one-time revoke pass (§4, §5.5); owner-authorised 2026-11-06 | the old rows carry the same wrong values; a separate repair on `main` would need its own step or take the schema number 9 |
 
 ### Changes in v5
 
@@ -95,7 +103,7 @@ short-lived URL and fetches the file over the network.
 |---|---|
 | `media_refs(message_id PK, media_key, direct_path, file_enc_sha256, mimetype, file_length, width, height, hydrated_path)` (schema v8); written for media messages stored from history, only when the message row is new, by a second statement after the message insert (a failure is only counted); `hydrated_path` is NULL | `src/storage.rs`; `src/bridge.rs` `persist_history_messages` |
 | Messages stored before the 2026-10-22 amendment, and every live media message, have no `media_refs` row; `messages.source` is `live`, `bootstrap` or `backfill` | `src/bridge.rs` (`MediaMode::Download` writes no ref); `src/storage.rs` |
-| History rows store the chat under its phone JID even when the key used a LID, a full sender JID (`…@s.whatsapp.net`, or `…@lid` when unmapped) and the key's `from_me`; the raw `remote_jid` and `participant` are not kept. Live rows store a bare sender number and always `from_me = 0` (a bug, roadmap) | `src/bridge.rs` `persist_history_messages`, `resolve_sender`; `src/storage.rs` `insert_inbound` |
+| History rows store the chat under its phone JID even when the key used a LID, a full sender JID (`…@s.whatsapp.net`, or `…@lid` when unmapped) and the key's `from_me`; the raw `remote_jid` and `participant` are not kept. A key without a participant uses its `remote_jid` as the sender, so own history messages name the group (groups) or the other person (1:1 chats) as the sender (a bug, fixed in phase 2). Live rows store a bare sender number (the user part; an unmapped LID keeps its LID user part) and always `from_me = 0` (a bug, fixed in phase 2) | `src/bridge.rs` `persist_history_messages`, `resolve_sender`; `src/storage.rs` `insert_inbound` |
 | Backfill pages strictly backward from the oldest stored message, so it does not revisit stored rows; a re-pair (pairing package) or a retried page can | `src/backfill.rs` (~77–91) |
 | A document's original file name exists only inside the display label `[doc: NAME SIZE] caption` in `messages.body_text` | `src/bridge.rs` `MediaMode` |
 | History extraction unwraps view-once wrappers into a normal media message; the view-once flag is set only on live events and is not stored | `src/bridge.rs` `unwrap_to_inner` (~3957), live flag (~3316) |
@@ -178,6 +186,21 @@ validation, circuit breaker; ADR 0028–0032; the schema version goes from 8 to 
 - Because backfill does not revisit stored rows (§2), old history rows without a reference are repaired by a
   re-pair that keeps history, or by `clear-data` followed by a new fetch (HOWTO).
 - No column for the transient states: `ready` is derived from `hydrated_path` (§6.1).
+- **Own-message attribution** (the first commit of phase 2; owner, 2026-11-06). The duplicate rule above and the
+  revoke rule (§5.5) compare the sender and `from_me`, so both values must be right first:
+  - live ingest stores the event's own `is_from_me` (today `insert_inbound` always writes 0);
+  - history ingest: a message with `from_me` and no participant stores the account's own phone JID
+    (`<number>@s.whatsapp.net`, device part removed) as the sender, not the key's `remote_jid`. Without a known
+    own number (no paired device row), the current fallback stays.
+- **The v9 migration repairs the stored rows** (owner-authorised 2026-11-06), in the migration step, after the
+  pre-migration backup and **before the one-time revoke pass** (§5.5):
+  - live rows with `from_me = 0` whose sender is the owner's phone number or LID user part (with or without a
+    `:<device>` suffix) get `from_me = 1`;
+  - history rows (`bootstrap`, `backfill`) with `from_me = 1` whose sender is the chat JID (the old fallback) get
+    the own phone JID as the sender; an own row that names a participant keeps it, as new rows do;
+  - the own number and LID come from the `device` row in the same file. With no paired device row (empty `pn`)
+    the repair is skipped and logged, and the rest of the migration runs;
+  - the two counts are logged (no JIDs). The repair is part of the v9 step: only the manual revert undoes it.
 - **There is no supported way back after a healthy v8 → v9 migration.** A v8 binary refuses a v9 DB, and
   `--rollback` runs only after a failed migration (§2). The only revert is restoring the pre-migration backup by
   hand; it loses everything received since, including the Signal session state in the same file, so a re-pair may
@@ -304,7 +327,8 @@ file back when its message is valid again.
   - It is resolved **once, when the revoke row is stored** (live or history): its `media_refs.revoked_at` is set and
     its file is tagged. The schema migration also runs a **one-time pass** over the revoke rows already stored,
     joined to their targets by the exact label `[deleted <id>]` within the chat (the key fields are not stored
-    there, so only the revoker-is-author test applies).
+    there, so only the revoker-is-author test applies). It runs **after the attribution repair** (§4): before it,
+    an own revoke stored from history names the group or the other person as its sender and would never count.
   - A revoke that arrives before its target is not applied (accepted: history usually delivers a revoked message as
     an empty stub without media). `revoked_at` is never cleared automatically.
 - **A message missing from the DB is never treated as deleted**: `clear-data`, a fresh re-pair and a DB restore
@@ -672,7 +696,7 @@ A `media` snapshot (`{enabled: false}` when the feature is off):
 
 ---
 
-## 9. Owner decisions (2026-10-28 → 11-04)
+## 9. Owner decisions (2026-10-28 → 11-06)
 
 | Topic | Decision |
 |---|---|
@@ -715,6 +739,7 @@ A `media` snapshot (`{enabled: false}` when the feature is off):
 | Off | With the feature off, only the two lanes stop; the delete and revoke hooks, the journal replay, the `.part` cleanup and the counts always run (2026-11-04) |
 | Matrix threshold | Go when the mapped 1:1 or the mapped group addressing recovers files older than one week; a LID-less account falls back to the pin's phone-number request (2026-11-04) |
 | Number allowlist | `WHATSRUST_ALLOWED_NUMBERS` does not scope media downloads, as for the history tools (2026-11-04) |
+| Attribution | The own-message attribution fix is the first commit of phase 2, not its own branch; the v9 migration repairs the stored rows (live `from_me`, the own sender of history messages) before the one-time revoke pass (2026-11-06) |
 
 ---
 
@@ -777,8 +802,9 @@ No other new crate: the sanitiser uses the standard library (§5.3), and the qua
    still uses the pin's phone-number request (§6.2); no such account is available to test it.
 3. **The HTTPS check of the native limits:** the spike proved the idle limit over HTTP only. Phase 4's tests run
    both limits over HTTPS against a local TLS server (§14).
-4. **Related, outside this feature** (roadmap rows): live ingest downloads from the same unchecked `direct_path`
-   (`src/bridge.rs` ~4089); live rows store `from_me = 0` for own messages.
+4. **Related, outside this feature** (roadmap row "Live media security", its own branch from `main`): live ingest
+   downloads from the same unchecked `direct_path` (`src/bridge.rs` ~4089). The own-message attribution row is now
+   part of phase 2 (§4, owner 2026-11-06).
 5. **Resolved:** the wa-rs version and the uninstall media prompt (2026-10-30); the re-upload addressing for fresh
    messages (2026-11-01, §2); the transfer limits (2026-11-04 spike, §2).
 
@@ -818,7 +844,8 @@ No other new crate: the sanitiser uses the standard library (§5.3), and the qua
 | A download token bucket | one download worker already limits the rate; the phone is protected by the re-upload controls |
 | HMAC-signed stateless URLs | survive restarts, but add a secret to manage; the in-memory token table is small and a client calls `get` again |
 | A bounded wait inside `get` (`wait_ms`) | the 202-and-poll pattern fits the call budgets; a later option |
-| Storing live media references now | out of scope by owner decision; needs the live `from_me` fix first |
+| Storing live media references now | out of scope by owner decision; the live `from_me` fix it needs comes with phase 2 |
+| The attribution fix on its own branch from `main` | it changes the same history function as phase 2, and its row repair would need its own step or take the schema number 9 (owner, 2026-11-06) |
 
 ---
 
@@ -829,7 +856,7 @@ No other new crate: the sanitiser uses the standard library (§5.3), and the qua
 | 0 | Branch from `main`; the "after a merge" step | ✅ committed; 0 stale doc hashes |
 | 1 | **The live re-upload test** with the dev probe (`media-probe`, HOWTO §3) | ✅ 2026-11-01: addressing for fresh messages settled (own LID), recorded in FEATURES F1 and ADR 0050 |
 | 1b | **The old-file test matrix** (§11.1; owner, with the probe) | ✅ 2026-11-05: recorded in ADR 0050 and §2; **GO** (2026-11-06); retest of two cells done 2026-11-06 (§11.1) |
-| 2 | Schema v9 (6 columns; staged migration, tests per ADR 0028–0032); the message and its reference in one transaction; history ingest writes the new columns and the `view_once` flag; the duplicate rule (match, then fill, or create when not live); the revoke extraction (key `from_me`/`participant`), its resolution at ingest (`revoked_at`) and the one-time pass; the HOWTO manual-revert section. **Merged only after phase 1b** | migration tests (fresh DB, v8 → v9, the failed-migration path, the one-time revoke pass); the manual revert rehearsed on a copy; ingest, duplicate (match and mismatch) and revoke tests (own, valid, forged, before the target) |
+| 2 | First commit: the own-message attribution fix (live `from_me`, the own sender of history messages; §4). Then schema v9 (6 columns; staged migration, tests per ADR 0028–0032) with the row repair before the one-time revoke pass; the message and its reference in one transaction; history ingest writes the new columns and the `view_once` flag; the duplicate rule (match, then fill, or create when not live); the revoke extraction (key `from_me`/`participant`), its resolution at ingest (`revoked_at`) and the one-time pass; the HOWTO manual-revert section. **Merged only after phase 1b** | attribution tests (live own and received, history own in a group and a 1:1 chat, no own number); migration tests (fresh DB, v8 → v9, the failed-migration path, the repair with and without a paired device row, the one-time revoke pass after the repair, including an own revoke stored from history); the manual revert rehearsed on a copy; ingest, duplicate (match and mismatch) and revoke tests (own, valid, forged, before the target) |
 | 3 | Layout: pure functions for folders, file names (bounded IDs), sanitising (byte limits), the MIME allowlist, the name file; the `tag`/`untag` primitive; the macOS quarantine attribute | unit and property tests for every row of §5.2 and §5.4, Cc/Cf/bidi stripping, Hebrew, empty names, 64-byte cuts, long and hostile IDs, executable extensions → `bin`, the §5.5 transition table |
 | 4 | The engine: `MediaTransfer` (ureq's own idle and total limits) and `MediaReuploader` (own-LID request, the pin's request for a LID-less account) with fakes; the two lanes; the reserve; the re-upload window, breaker and memories (persisted per key); the states and the per-item backoff; cancel and cancel all; the delete hook (matched by chat) with the chunked intent journal; startup cleanup and the counts; adoption by ID and un-tag | fake-driven tests for every state and reason; the real agent against local HTTP **and HTTPS** servers (both limits); journal replay with concurrent events; the races "deleted while downloading" and "revoked while downloading"; queue full; disconnected and no-LID waits |
 | 5 | The media file listener (startup rules, the pipeline of §7.2, headers, streaming with the minimum rate, tokens with the fresh-token margin); REST `get`/`status`/`cancel`; the proxy recipe update | gate, pipeline and header tests; REST golden cases for every row of the §8.1 answer table (labelled); the proxy smoke playbook |
