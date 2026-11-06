@@ -14,6 +14,14 @@ Work on branch `feature/media-download`, not yet on `main`.
 ### Fixed
 - Own messages are attributed to the account: live rows now store the account's own messages with `from_me = 1` (they were always stored with 0), and own history messages without a key participant store the account's own phone JID as the sender instead of the group or the other person; rows stored earlier are repaired by the schema v9 migration (media download design v5.1 §4)
 
+## 2026-11-06 — Live media security
+
+Merged from `fix/live-media-security` (rebase-merge; main commit bd5f785).
+
+### Security
+- Live media ingest no longer downloads a media message whose `direct_path` could send the request, with the media auth token, to another host (anything but one leading `/` followed by printable ASCII without spaces, `@`, `\` or `#`), or that carries a sender-supplied `static_url` (wa-rs would fetch it as-is); the message is skipped like an over-size file (marked done, not retried), with one WARN that does not quote the value (bd5f785)
+- The media auth token no longer reaches the daemon's log under any `RUST_LOG`: the wa-rs download-failure warning (full URL with `auth=`), the DEBUG stanza dumps that include the media-connection reply, and the HTTP client's request-URI traces are always filtered; `RUST_LOG` directives with `[...]` or `{...}` (field or span filters) are ignored, because they would out-rank the filter (bd5f785)
+
 ## 2026-10-26 — Deployment as a service, doc hash remap
 
 Merged from `ops/supervisor` (rebase-merge; main commits 60596a5 and 829a62a).
@@ -24,10 +32,6 @@ Merged from `ops/supervisor` (rebase-merge; main commits 60596a5 and 829a62a).
 
 ### Fixed
 - Commit hashes cited in the docs that the 2026-10-23 rebase-merge left pointing at branch-only commits now point at the `main` commits (60596a5)
-
-### Security
-- Live media ingest no longer downloads a media message whose `direct_path` could send the request, with the media auth token, to another host (anything but one leading `/` followed by printable ASCII without spaces, `@`, `\` or `#`), or that carries a sender-supplied `static_url` (wa-rs would fetch it as-is); the message is skipped like an over-size file (marked done, not retried), with one WARN that does not quote the value
-- The media auth token no longer reaches the daemon's log under any `RUST_LOG`: the wa-rs download-failure warning (full URL with `auth=`), the DEBUG stanza dumps that include the media-connection reply, and the HTTP client's request-URI traces are always filtered; `RUST_LOG` directives with `[...]` or `{...}` (field or span filters) are ignored, because they would out-rank the filter
 
 ## 2026-10-23 — Fetch-history anchors and pairing history, MCP HTTP listener, run profiles, planning docs
 
