@@ -2876,7 +2876,7 @@ mod tests {
     /// Store one message so the chat has a usable anchor (timestamp 10_000 s = 10_000_000 ms).
     async fn seed_anchor_message(store: &Store, chat_jid: &str) {
         store
-            .insert_inbound(chat_jid, "sender@s.whatsapp.net", "seed-msg", "text", Some("seed"), 10_000, "pending")
+            .insert_inbound(chat_jid, "sender@s.whatsapp.net", "seed-msg", "text", Some("seed"), 10_000, false, "pending")
             .await
             .unwrap();
     }
@@ -2910,7 +2910,7 @@ mod tests {
         seed_anchor_message(&store, chat).await;
         // A newer message must not win over the oldest one.
         store
-            .insert_inbound(chat, "sender@s.whatsapp.net", "newer-msg", "text", Some("newer"), 20_000, "pending")
+            .insert_inbound(chat, "sender@s.whatsapp.net", "newer-msg", "text", Some("newer"), 20_000, false, "pending")
             .await
             .unwrap();
 

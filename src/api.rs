@@ -2761,7 +2761,7 @@ mod tests {
     async fn store_fetch_chat_message(bridge: &WhatsAppBridge, message_id: &str, ts_secs: i64) {
         bridge
             .store()
-            .insert_inbound(FETCH_CHAT, "5551234@s.whatsapp.net", message_id, "text", Some("hello"), ts_secs, "pending")
+            .insert_inbound(FETCH_CHAT, "5551234@s.whatsapp.net", message_id, "text", Some("hello"), ts_secs, false, "pending")
             .await
             .unwrap();
     }
