@@ -122,7 +122,7 @@ short-lived URL and fetches the file over the network.
 | Most history media is probably expired: CDN links live hours to days | ADR 0005 |
 | **Old-file test matrix (2026-11-05, the owner's second account, which has a LID):** expired links answer **`http status: 403`** (4 of 4; not 404/410). The `web` request recovered files up to **4.8 years old** (1:1 chats and a group video, 4 of 4), with the chat and the group participant sent in **phone-JID form** (no LID mapping existed), so the stored form works when `to` is the own LID. Failures: an own group message, because history stores the **group JID as the sender of own group messages** (the key has no participant), and the server did not ACK a request naming the group as participant; and one fresh `@lid` chat, where the phone answered within 1 s but its answer did not decrypt with the media key that had just downloaded the file | `runs/dev-live/whatsrust-probe.log`; ADR 0050 Notes |
 | **Retest (2026-11-06):** own group messages succeed with the own LID as the participant (3 of 3, up to 1606 d); `@lid` chats succeed (2 of 2 old, one an own message). Two fresh messages of one `@lid` chat failed: one answer did not decrypt, one re-uploaded file failed its MAC, so the phone used another media key than the one stored from history; their links were still valid. Across both runs, 13 of 15 `web` requests succeeded | ADR 0050 Notes |
-| wa-rs logs every failed CDN download at WARN with the **full URL, including the media-connection `auth=` token** (60 of 60 such lines in the probe log); the pin also appends `?auth=…` after a path that already has a query string (a double `?`), which the CDN accepts | `runs/dev-live/whatsrust-probe.log`; wa-rs `src/download.rs` (the "Trying next host" warning), `wacore/src/download.rs:291-293` |
+| wa-rs logs every failed CDN download at WARN with the **full URL, including the media-connection `auth=` token** (60 of 60 such lines in the probe log; filtered from the daemon log since bd5f785, which also covers the DEBUG/TRACE stanza and HTTP traces that print it); the pin also appends `?auth=…` after a path that already has a query string (a double `?`), which the CDN accepts | `runs/dev-live/whatsrust-probe.log`; wa-rs `src/download.rs` (the "Trying next host" warning), `wacore/src/download.rs:291-293` |
 | MCP tool budget 40 s; CLI client timeout 45 s; MCP turns an HTTP status ≥ 400 into `isError` | `src/mcp_http.rs` `TOOL_BUDGET`; `src/bridge.rs` `SYNC_CLIENT_TIMEOUT`; `src/mcp_registry.rs` (~477) |
 | The REST response type buffers the whole body (`ApiResponse.body: Vec<u8>`); only SSE streams, with a write timeout | `src/api.rs` |
 | Every REST route passes the Origin/Host/Content-Type gate, then the bearer-token check when a token is set; the gate blocks cross-site POSTs, not cross-site GETs. `CallContext.loopback_file_access` is the REST listener's bind (`cfg.is_loopback`), not the peer; the MCP HTTP runner sets false | `src/api.rs` `reject_from_head`, `CallContext` (~2126, ~2264); ADR 0044 |
@@ -802,8 +802,10 @@ No other new crate: the sanitiser uses the standard library (§5.3), and the qua
    still uses the pin's phone-number request (§6.2); no such account is available to test it.
 3. **The HTTPS check of the native limits:** the spike proved the idle limit over HTTP only. Phase 4's tests run
    both limits over HTTPS against a local TLS server (§14).
-4. **Related, outside this feature** (roadmap row "Live media security", its own branch from `main`): live ingest
-   downloads from the same unchecked `direct_path` (`src/bridge.rs` ~4089). The own-message attribution row is now
+4. **Related, resolved on `main` 2026-11-06 (bd5f785):** live ingest checks `direct_path` with
+   `direct_path_is_safe` (`src/bridge.rs`, the rule of §6.2 step 3; phase 4 reuses it) and refuses a
+   sender-supplied `static_url`, which wa-rs fetches as-is; the engine never stores one and checks every URL host
+   (§6.2 step 4). The daemon log filter keeps the media token out of the log. The own-message attribution row is now
    part of phase 2 (§4, owner 2026-11-06).
 5. **Resolved:** the wa-rs version and the uninstall media prompt (2026-10-30); the re-upload addressing for fresh
    messages (2026-11-01, §2); the transfer limits (2026-11-04 spike, §2).
