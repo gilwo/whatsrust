@@ -3284,9 +3284,19 @@ async fn handle_event(
 
             // Normalize DM chat JID: resolve @lid → @s.whatsapp.net so downstream
             // consumers (e.g. Habb) see a consistent identity for each contact.
-            // Groups are never LID-based so only DMs need resolution.
+            // Groups are never LID-based so only DMs need resolution. An own message never
+            // keys its chat with the sender's alt (the account's own number): see
+            // `resolve_live_chat_jid`.
             let chat_jid_raw = info.source.chat.to_string();
-            let chat_jid = resolve_chat_jid(&chat_jid_raw, sender_alt, store).await;
+            let chat_jid = resolve_live_chat_jid(
+                &chat_jid_raw,
+                sender_alt,
+                info.source.is_from_me,
+                client.get_lid().as_ref(),
+                client.get_pn().as_ref(),
+                store,
+            )
+            .await;
 
             // Allowlist filter: skip messages from numbers not on the list.
             // Check both the resolved sender AND the resolved chat JID phone,
@@ -4608,7 +4618,8 @@ fn bare_lid_user(jid_str: &str) -> &str {
 ///
 /// When available, `sender_alt` from wa-rs is used as an inline fallback before
 /// hitting the database — this covers the first-message edge case where the LID
-/// mapping hasn't been persisted yet.
+/// mapping hasn't been persisted yet. The alt must name the other person: for the chat of a live
+/// message use `resolve_live_chat_jid`, which drops the alt of an own message.
 async fn resolve_chat_jid(raw: &str, sender_alt: Option<&wacore_binary::jid::Jid>, store: &Store) -> String {
     let Some((_, "lid")) = raw.split_once('@') else {
         return raw.to_string();
@@ -4625,6 +4636,45 @@ async fn resolve_chat_jid(raw: &str, sender_alt: Option<&wacore_binary::jid::Jid
         return format!("{}@s.whatsapp.net", entry.phone_number);
     }
     raw.to_string()
+}
+
+/// Key the chat of a live message (`Event::Message`).
+///
+/// A received message resolves like `resolve_chat_jid`: the sender's alt is the other person's
+/// phone JID, which is also the chat.
+///
+/// An own message (`is_from_me`) is different: its chat is the *recipient* (the other person),
+/// and wa-rs sets the sender's alt to the account's *own* phone JID when the message arrives from
+/// a LID (`wacore` `messages.rs`, own-message branch; `recipient_alt` is never filled at this
+/// pin). Keying the chat with that alt would file the message under the account's own number.
+/// So an own message ignores the alt: a `@lid` chat resolves through the LID mapping only, and
+/// stays `@lid` when the mapping is unknown. Phone and group chats pass through unchanged.
+///
+/// The one exception is the self-chat ("message yourself"): its chat is the account's own LID,
+/// which is the account's own phone JID. `own_lid` and `own_pn` are the client's device snapshot
+/// (`Client::get_lid` / `Client::get_pn`), the same one wa-rs used to set `is_from_me`, so no
+/// database read is needed to recognise the account.
+async fn resolve_live_chat_jid(
+    chat_raw: &str,
+    sender_alt: Option<&Jid>,
+    is_from_me: bool,
+    own_lid: Option<&Jid>,
+    own_pn: Option<&Jid>,
+    store: &Store,
+) -> String {
+    if !is_from_me {
+        return resolve_chat_jid(chat_raw, sender_alt, store).await;
+    }
+    if let (Some(own_lid), Some(own_pn)) = (own_lid, own_pn) {
+        let is_own_lid_chat = chat_raw
+            .split_once('@')
+            .is_some_and(|(_, server)| server == "lid")
+            && bare_lid_user(chat_raw) == own_lid.user.as_str();
+        if is_own_lid_chat {
+            return format!("{}@s.whatsapp.net", own_pn.user);
+        }
+    }
+    resolve_chat_jid(chat_raw, None, store).await
 }
 
 /// Resolve a sender JID to a phone number using the LID mapping table.
@@ -8625,5 +8675,163 @@ mod media_location_tests {
         for reason in [with_url, without_url] {
             assert!(!reason.contains("other.example") && !reason.contains("secret-path"), "{reason}");
         }
+    }
+}
+
+#[cfg(test)]
+mod live_chat_jid_tests {
+    use super::*;
+    use wacore::store::traits::LidPnMappingEntry;
+
+    const OWN_PN: &str = "15550001111@s.whatsapp.net";
+    const OWN_LID: &str = "100000000000009@lid";
+    const PEER_LID: &str = "100000000000001@lid";
+    const PEER_PN: &str = "15551234567@s.whatsapp.net";
+    const UNMAPPED_PEER_LID: &str = "100000000000002@lid";
+    const GROUP: &str = "120363000000000001@g.us";
+
+    fn jid(s: &str) -> Jid {
+        Jid::from_str(s).unwrap()
+    }
+
+    /// A store whose LID mapping knows `PEER_LID` (not `UNMAPPED_PEER_LID`).
+    async fn open_store(name: &str) -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("test_live_chat_jid_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::new(&dir.join("wa.db")).expect("test DB");
+        store
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: "100000000000001".to_owned(),
+                phone_number: "15551234567".to_owned(),
+                created_at: 1,
+                updated_at: 1,
+                learning_source: "test".to_owned(),
+            })
+            .await
+            .unwrap();
+        (store, dir)
+    }
+
+    /// A message the account sent: `is_from_me`, the account's identities known.
+    async fn own(chat_raw: &str, sender_alt: Option<&Jid>, store: &Store) -> String {
+        resolve_live_chat_jid(chat_raw, sender_alt, true, Some(&jid(OWN_LID)), Some(&jid(OWN_PN)), store).await
+    }
+
+    /// A message someone else sent.
+    async fn received(chat_raw: &str, sender_alt: Option<&Jid>, store: &Store) -> String {
+        resolve_live_chat_jid(chat_raw, sender_alt, false, Some(&jid(OWN_LID)), Some(&jid(OWN_PN)), store).await
+    }
+
+    #[tokio::test]
+    async fn test_received_message_in_a_lid_dm_keeps_the_peers_phone_alt() {
+        let (store, dir) = open_store("received").await;
+        let peer_alt = jid(PEER_PN);
+
+        // The alt names the peer: it wins, even before the mapping is stored.
+        assert_eq!(received(UNMAPPED_PEER_LID, Some(&peer_alt), &store).await, PEER_PN);
+        assert_eq!(received(PEER_LID, Some(&peer_alt), &store).await, PEER_PN);
+        // No alt: the mapping decides, else the raw LID stays.
+        assert_eq!(received(PEER_LID, None, &store).await, PEER_PN);
+        assert_eq!(received(UNMAPPED_PEER_LID, None, &store).await, UNMAPPED_PEER_LID);
+        // A LID alt is not a phone JID: the mapping decides.
+        assert_eq!(received(PEER_LID, Some(&jid(OWN_LID)), &store).await, PEER_PN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_received_message_is_resolved_exactly_like_resolve_chat_jid() {
+        let (store, dir) = open_store("received-same").await;
+        let peer_alt = jid(PEER_PN);
+
+        for chat in [PEER_LID, UNMAPPED_PEER_LID, OWN_LID, PEER_PN, GROUP] {
+            for alt in [None, Some(&peer_alt)] {
+                assert_eq!(
+                    received(chat, alt, &store).await,
+                    resolve_chat_jid(chat, alt, &store).await,
+                    "chat {chat}, alt {alt:?}",
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_own_message_in_a_lid_dm_uses_the_mapping_not_the_own_alt() {
+        let (store, dir) = open_store("own-lid-dm").await;
+        // wa-rs sets the sender's alt to the account's own phone JID when `from` is a LID.
+        let own_alt = jid(OWN_PN);
+
+        assert_eq!(own(PEER_LID, Some(&own_alt), &store).await, PEER_PN, "mapping known: the peer's phone JID");
+        assert_eq!(
+            own(UNMAPPED_PEER_LID, Some(&own_alt), &store).await,
+            UNMAPPED_PEER_LID,
+            "mapping unknown: the raw LID, never the own number",
+        );
+        // A device-qualified chat LID still finds the mapping.
+        assert_eq!(own("100000000000001:3@lid", Some(&own_alt), &store).await, PEER_PN);
+        // Same result without an alt.
+        assert_eq!(own(PEER_LID, None, &store).await, PEER_PN);
+        assert_eq!(own(UNMAPPED_PEER_LID, None, &store).await, UNMAPPED_PEER_LID);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_own_message_in_a_lid_dm_never_becomes_the_own_number() {
+        let (store, dir) = open_store("own-never").await;
+        let own_alt = jid(OWN_PN);
+
+        for chat in [PEER_LID, UNMAPPED_PEER_LID] {
+            assert_ne!(own(chat, Some(&own_alt), &store).await, OWN_PN, "chat {chat}");
+        }
+        // The account's identities unknown (not expected for an own message): same rule.
+        let unknown_own = resolve_live_chat_jid(UNMAPPED_PEER_LID, Some(&own_alt), true, None, None, &store).await;
+        assert_eq!(unknown_own, UNMAPPED_PEER_LID);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_own_message_in_a_phone_dm_is_unchanged() {
+        let (store, dir) = open_store("own-phone-dm").await;
+        let own_lid_alt = jid(OWN_LID);
+
+        // `from` is the own phone JID, so wa-rs sets the alt to the own LID.
+        assert_eq!(own(PEER_PN, Some(&own_lid_alt), &store).await, PEER_PN);
+        assert_eq!(own(PEER_PN, None, &store).await, PEER_PN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_own_message_in_the_self_chat_is_the_own_phone_jid() {
+        let (store, dir) = open_store("own-self-chat").await;
+        let own_alt = jid(OWN_PN);
+
+        assert_eq!(own(OWN_LID, Some(&own_alt), &store).await, OWN_PN);
+        assert_eq!(own(OWN_LID, None, &store).await, OWN_PN, "no alt needed");
+        assert_eq!(own("100000000000009:75@lid", Some(&own_alt), &store).await, OWN_PN, "a device part is ignored");
+        // The self-chat addressed by the own phone JID is already the own phone JID.
+        assert_eq!(own(OWN_PN, None, &store).await, OWN_PN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_self_chat_is_the_own_phone_jid_even_when_the_mapping_is_unknown() {
+        let (store, dir) = open_store("own-self-chat-unmapped").await;
+
+        // The own LID has no `lid_pn_mapping` row here: the account's own identities decide.
+        assert_eq!(own(OWN_LID, Some(&jid(OWN_PN)), &store).await, OWN_PN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_group_messages_are_unchanged() {
+        let (store, dir) = open_store("group").await;
+        let alt = jid(PEER_PN);
+
+        for alt in [None, Some(&alt)] {
+            assert_eq!(received(GROUP, alt, &store).await, GROUP);
+            assert_eq!(own(GROUP, alt, &store).await, GROUP);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
