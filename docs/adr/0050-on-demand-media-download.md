@@ -2,8 +2,9 @@
 
 **Status:** Proposed (v5, 2026-11-04: the v4 follow-up cold review and a ureq timeout spike folded in; the old-file
 test matrix passed 2026-11-05, GO 2026-11-06; v5.1 2026-11-06: the own-message attribution fix folded into phase 2;
-v5.2 2026-11-08: the revoke key rule corrected, cold review pending; next: phase 2a)
-**Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4), 2026-11-04 (v5), 2026-11-06 (v5.1), 2026-11-08 (v5.2)
+v5.2 2026-11-08: the revoke key rule corrected; v5.3 2026-11-08: the v5.2 cold review folded in (revokes judged
+when read, a deferred repair, an in-place downgrade); next: phase 2a, and a cold review of v5.3 before 2b)
+**Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4), 2026-11-04 (v5), 2026-11-06 (v5.1), 2026-11-08 (v5.2, v5.3)
 
 ## Context
 
@@ -32,16 +33,19 @@ Facts that shape the design (checked in the code, the wa-rs pin `9e8c70e` and a 
 ## Decision
 
 1. **The media ID is the message ID.**
-2. **Schema v9** (owner-authorised): `media_refs` gains `file_name`, `file_sha256`, `remote_jid`, `participant`,
-   `revoked_at` and `view_once`, written by history ingest for new rows. The message and its reference are written
+2. **Schema v9** (owner-authorised): `media_refs` gains `file_name`, `file_sha256`, `remote_jid`, `participant`
+   and `view_once` (`revoked_at` dropped 2026-11-08), written by history ingest for new rows; `messages` gains a
+   partial index on the revoke label. The step is re-runnable. The message and its reference are written
    in one transaction. A duplicate (a re-fetched message) whose chat, sender, `from_me` and kind match the stored
    row fills an existing reference, and creates a missing one when the stored message is not live; a mismatch
    changes nothing. Staged migration per ADR 0028–0032. No backfill of the new columns. Phase 2 first fixes the
    own-message attribution (live rows store the event's `from_me`; own history messages store the own phone JID as
-   the sender), and the migration repairs the stored rows and the fetch cursor's anchor flag before the one-time
-   revoke pass, all in the v9 step (owner-authorised 2026-11-06 and 2026-11-08). **There is no supported way back after a healthy
-   migration** (`--rollback` serves only failed ones), so the schema phase is merged only after the old-file test
-   matrix passes.
+   the sender). The stored rows and the fetch cursor's anchor flag are repaired once, at the first start that
+   knows the owner's number, under a metadata marker that records it (owner-authorised 2026-11-06; timing
+   2026-11-08). **The way back after a healthy migration is an in-place downgrade** (`PRAGMA user_version = 8` on
+   a stopped daemon; proven by a test with the v8 binary); restoring the pre-migration backup is the fallback, and
+   `--rollback` serves failed migrations only. The schema phase is merged only after the old-file test matrix
+   passes (done 2026-11-05).
 3. **Files on disk, one folder per chat,** under `media/` beside `whatsapp.db`: `chat_<number>/`,
    `group_<number>/`, `lid_<number>/`. One name file per folder (`_group_<name>.txt` / `_chat_<name>.txt`,
    sanitised by a std allow-list of letters, digits, `-` and `.`, at most 64 bytes; the group file lists the participants'
@@ -96,10 +100,11 @@ Facts that shape the design (checked in the code, the wa-rs pin `9e8c70e` and a 
    is moved into its chat's reserved `_deleted/` folder by one idempotent `tag` primitive; "deleted" is a path
    property, never a part of a file name (a chat whose rows are all deleted gets a `deleted: <epoch>` line in its
    name file). **Only an observed delete or a valid revoke tags a file.** A revoke is judged by identities, not by
-   the stored `from_me`: the revoker must be the target's author (the owner's own account for an own message), and
-   the revoke key, which the revoker writes from its own view, must say `from_me = true` with no participant or the
-   revoker as participant (an admin's delete, `from_me = false`, does not count; corrected in v5.2). It is
-   resolved once at ingest into `revoked_at`, and the migration runs a one-time pass over stored revoke rows. The
+   the stored `from_me`: a stored revoke row in the same chat with the exact label `[deleted <id>]` counts when
+   its revoker is the target's author (the owner's own account for an own message); an admin's delete does not
+   count. **It is judged when read** (`get`, `status`, the download start and its final write), through a partial
+   index on the label, so arrival order and the running build do not matter; no column stores the result and no
+   pass runs over old rows (2026-11-08). The revoke key does not gate the judgement; its shape is only logged. The
    file set comes from the rows actually deleted (a message delete also matches the chat), through per-event,
    chunked intent keys in `metadata` that startup replays. A message missing from the DB is never treated as deleted. A revoked message is never downloaded. A
    message that comes back is moved back and adopted. **This narrows ADR 0012 for media:** a delete no longer
@@ -206,6 +211,18 @@ before the one-time revoke pass. The owner authorised this repair; it is undone 
   earlier rows cannot be repaired.
 - The owner widened the repair (2026-11-08): own history rows whose sender is not one of the owner's identities,
   every form of the owner's number and LID for live rows, and the fetch cursor's anchor flag.
+
+**2026-11-08: the v5.2 cold review** (`_reviewer/design/2026-11-08-on-demand-media-download-v5.md`; approve with
+changes, 0 blocking, 6 major) and the owner's decisions (design v5.3):
+- the revoke subsystem drew a major finding in three reviews (v3, v4, v5.2), each answered by another patch to
+  "resolve at ingest". Revokes are now **judged when read**, from the stored revoke rows; `revoked_at` and the
+  one-time pass are dropped. The revoke key's shape (inferred from wa-rs's send code only) is logged, not used;
+- logout deletes the `device` row and the QR flow starts unpaired, so the repair runs once at the first start
+  that knows the owner's number, under a marker, not inside the version step;
+- a v8 binary refuses v9 only by the version number, so an in-place downgrade becomes the primary revert, once a
+  test with the v8 binary proves it;
+- the owner's largest profile (shape report): 26,080 messages, 963 rows to repair, no dotted LID; the budget is
+  30 s for the migration and the repair on a synthetic 500,000-message DB.
 
 ## Alternatives considered
 

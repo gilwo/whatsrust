@@ -1674,6 +1674,16 @@ so you're back to needing `--rollback` or another `--migrate` attempt).
 `cat whatsapp.db.migration-pin` (JSON) shows `state` (`failed` /
 `rolled_back`) and `pinned_version`.
 
+### 6d. Database shape report (before a schema upgrade)
+
+`scripts/db-shape-report.sh <path/to/whatsapp.db>` prints a read-only report for sizing a migration: file sizes, the
+schema version, the shape of the account's own phone JID and LID, message counts by source, the shapes of stored
+sender and chat identifiers, and the rows the v9 own-message repair would change. It opens the database with
+`sqlite3 -readonly` and prints only counts and shapes (for example `lid dot=0 colon=1 len=15`), never a JID, a number
+or message text, so the output can be pasted into a review. Prefer a stopped daemon; otherwise report on a copy made
+with `sqlite3 -readonly <db> ".backup /tmp/whatsrust-shape-copy.db"` and delete the copy afterwards (it holds your
+messages). `--help` shows the details.
+
 ---
 
 ## 7. Test & lint
