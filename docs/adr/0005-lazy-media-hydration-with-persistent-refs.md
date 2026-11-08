@@ -41,7 +41,7 @@ Old directPaths that expire → **best-effort**. If fetch fails, return error to
 
 The decision is now carried out for history rows. Messages stored from history (the package the phone sends at pairing, and on-demand fetches) download no media: each media message is stored with a label built from the proto's `file_length` (for example `[image 12.1KB] caption`) and a `media_refs` row (`media_key`, `direct_path`, `file_enc_sha256`, `mimetype`, `file_length`, `width`, `height`; `hydrated_path` stays NULL). Media whose link has expired is therefore stored too. Live ingest is unchanged: it still downloads eagerly, because the bytes feed the inbound event, and writes no `media_refs` row. The on-demand download from `media_refs` (REST, CLI and MCP) is not built yet; it is on the ROADMAP backlog. Deleting a message or a chat deletes its `media_refs` rows. See ADR 0048.
 
-## Amendment (2026-10-29, proposed; revised 2026-10-30, 2026-11-01, 2026-11-03, 2026-11-04 and 2026-11-08)
+## Amendment (2026-10-29, proposed; revised 2026-10-30, 2026-11-01, 2026-11-03, 2026-11-04 and 2026-11-08 twice)
 
 The on-demand download is designed in ADR 0050 (status Proposed; detail in
 `docs/plans/2026-10-29-on-demand-media-download-design.md`). Three points of this ADR change with it:
@@ -55,6 +55,8 @@ The on-demand download is designed in ADR 0050 (status Proposed; detail in
   `media/<prefix>_<number>/` beside `whatsapp.db`, recorded in `media_refs.hydrated_path` (relative to
   `media/`). The DB still holds no media bytes, and nothing is downloaded unless a client asks for that message.
 - **The reference gains fields** (schema v9): `file_name`, `file_sha256`, `remote_jid`, `participant`,
-  `view_once`, for new history rows (`static_url` was dropped on 2026-11-01: newsletters are never stored;
-  `revoked_at` was dropped on 2026-11-08: a revoke is judged when read, from the stored revoke rows). The message and its reference are written in one transaction, and a re-fetched history message that
+  `view_once`, `media_key_timestamp`, for new history rows (`static_url` was dropped on 2026-11-01: newsletters are
+  never stored; `revoked_at` was dropped on 2026-11-08: a revoke is judged when read, from the stored revoke rows).
+  A re-fetched duplicate fills the encryption tuple (`media_key`, `direct_path`, `file_enc_sha256`,
+  `media_key_timestamp`) only as a whole. The message and its reference are written in one transaction, and a re-fetched history message that
   matches the stored row (chat, sender, `from_me`, kind) creates a missing reference unless the stored row is live. Live media still gets no reference (out of scope for now).

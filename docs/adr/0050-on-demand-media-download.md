@@ -3,8 +3,9 @@
 **Status:** Proposed (v5, 2026-11-04: the v4 follow-up cold review and a ureq timeout spike folded in; the old-file
 test matrix passed 2026-11-05, GO 2026-11-06; v5.1 2026-11-06: the own-message attribution fix folded into phase 2;
 v5.2 2026-11-08: the revoke key rule corrected; v5.3 2026-11-08: the v5.2 cold review folded in (revokes judged
-when read, a deferred repair, an in-place downgrade); next: phase 2a, and a cold review of v5.3 before 2b)
-**Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4), 2026-11-04 (v5), 2026-11-06 (v5.1), 2026-11-08 (v5.2, v5.3)
+when read, a deferred repair, an in-place downgrade); v5.4 2026-11-08: the v5.3 cold review folded in; next: phase
+2a commit, then 2b; phase 2 merges to `main` after 2b)
+**Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4), 2026-11-04 (v5), 2026-11-06 (v5.1), 2026-11-08 (v5.2, v5.3, v5.4)
 
 ## Context
 
@@ -34,14 +35,17 @@ Facts that shape the design (checked in the code, the wa-rs pin `9e8c70e` and a 
 
 1. **The media ID is the message ID.**
 2. **Schema v9** (owner-authorised): `media_refs` gains `file_name`, `file_sha256`, `remote_jid`, `participant`
-   and `view_once` (`revoked_at` dropped 2026-11-08), written by history ingest for new rows; `messages` gains a
-   partial index on the revoke label. The step is re-runnable. The message and its reference are written
+   `view_once` and `media_key_timestamp` (`revoked_at` dropped 2026-11-08), written by history ingest for new rows;
+   `messages` gains a partial index on the revoke label. The step is re-runnable (`ensure_v9_columns` also runs on the
+   re-validation branch). A duplicate fills the encryption tuple (`media_key`, `direct_path`, `file_enc_sha256`,
+   `media_key_timestamp`) only as a whole. The message and its reference are written
    in one transaction. A duplicate (a re-fetched message) whose chat, sender, `from_me` and kind match the stored
    row fills an existing reference, and creates a missing one when the stored message is not live; a mismatch
    changes nothing. Staged migration per ADR 0028–0032. No backfill of the new columns. Phase 2 first fixes the
    own-message attribution (live rows store the event's `from_me`; own history messages store the own phone JID as
-   the sender). The stored rows and the fetch cursor's anchor flag are repaired once, at the first start that
-   knows the owner's number, under a metadata marker that records it (owner-authorised 2026-11-06; timing
+   the sender). The stored rows and the fetch cursor's anchor flag are repaired at every start that knows the
+   owner's number (idempotent; a backup before it changes rows outside the migrating start; a post-condition; the
+   marker records the number as a re-pair guard; ADR 0028 amendment) (owner-authorised 2026-11-06; timing
    2026-11-08). **The way back after a healthy migration is an in-place downgrade** (`PRAGMA user_version = 8` on
    a stopped daemon; proven by a test with the v8 binary); restoring the pre-migration backup is the fallback, and
    `--rollback` serves failed migrations only. The schema phase is merged only after the old-file test matrix
@@ -104,7 +108,10 @@ Facts that shape the design (checked in the code, the wa-rs pin `9e8c70e` and a 
    its revoker is the target's author (the owner's own account for an own message); an admin's delete does not
    count. **It is judged when read** (`get`, `status`, the download start and its final write), through a partial
    index on the label, so arrival order and the running build do not matter; no column stores the result and no
-   pass runs over old rows (2026-11-08). The revoke key does not gate the judgement; its shape is only logged. The
+   pass runs over old rows (2026-11-08). In a 1:1 chat the author test is `from_me` equality; in a group, sender
+   identity. **Revoked wins** (a message judged revoked is never `ready`; its file is tagged then), and revoke
+   tombstones are stored even from senders outside `WHATSRUST_ALLOWED_NUMBERS`. Remaining false negatives fail open,
+   by policy; retention must keep revoke rows. The revoke key does not gate the judgement; its shape is only logged. The
    file set comes from the rows actually deleted (a message delete also matches the chat), through per-event,
    chunked intent keys in `metadata` that startup replays. A message missing from the DB is never treated as deleted. A revoked message is never downloaded. A
    message that comes back is moved back and adopted. **This narrows ADR 0012 for media:** a delete no longer
@@ -223,6 +230,17 @@ changes, 0 blocking, 6 major) and the owner's decisions (design v5.3):
   test with the v8 binary proves it;
 - the owner's largest profile (shape report): 26,080 messages, 963 rows to repair, no dotted LID; the budget is
   30 s for the migration and the repair on a synthetic 500,000-message DB.
+
+**2026-11-08: the v5.3 cold review** (`_reviewer/design/2026-11-08-on-demand-media-download-v5.3.md`; approve with
+changes, 0 blocking, 4 major; trajectory: converging) and the owner's decisions (design v5.4):
+- the one-shot repair marker would lock in rows written later; the repair now runs at every start that knows the
+  number, with a backup before it changes rows, a post-condition and a failure note (ADR 0028 amendment);
+- per-column filling of duplicates could pair a key with another encryption's path; v9 adds `media_key_timestamp`
+  and fills the encryption tuple only as a whole;
+- "revoked wins" over a downloaded file, revoke tombstones stored past the allowlist, fail-open as policy;
+- phase 2 merges to `main` after 2b.
+Run 2a measured the budget (7.2–8.1 s for 500,000 messages, debug build) and proved the in-place downgrade with a
+v8 build (`--migrate` accepted the DB in 0.23 s).
 
 ## Alternatives considered
 
