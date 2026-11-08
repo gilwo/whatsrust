@@ -5,9 +5,9 @@ This plan turns design §13 row 2 (`2026-10-29-on-demand-media-download-design.m
 (`_reviewer/design/2026-11-08-on-demand-media-download-v5.md`, `…-v5.3.md`), with the owner's decisions of 2026-11-08
 applied. The design stays the specification; this file says where and in which order.
 
-**Status:** v5.4, 2026-11-08. Done: the attribution fix (d2f598c), the LID-chat fix (a72b1f2). Run 2a: done, with the
-v5.3 review follow-up (§2.9) and a code review round (§2.10). Next: **2b**. Phase 2 merges to `main`
-after 2b (owner).
+**Status:** v5.4, 2026-11-08. Done: the attribution fix (d2f598c), the LID-chat fix (a72b1f2). Run 2a: done (ae89d33),
+with the v5.3 review follow-up (§2.9) and a code review round (§2.10). Run 2b: done (2026-11-08; the allowlist
+variable is `WHATSAPP_ALLOWED`). Next: the merge to `main` (owner), then phase 3.
 
 ## 1. The split
 

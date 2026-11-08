@@ -1,6 +1,7 @@
 # On-demand media download — design and plan
 
-**Status:** v5.4 (2026-11-08): the v5.3 cold review folded in with the owner's decisions: the repair runs at every
+**Status:** v5.4 (2026-11-08); **phase 2 built** (2a ae89d33, 2b 2026-11-08; the allowlist variable is
+`WHATSAPP_ALLOWED`, corrected from a wrong name used since v4). v5.4: the v5.3 cold review folded in with the owner's decisions: the repair runs at every
 start that knows the owner's number, with a backup before it changes rows; a `media_key_timestamp` column and a
 whole-tuple fill; "revoked wins" and revoke tombstones stored past the allowlist; phase 2 merges after 2b. v5.3
 (2026-11-08): the v5.2 cold review folded in with the owner's decisions: revokes are judged when
@@ -40,7 +41,7 @@ This document describes what is built and how. The owner's decisions are in §9;
 | The repair's purpose restated: the duplicate and revoke rules are identity-based and work without it; it corrects stored data for `history`/`search` and the fetch cursor's anchor flag (§4) | v5.3 review M2 |
 | A sixth column, `media_key_timestamp`; the encryption tuple (`media_key`, `direct_path`, `file_enc_sha256`, `media_key_timestamp`) is filled only as a whole, when all three key fields are empty (§4; owner, 2026-11-08) | per-column filling could pair a key from one encryption with a path from another (a false `integrity`); without the timestamp a newer copy could never be told apart without a v10 (v5.3 review M3) |
 | **Revoked wins:** a message judged revoked is not `ready`; `get`/`status` answer `revoked`, and a downloaded file is tagged then (idempotent) (§5.5, §6.1; owner, 2026-11-08) | the read-time judgement and event-time tagging had no precedence (v5.3 review M4) |
-| **Revoke tombstones are stored past the allowlist** (only the revoke row; no event, no receipt); the remaining false negatives fail open, as a stated policy; retention and prune features must keep revoke rows (§5.5; owner, 2026-11-08) | live ingest dropped revokes from senders not on `WHATSRUST_ALLOWED_NUMBERS` while history stored their media (v5.3 review M4) |
+| **Revoke tombstones are stored past the allowlist** (only the revoke row; no event, no receipt); the remaining false negatives fail open, as a stated policy; retention and prune features must keep revoke rows (§5.5; owner, 2026-11-08) | live ingest dropped revokes from senders not on `WHATSAPP_ALLOWED` while history stored their media (v5.3 review M4) |
 | In a 1:1 chat a revoke is judged by `from_me` equality with the target (after the repair); groups by sender identity (§5.5) | removes the LID-mapping false negatives in 1:1 chats (v5.3 review m8) |
 | `ensure_v9_columns` on the re-validation branch, so `--migrate` can fix a v9 DB with a missing column; precise recovery wording (§4) | v5.3 review m1 |
 | Phase 2 merges to `main` after 2b (§9, §13; owner, 2026-11-08) | the attribution repair is user-visible on its own; the engine follows on the branch |
@@ -408,9 +409,13 @@ file back when its message is valid again.
     target's sender as the same user (phone or LID form, through the mapping; the mapping comes from server stanza
     attributes and own-phone sync, one hop only, so a reassigned phone number would merge users). An admin's delete
     in a group does not count: the admin is not the author (the media stays available; documented);
-  - **revoke rows are stored past the allowlist:** a revoke from a sender not on `WHATSRUST_ALLOWED_NUMBERS` is
+  - **revoke rows are stored past the allowlist:** a revoke from a sender not on `WHATSAPP_ALLOWED` is
     stored as its tombstone row only (no event, no read receipt), because history stores that sender's media
-    regardless of the allowlist (owner, 2026-11-08);
+    regardless of the allowlist (owner, 2026-11-08). A tombstone is stored only when the target ID and the stanza ID
+    look like message IDs (1–128 bytes of `[A-Za-z0-9._=+-]`), so an excluded sender cannot put free text into
+    searchable history; it is stored under `message_id = tombstone:<stanza id>`, so it can never take the ID of a real
+    message (the fetch anchor skips such rows); an identical tombstone (chat, sender, label) is not stored twice;
+    tombstones naming distinct targets are not capped per sender (a residual risk) (2b code review, 2026-11-08);
   - **revoked wins:** a message judged revoked is never `ready`; `get` and `status` answer `revoked`, and a
     downloaded file of it is tagged at that moment (idempotent; tagging a file of a message judged revoked is safe,
     unlike tagging by absence);
@@ -833,7 +838,7 @@ A `media` snapshot (`{enabled: false}` when the feature is off):
 | Sanitiser | A std allow-list; no Unicode crates (2026-11-04) |
 | Off | With the feature off, only the two lanes stop; the delete and revoke hooks, the journal replay, the `.part` cleanup and the counts always run (2026-11-04) |
 | Matrix threshold | Go when the mapped 1:1 or the mapped group addressing recovers files older than one week; a LID-less account falls back to the pin's phone-number request (2026-11-04) |
-| Number allowlist | `WHATSRUST_ALLOWED_NUMBERS` does not scope media downloads, as for the history tools (2026-11-04) |
+| Number allowlist | `WHATSAPP_ALLOWED` does not scope media downloads, as for the history tools (2026-11-04) |
 | Attribution | The own-message attribution fix is the first commit of phase 2, not its own branch; the v9 migration repairs the stored rows (live `from_me`, the own sender of history messages) before the one-time revoke pass (2026-11-06) Revised 2026-11-08: the repair runs once at the first start that knows the owner's number; no revoke pass |
 | Repair scope | Own history rows whose sender is not one of the owner's identities; the live repair matches every form of the owner's number and LID; the fetch cursor's anchor flag is repaired too (2026-11-08) |
 | LID 1:1 chats | Own messages in LID-addressed 1:1 chats are filed under the other person: a separate fix commit on the media branch before phase 2a; earlier rows keep the wrong chat (2026-11-08) |

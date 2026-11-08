@@ -791,6 +791,10 @@ pub struct BridgeConfig {
     /// Automatically send read receipts for inbound messages after enqueue.
     pub auto_mark_read: bool,
     /// If non-empty, only process inbound messages from these phone numbers (digits only).
+    /// A message from anyone else is dropped: no event, no inbound dispatch, no read receipt and
+    /// no stored row, with one exception: a sender revoke ("delete for everyone") from anyone is
+    /// stored as its revoke row (and nothing else happens to it), because stored history keeps
+    /// every sender's media and the media download must see that its sender deleted it.
     pub allowed_numbers: Vec<String>,
     /// Minimum interval between outbound sends (anti-ban pacing, millis).
     pub min_send_interval_ms: u64,
@@ -3159,6 +3163,148 @@ async fn run_bot_session(
 // Event handling — expanded from 5 to 12+ event types
 // ---------------------------------------------------------------------------
 
+/// Whether the sender allowlist (`WHATSAPP_ALLOWED`, `BridgeConfig.allowed_numbers`) drops a live
+/// message: the list is not empty, the message is not our own, and neither the resolved sender
+/// nor the phone of the resolved chat JID is on it. (Both are checked, since LID resolution may
+/// succeed for one but not the other.)
+fn allowlist_drops(allowed_numbers: &[String], is_from_me: bool, sender: &str, chat_jid: &str) -> bool {
+    !allowed_numbers.is_empty()
+        && !is_from_me
+        && !allowed_numbers.iter().any(|n| n == sender)
+        && !allowed_numbers
+            .iter()
+            .any(|n| chat_jid.strip_suffix("@s.whatsapp.net").is_some_and(|pn| pn == n))
+}
+
+/// Where an inbound row is: the chat, the sender, the message ID, the event's time and `from_me`.
+struct InboundKey<'a> {
+    jid: &'a str,
+    sender: &'a str,
+    id: &'a str,
+    timestamp: i64,
+    from_me: bool,
+}
+
+/// How [`persist_inbound`] writes a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InboundWrite {
+    /// A message that passed the allowlist: `insert_message_if_new`, source `live`, under its ID.
+    Message,
+    /// The revoke of a message the allowlist dropped (the content must be a revoke): the same row
+    /// through `Store::insert_revoke_tombstone`, which files it under `tombstone:<id>` and skips
+    /// an identical revoke row.
+    RevokeTombstone,
+}
+
+/// Write the history row of an inbound message: its content kind, its display text as the body and
+/// the write-time `embed_status` classification (ADR 0016/0038) come from the `content`, here and
+/// nowhere else, so every path stores the same row for the same content. `Ok(true)` when a row was
+/// written, `Ok(false)` when the insert was ignored (an ID or, for a tombstone, an identical row
+/// already stored).
+///
+/// The text of the classification is discarded (Option C, ADR 0038); callers wake the embedding
+/// drain worker themselves when `content.embed_status()` is `"pending"`.
+async fn persist_inbound(
+    store: &Store,
+    key: &InboundKey<'_>,
+    content: &InboundContent,
+    write: InboundWrite,
+) -> std::result::Result<bool, wacore::store::error::StoreError> {
+    let body = content.display_text();
+    let embed_status = content.embed_status();
+    match write {
+        InboundWrite::Message => {
+            let body_opt = if body.is_empty() { None } else { Some(body.as_str()) };
+            store
+                .insert_message_if_new(
+                    key.jid, key.sender, key.id, content.kind(), body_opt, key.timestamp, key.from_me, "live", embed_status,
+                )
+                .await
+        }
+        InboundWrite::RevokeTombstone => {
+            debug_assert_eq!(content.kind(), "revoke", "only a revoke is stored as a tombstone");
+            store
+                .insert_revoke_tombstone(key.jid, key.sender, key.id, &body, key.timestamp, key.from_me, embed_status)
+                .await
+        }
+    }
+}
+
+/// Whether `id` looks like a message ID: not empty, at most 128 bytes, only `A-Z a-z 0-9 . _ = + -`.
+/// The ID of a message from a sender the allowlist excludes goes into the stored text, which is
+/// searchable, so only this much of it is accepted.
+fn is_plausible_message_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'=' | b'+' | b'-'))
+}
+
+/// What [`store_revoke_tombstone`] did with a message the allowlist dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tombstone {
+    /// Not a sender revoke: nothing stored.
+    NotARevoke,
+    /// The revoke's target ID or the message's own ID does not look like a message ID: nothing
+    /// stored (the judgement fails open).
+    ImplausibleId,
+    /// The revoke row was written.
+    Stored,
+    /// Nothing added: this stanza ID or an identical revoke row (chat, sender, target) was already stored.
+    AlreadyStored,
+    /// The write failed.
+    Failed,
+}
+
+impl Tombstone {
+    /// The value of the `revoke_row` field of the drop log line.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotARevoke => "not_a_revoke",
+            Self::ImplausibleId => "implausible_id",
+            Self::Stored => "stored",
+            Self::AlreadyStored => "already_stored",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// What is kept of a message the allowlist drops: when it is a sender revoke whose IDs look like
+/// message IDs ([`is_plausible_message_id`], for the target and for the message), its revoke row,
+/// the row a revoke that passed the allowlist gets (`persist_inbound`: the content kind `revoke`,
+/// the label `[deleted <target id>]`, the resolved sender and chat, the event's time), filed under
+/// `tombstone:<id>` and not repeated when an identical one is stored (`InboundWrite::RevokeTombstone`).
+/// Any other message stores nothing.
+///
+/// Nothing else happens: no event, no inbound dispatch, no read receipt, no reply, no download.
+/// The function takes only the store, so it has nothing to do any of those with. The row is never
+/// from our own message: the allowlist does not drop those.
+async fn store_revoke_tombstone(
+    store: &Store,
+    msg: &wa::Message,
+    chat_jid: &str,
+    sender: &str,
+    id: &str,
+    timestamp: i64,
+) -> Tombstone {
+    let Some(target_id) = sender_revoke_target(msg) else {
+        return Tombstone::NotARevoke;
+    };
+    if !is_plausible_message_id(&target_id) || !is_plausible_message_id(id) {
+        debug!("revoke from a non-allowed sender has an ID that does not look like a message ID; not stored");
+        return Tombstone::ImplausibleId;
+    }
+    let content = InboundContent::Revoke { target_id };
+    let key = InboundKey { jid: chat_jid, sender, id, timestamp, from_me: false };
+    match persist_inbound(store, &key, &content, InboundWrite::RevokeTombstone).await {
+        Ok(true) => Tombstone::Stored,
+        Ok(false) => Tombstone::AlreadyStored,
+        Err(e) => {
+            warn!(error = %e, "failed to store the revoke row of a message from a non-allowed sender");
+            Tombstone::Failed
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_event(
     event: Event,
@@ -3301,16 +3447,28 @@ async fn handle_event(
             // Allowlist filter: skip messages from numbers not on the list.
             // Check both the resolved sender AND the resolved chat JID phone,
             // since LID resolution may succeed for one but not the other.
-            if !allowed_numbers.is_empty()
-                && !info.source.is_from_me
-                && !allowed_numbers.iter().any(|n| n == &sender)
-                && !allowed_numbers.iter().any(|n| {
-                    // Also match if chat JID resolved to a phone-based JID
-                    chat_jid.strip_suffix("@s.whatsapp.net").is_some_and(|pn| pn == n)
-                })
-            {
-                dedup.mark_done(&info.id);
-                info!(sender = %sender, raw = %sender_raw, chat = %chat_jid, "message from non-allowed sender, skipping");
+            if allowlist_drops(allowed_numbers, info.source.is_from_me, &sender, &chat_jid) {
+                // The one thing kept of a dropped message is the row of a sender revoke (media
+                // design §5.5): history stores that sender's media whatever the list says, and
+                // `is_revoked` can only see the revoke if its row is stored. Nothing else happens
+                // to it (`store_revoke_tombstone` has no channel, client or receipt to use).
+                let tombstone = store_revoke_tombstone(
+                    store,
+                    &msg,
+                    &chat_jid,
+                    &sender,
+                    &info.id,
+                    info.timestamp.timestamp(),
+                )
+                .await;
+                if tombstone == Tombstone::Failed {
+                    // As after a transient extraction failure: a redelivery of this message can
+                    // retry the write (the revoke judgement fails open meanwhile).
+                    dedup.remove(&info.id);
+                } else {
+                    dedup.mark_done(&info.id);
+                }
+                info!(sender = %sender, raw = %sender_raw, chat = %chat_jid, revoke_row = tombstone.as_str(), "message from non-allowed sender, skipping");
                 return;
             }
 
@@ -3383,12 +3541,11 @@ async fn handle_event(
                         flags: ctx_meta.flags,
                     };
 
-                    // Persist to history table for search/context
-                    let body_text = inbound.content.display_text();
-                    let body_opt = if body_text.is_empty() { None } else { Some(body_text.as_str()) };
+                    // Persist to history table for search/context (`persist_inbound`: the body is
+                    // the content's `display_text()`).
                     // M2.2.2: write-time embeddable-text classification (ADR 0016) from the
                     // InboundContent in hand — `embed_status()` wraps `embeddable_text()` (bare
-                    // NL, distinct from the decorated `display_text()` above); the text itself is
+                    // NL, distinct from the decorated `display_text()`); the text itself is
                     // discarded here (Option C, ADR 0038) — only pending/skipped classification matters.
                     // M2.2.3 (F-C part 2, ADR 0038): the pre-M2 backlog (every row migrated before
                     // this classifier existed) is tolerated as-is, not reclassified — the raw
@@ -3397,10 +3554,14 @@ async fn handle_event(
                     // backlog volume is small and stray non-NL text is bounded by the M2.3 3-attempt
                     // cap. No migration/backfill script is added for this.
                     let embed_status = inbound.content.embed_status();
-                    if let Err(e) = store.insert_inbound(
-                        &inbound.jid, &inbound.sender, &inbound.id,
-                        inbound.content.kind(), body_opt, inbound.timestamp, inbound.is_from_me, embed_status,
-                    ).await {
+                    let key = InboundKey {
+                        jid: &inbound.jid,
+                        sender: &inbound.sender,
+                        id: &inbound.id,
+                        timestamp: inbound.timestamp,
+                        from_me: inbound.is_from_me,
+                    };
+                    if let Err(e) = persist_inbound(store, &key, &inbound.content, InboundWrite::Message).await {
                         debug!(error = %e, "failed to insert inbound history (may be duplicate)");
                     }
                     // M2.3.2: fire embed_notify when a row lands 'pending' to wake the drain worker.
@@ -3955,31 +4116,25 @@ async fn seed_cursor_if_no_anchor(
 // Inbound content extraction
 // ---------------------------------------------------------------------------
 
+/// The message one wrapper level down: the ephemeral wrapper's, else a view-once wrapper's (the
+/// extractor's wrappers, in its order).
+fn wrapped_inner(msg: &wa::Message) -> Option<&wa::Message> {
+    msg.ephemeral_message
+        .as_ref()
+        .and_then(|w| w.message.as_deref())
+        .or_else(|| msg.view_once_message.as_ref().and_then(|w| w.message.as_deref()))
+        .or_else(|| msg.view_once_message_v2.as_ref().and_then(|w| w.message.as_deref()))
+        .or_else(|| msg.view_once_message_v2_extension.as_ref().and_then(|w| w.message.as_deref()))
+}
+
 /// Unwrap ephemeral/view-once wrappers to reach the inner leaf message.
 /// Returns a reference to the innermost message (or the original if not wrapped).
 fn unwrap_to_inner(msg: &wa::Message) -> &wa::Message {
-    // ephemeral_message wraps the actual content
-    if let Some(ref eph) = msg.ephemeral_message {
-        if let Some(ref inner) = eph.message {
-            return unwrap_to_inner(inner);
-        }
+    let mut current = msg;
+    while let Some(inner) = wrapped_inner(current) {
+        current = inner;
     }
-    if let Some(ref vo) = msg.view_once_message {
-        if let Some(ref inner) = vo.message {
-            return unwrap_to_inner(inner);
-        }
-    }
-    if let Some(ref vo2) = msg.view_once_message_v2 {
-        if let Some(ref inner) = vo2.message {
-            return unwrap_to_inner(inner);
-        }
-    }
-    if let Some(ref vo2_ext) = msg.view_once_message_v2_extension {
-        if let Some(ref inner) = vo2_ext.message {
-            return unwrap_to_inner(inner);
-        }
-    }
-    msg
+    current
 }
 
 /// Extract reply context (stanza_id, participant, quoted text) from any message variant.
@@ -4266,6 +4421,54 @@ fn cached_media_ref(msg: &wa::Message) -> Option<crate::storage::MediaRefRow> {
     }
 }
 
+/// The shape of a revoke's key for the debug log: its `from_me` as `"true"`, `"false"` or
+/// `"absent"`, and whether it names a participant (a non-empty one). Never the JIDs or the ID.
+fn revoke_key_shape(key: &wa::MessageKey) -> (&'static str, bool) {
+    let from_me = match key.from_me {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "absent",
+    };
+    (from_me, key.participant.as_deref().is_some_and(|p| !p.is_empty()))
+}
+
+/// The target message ID of a revoke: a protocol message of type REVOKE (0) with a key. Logs the
+/// key's shape once at debug level. The key does not gate the revoke judgement (`is_revoked`
+/// judges by identities); the shape is logged only to confirm, from real revokes, how WhatsApp
+/// writes it (design §5.5).
+fn revoke_target(proto: &wa::message::ProtocolMessage) -> Option<String> {
+    if proto.r#type != Some(wa::message::protocol_message::Type::Revoke as i32) {
+        return None;
+    }
+    let key = proto.key.as_ref()?;
+    // Both fields are a `&'static str` and a `bool` by construction: no JID and no ID can reach
+    // the log through this line.
+    let (key_from_me, participant_present) = revoke_key_shape(key);
+    debug!(key_from_me, participant_present, "revoke key shape");
+    Some(key.id.clone().unwrap_or_default())
+}
+
+/// The target of the sender revoke that `msg` is, if it is one, read straight from the raw message
+/// through the wrappers the extractor unwraps (ephemeral, view-once) to the extractor's depth
+/// (`MAX_EXTRACT_DEPTH`). It is the extractor's revoke test without the media branches, so it
+/// never downloads anything: the allowlist drops a message before extraction, and a revoke from a
+/// sender it drops still leaves its revoke row.
+///
+/// One difference from the extractor, accepted: a message that carries a revoke *and* content the
+/// extractor reads first (media, a contact, a reaction, an edit) is a revoke here and that content
+/// there. It claims only that its own sender deleted the message it names, which is the sender's
+/// to say, and the judgement checks the identities anyway.
+fn sender_revoke_target(msg: &wa::Message) -> Option<String> {
+    let mut current = msg;
+    for _ in 0..=MAX_EXTRACT_DEPTH {
+        if let Some(target) = current.protocol_message.as_deref().and_then(revoke_target) {
+            return Some(target);
+        }
+        current = wrapped_inner(current)?;
+    }
+    None
+}
+
 /// Try to extract structured content from an inbound message (live ingest: media is downloaded).
 async fn extract_content(
     msg: &wa::Message,
@@ -4502,13 +4705,8 @@ async fn extract_content_inner(
 
     // --- Protocol message (revokes / deletes) ---
     if let Some(ref proto) = msg.protocol_message {
-        // Revoke = type 0 (REVOKE) with a key
-        if proto.r#type == Some(0) {
-            if let Some(ref key) = proto.key {
-                return ExtractResult::Content(InboundContent::Revoke {
-                    target_id: key.id.clone().unwrap_or_default(),
-                });
-            }
+        if let Some(target_id) = revoke_target(proto) {
+            return ExtractResult::Content(InboundContent::Revoke { target_id });
         }
     }
 
@@ -9160,6 +9358,501 @@ mod live_chat_jid_tests {
             assert_eq!(received(GROUP, alt, &store).await, GROUP);
             assert_eq!(own(GROUP, alt, &store).await, GROUP);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — revoke rows past the allowlist, the revoke key-shape (media phase 2b)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod revoke_tombstone_tests {
+    use super::*;
+    use crate::storage::TOMBSTONE_ID_PREFIX;
+    use std::path::Path;
+
+    const GROUP: &str = "120363000000000001@g.us";
+    const PEER_PHONE: &str = "15551234567";
+    const PEER_JID: &str = "15551234567@s.whatsapp.net";
+
+    fn open_store(name: &str) -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("test_revoke_tombstone_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::new(&dir.join("wa.db")).expect("test DB");
+        (store, dir)
+    }
+
+    fn key(id: &str, from_me: Option<bool>, participant: Option<&str>) -> wa::MessageKey {
+        wa::MessageKey {
+            id: Some(id.to_owned()),
+            from_me,
+            participant: participant.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    fn protocol(kind: i32, key: Option<wa::MessageKey>) -> wa::Message {
+        wa::Message {
+            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+                r#type: Some(kind),
+                key,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// What a sender revoke of `target` looks like, as wa-rs writes it (type REVOKE, the key from
+    /// the revoker's view).
+    fn revoke(target: &str) -> wa::Message {
+        protocol(0, Some(key(target, Some(true), None)))
+    }
+
+    fn future_proof(inner: wa::Message) -> Option<Box<wa::message::FutureProofMessage>> {
+        Some(Box::new(wa::message::FutureProofMessage { message: Some(Box::new(inner)) }))
+    }
+
+    fn ephemeral(inner: wa::Message) -> wa::Message {
+        wa::Message { ephemeral_message: future_proof(inner), ..Default::default() }
+    }
+
+    fn text(body: &str) -> wa::Message {
+        wa::Message { conversation: Some(body.to_owned()), ..Default::default() }
+    }
+
+    fn image() -> wa::Message {
+        wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage {
+                mimetype: Some("image/jpeg".to_owned()),
+                media_key: Some(vec![1, 2, 3]),
+                direct_path: Some("/v/t62/abc?ccb=11".to_owned()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn allowed(numbers: &[&str]) -> Vec<String> {
+        numbers.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    /// `msg` wrapped `levels` times in ephemeral wrappers.
+    fn nested(levels: usize, msg: wa::Message) -> wa::Message {
+        (0..levels).fold(msg, |inner, _| ephemeral(inner))
+    }
+
+    /// What the extractor makes of `msg` in stored-history mode (no download): its revoke target.
+    async fn extracted_revoke(store: &Store, msg: &wa::Message) -> Option<String> {
+        let mut media = MediaMode::reference();
+        match extract_content_inner(msg, &mut media, 0, store, Some(PEER_JID)).await {
+            ExtractResult::Content(InboundContent::Revoke { target_id }) => Some(target_id),
+            _ => None,
+        }
+    }
+
+    // --- The allowlist decision ---
+
+    #[test]
+    fn the_allowlist_drops_a_message_only_when_a_list_is_set_and_nobody_listed_sent_it() {
+        let list = allowed(&["15559999999"]);
+        // Not on the list: dropped.
+        assert!(allowlist_drops(&list, false, PEER_PHONE, PEER_JID));
+        assert!(allowlist_drops(&list, false, PEER_PHONE, GROUP), "a group chat has no phone to match");
+        // The sender is on the list, or the resolved chat's phone is.
+        assert!(!allowlist_drops(&list, false, "15559999999", GROUP));
+        assert!(!allowlist_drops(&list, false, PEER_PHONE, "15559999999@s.whatsapp.net"));
+        assert!(allowlist_drops(&list, false, PEER_PHONE, "15559999999@lid"), "only a phone JID names a number");
+        // An empty list filters nothing; the account's own messages are never dropped.
+        assert!(!allowlist_drops(&[], false, PEER_PHONE, PEER_JID));
+        assert!(!allowlist_drops(&list, true, PEER_PHONE, PEER_JID));
+    }
+
+    // --- Finding a revoke in the raw message ---
+
+    #[test]
+    fn a_sender_revoke_is_found_in_the_raw_message_through_the_wrappers() {
+        assert_eq!(sender_revoke_target(&revoke("T1")).as_deref(), Some("T1"));
+        assert_eq!(sender_revoke_target(&ephemeral(revoke("T2"))).as_deref(), Some("T2"));
+        assert_eq!(sender_revoke_target(&ephemeral(ephemeral(revoke("T3")))).as_deref(), Some("T3"));
+        // The key's flag and participant do not gate it (only their shape is logged).
+        for k in [key("T4", None, None), key("T4", Some(false), Some("15559999999@s.whatsapp.net"))] {
+            assert_eq!(sender_revoke_target(&protocol(0, Some(k))).as_deref(), Some("T4"));
+        }
+
+        // Not revokes: another protocol message type, a revoke without a key, plain content.
+        assert_eq!(sender_revoke_target(&protocol(3, Some(key("T5", Some(true), None)))), None);
+        assert_eq!(sender_revoke_target(&protocol(0, None)), None);
+        assert_eq!(sender_revoke_target(&text("[deleted T5]")), None);
+        assert_eq!(sender_revoke_target(&image()), None);
+        assert_eq!(sender_revoke_target(&ephemeral(text("hello"))), None);
+        assert_eq!(sender_revoke_target(&wa::Message::default()), None);
+    }
+
+    #[test]
+    fn the_wrappers_are_unwrapped_in_the_extractors_order_and_to_its_depth() {
+        let view_once = |inner| wa::Message { view_once_message: future_proof(inner), ..Default::default() };
+        let view_once_v2 = |inner| wa::Message { view_once_message_v2: future_proof(inner), ..Default::default() };
+        let view_once_v2_ext = |inner| wa::Message { view_once_message_v2_extension: future_proof(inner), ..Default::default() };
+
+        // `unwrap_to_inner` reaches the leaf through every wrapper kind, in any mix.
+        let leaf = text("leaf");
+        let mixed = ephemeral(view_once(view_once_v2(view_once_v2_ext(leaf.clone()))));
+        assert_eq!(unwrap_to_inner(&mixed), &leaf);
+        assert_eq!(unwrap_to_inner(&leaf), &leaf, "not wrapped: itself");
+        // A wrapper without an inner message falls through to the next kind, as before.
+        let empty_ephemeral = wa::Message {
+            ephemeral_message: Some(Box::new(wa::message::FutureProofMessage { message: None })),
+            view_once_message: future_proof(leaf.clone()),
+            ..Default::default()
+        };
+        assert_eq!(unwrap_to_inner(&empty_ephemeral), &leaf);
+
+        // A view-once-wrapped revoke is found (the extractor unwraps view-once too).
+        for wrapped in [view_once(revoke("V1")), view_once_v2(revoke("V1")), view_once_v2_ext(revoke("V1"))] {
+            assert_eq!(sender_revoke_target(&wrapped).as_deref(), Some("V1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_raw_check_and_the_extractor_agree_on_wrappers_and_depth_and_differ_only_where_documented() {
+        let (store, dir) = open_store("agree");
+        let view_once = |inner| wa::Message { view_once_message_v2: future_proof(inner), ..Default::default() };
+
+        // Agreement: plain, wrapped up to MAX_EXTRACT_DEPTH levels (ephemeral and view-once),
+        // not a revoke, a revoke without a key.
+        let max = MAX_EXTRACT_DEPTH as usize;
+        let mut agreeing = vec![
+            revoke("T1"),
+            view_once(revoke("T2")),
+            protocol(3, Some(key("T3", None, None))),
+            protocol(0, None),
+            text("hi"),
+            image(),
+        ];
+        agreeing.extend((1..=max).map(|levels| nested(levels, revoke("TD"))));
+        // One level deeper than the extractor goes: neither finds it.
+        agreeing.push(nested(max + 1, revoke("TOODEEP")));
+        for (n, msg) in agreeing.iter().enumerate() {
+            assert_eq!(extracted_revoke(&store, msg).await, sender_revoke_target(msg), "message {n}");
+        }
+        assert_eq!(sender_revoke_target(&nested(max, revoke("TD"))).as_deref(), Some("TD"));
+        assert_eq!(sender_revoke_target(&nested(max + 1, revoke("TOODEEP"))), None);
+
+        // The documented difference: content the extractor reads before the protocol message wins
+        // there (here an image), while the raw check still sees the revoke.
+        let mut image_and_revoke = image();
+        image_and_revoke.protocol_message = revoke("T9").protocol_message;
+        assert_eq!(sender_revoke_target(&image_and_revoke).as_deref(), Some("T9"));
+        assert_eq!(extracted_revoke(&store, &image_and_revoke).await, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- The key shape ---
+
+    #[test]
+    fn the_revoke_key_shape_is_a_static_word_and_a_flag() {
+        let participant = Some("15559998888@s.whatsapp.net");
+        // `(from_me, participant)` of the key -> what is logged. The log line carries only these two
+        // values, a `&'static str` and a `bool`, so no JID and no ID can reach it.
+        for (from_me, participant, expected) in [
+            (Some(true), None, ("true", false)),
+            (Some(false), participant, ("false", true)),
+            (None, None, ("absent", false)),
+            (None, participant, ("absent", true)),
+            (Some(true), Some(""), ("true", false)),
+        ] {
+            assert_eq!(revoke_key_shape(&key("ID", from_me, participant)), expected);
+        }
+        // The shape is read where a revoke is recognised, without changing the result.
+        assert_eq!(revoke_target(&protocol(0, Some(key("T1", Some(true), None))).protocol_message.unwrap()).as_deref(), Some("T1"));
+        assert_eq!(revoke_target(&protocol(3, Some(key("T1", Some(true), None))).protocol_message.unwrap()), None);
+    }
+
+    // --- Message IDs ---
+
+    #[test]
+    fn only_a_short_id_of_plain_characters_looks_like_a_message_id() {
+        for ok in ["3EB0A1B2C3D4E5F6A7B8", "ABC.def_GHI=jkl+mno-123", "x", &"a".repeat(128)] {
+            assert!(is_plausible_message_id(ok), "{ok:?}");
+        }
+        for bad in [
+            "",
+            &"a".repeat(129),
+            "has space",
+            "[brackets]",
+            "line\nbreak",
+            "tab\tbed",
+            "semi;colon",
+            "quo\"te",
+            "colon:colon",
+            "slash/slash",
+            "percent%",
+            "héllo",
+            "עברית",
+            "nul\0",
+        ] {
+            assert!(!is_plausible_message_id(bad), "{bad:?}");
+        }
+        // 128 bytes counts bytes, not characters: 65 two-byte characters are too long (and not plain anyway).
+        assert!(!is_plausible_message_id(&"é".repeat(65)));
+    }
+
+    // --- Storing the tombstone ---
+
+    fn row_counts_outside_messages(dir: &Path) -> Vec<(String, i64)> {
+        let conn = rusqlite::Connection::open(dir.join("wa.db")).unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'messages%' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|t| {
+                let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM \"{t}\""), [], |r| r.get(0)).unwrap();
+                (t, n)
+            })
+            .collect()
+    }
+
+    /// A stored message row.
+    #[derive(Debug, PartialEq, Clone)]
+    struct Row {
+        chat: String,
+        sender: String,
+        id: String,
+        kind: String,
+        body: Option<String>,
+        timestamp: i64,
+        from_me: i64,
+        source: String,
+        embed_status: String,
+    }
+
+    fn message_rows(dir: &Path) -> Vec<Row> {
+        let conn = rusqlite::Connection::open(dir.join("wa.db")).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, from_me, source, embed_status
+                 FROM messages ORDER BY message_id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok(Row {
+                chat: r.get(0)?,
+                sender: r.get(1)?,
+                id: r.get(2)?,
+                kind: r.get(3)?,
+                body: r.get(4)?,
+                timestamp: r.get(5)?,
+                from_me: r.get(6)?,
+                source: r.get(7)?,
+                embed_status: r.get(8)?,
+            })
+        })
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_revoke_from_a_non_allowed_sender_is_stored_as_its_tombstone_and_nothing_else() {
+        let (store, dir) = open_store("tombstone");
+        // The sender's media message came in through stored history (which has no allowlist).
+        store
+            .insert_message(GROUP, PEER_JID, "TARGET", "image", Some("[image 1.0KB]"), 100, false, "bootstrap", "skipped")
+            .await
+            .unwrap();
+        let before = row_counts_outside_messages(&dir);
+        assert!(!store.is_revoked("TARGET").await.unwrap());
+
+        let list = allowed(&["15559999999"]);
+        assert!(allowlist_drops(&list, false, PEER_PHONE, GROUP), "the allowlist drops this message");
+        let outcome = store_revoke_tombstone(&store, &ephemeral(revoke("TARGET")), GROUP, PEER_PHONE, "REVOKEMSG", 200).await;
+        assert_eq!(outcome, Tombstone::Stored);
+
+        let rows = message_rows(&dir);
+        assert_eq!(rows.len(), 2, "the target and the tombstone");
+        let tombstone = rows.iter().find(|r| r.kind == "revoke").expect("the tombstone");
+        assert_eq!(tombstone.id, format!("{TOMBSTONE_ID_PREFIX}REVOKEMSG"), "filed under tombstone:<id>, not the stanza's own ID");
+        assert_eq!(
+            (tombstone.chat.as_str(), tombstone.sender.as_str(), tombstone.body.as_deref(), tombstone.timestamp, tombstone.from_me),
+            (GROUP, PEER_PHONE, Some("[deleted TARGET]"), 200, 0)
+        );
+        // Nothing else was written: no media reference, embedding or other table gained a row.
+        assert_eq!(row_counts_outside_messages(&dir), before);
+        // The judgement sees the tombstone (the sender revoked their own message).
+        assert!(store.is_revoked("TARGET").await.unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_tombstone_is_the_row_the_allowed_path_writes_by_structure() {
+        // Both paths go through `persist_inbound` with the same content; only the ID differs. Two
+        // stores, so that the tombstone's "identical row" check has nothing to skip.
+        let (allowed_store, allowed_dir) = open_store("same-row-allowed");
+        let (dropped_store, dropped_dir) = open_store("same-row-dropped");
+        let content = InboundContent::Revoke { target_id: "TARGET".to_owned() };
+        let key = |id| InboundKey { jid: GROUP, sender: PEER_PHONE, id, timestamp: 200, from_me: false };
+
+        assert!(persist_inbound(&allowed_store, &key("MSG1"), &content, InboundWrite::Message).await.unwrap());
+        assert!(persist_inbound(&dropped_store, &key("MSG1"), &content, InboundWrite::RevokeTombstone).await.unwrap());
+
+        let allowed_row = message_rows(&allowed_dir).remove(0);
+        let dropped_row = message_rows(&dropped_dir).remove(0);
+        assert_eq!(allowed_row.id, "MSG1");
+        assert_eq!(dropped_row.id, format!("{TOMBSTONE_ID_PREFIX}MSG1"));
+        assert_eq!(Row { id: String::new(), ..dropped_row }, Row { id: String::new(), ..allowed_row.clone() });
+        assert_eq!(
+            (allowed_row.kind.as_str(), allowed_row.body.as_deref(), allowed_row.source.as_str(), allowed_row.embed_status.as_str()),
+            ("revoke", Some("[deleted TARGET]"), "live", "skipped")
+        );
+        let _ = std::fs::remove_dir_all(&allowed_dir);
+        let _ = std::fs::remove_dir_all(&dropped_dir);
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_never_takes_the_id_of_a_message_that_arrives_later() {
+        let (store, dir) = open_store("id-block");
+        // A stranger's revoke carries a stanza ID, which is also the ID a real message gets later.
+        let outcome = store_revoke_tombstone(&store, &revoke("TARGET"), GROUP, PEER_PHONE, "LATER1", 200).await;
+        assert_eq!(outcome, Tombstone::Stored);
+
+        let written = store
+            .insert_message_if_new(GROUP, "15550002222", "LATER1", "text", Some("the real message"), 300, false, "live", "pending")
+            .await
+            .unwrap();
+        assert!(written, "the real message is stored");
+        let rows = message_rows(&dir);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.id == "LATER1" && r.kind == "text" && r.body.as_deref() == Some("the real message")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn repeated_revokes_store_one_row_and_the_judgement_still_answers() {
+        let (store, dir) = open_store("repeat");
+        store.insert_message(GROUP, PEER_JID, "TARGET", "image", None, 100, false, "bootstrap", "skipped").await.unwrap();
+        // The same stanza ID again, then 50 revokes of the same target with different stanza IDs.
+        assert_eq!(store_revoke_tombstone(&store, &revoke("TARGET"), GROUP, PEER_PHONE, "S0", 200).await, Tombstone::Stored);
+        assert_eq!(store_revoke_tombstone(&store, &revoke("TARGET"), GROUP, PEER_PHONE, "S0", 200).await, Tombstone::AlreadyStored);
+        for n in 1..=50 {
+            let outcome = store_revoke_tombstone(&store, &revoke("TARGET"), GROUP, PEER_PHONE, &format!("S{n}"), 200 + n).await;
+            assert_eq!(outcome, Tombstone::AlreadyStored, "identical chat, sender and target");
+        }
+        assert_eq!(message_rows(&dir).iter().filter(|r| r.kind == "revoke").count(), 1);
+        assert!(store.is_revoked("TARGET").await.unwrap());
+
+        // Another target, another sender or another chat is another row.
+        assert_eq!(store_revoke_tombstone(&store, &revoke("OTHER"), GROUP, PEER_PHONE, "S100", 300).await, Tombstone::Stored);
+        assert_eq!(store_revoke_tombstone(&store, &revoke("TARGET"), GROUP, "15550002222", "S101", 300).await, Tombstone::Stored);
+        assert_eq!(store_revoke_tombstone(&store, &revoke("TARGET"), PEER_JID, PEER_PHONE, "S102", 300).await, Tombstone::Stored);
+        assert_eq!(message_rows(&dir).iter().filter(|r| r.kind == "revoke").count(), 4);
+
+        // A revoke row an allowed sender's message left counts as the identical row too.
+        store
+            .insert_inbound(GROUP, PEER_PHONE, "REAL-REVOKE", "revoke", Some("[deleted THIRD]"), 400, false, "skipped")
+            .await
+            .unwrap();
+        assert_eq!(store_revoke_tombstone(&store, &revoke("THIRD"), GROUP, PEER_PHONE, "S103", 401).await, Tombstone::AlreadyStored);
+        assert!(!store.is_revoked("THIRD").await.unwrap(), "no stored target: nothing to judge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_id_that_is_not_a_message_id_stores_nothing() {
+        let (store, dir) = open_store("bad-ids");
+        let before = row_counts_outside_messages(&dir);
+        let long = "a".repeat(129);
+        let boundary = "b".repeat(128);
+        // (the revoke's target ID, the message's own ID)
+        let bad = [
+            (long.as_str(), "S1"),
+            ("has space", "S1"),
+            ("[brackets]", "S1"),
+            ("two\nlines", "S1"),
+            ("", "S1"),
+            ("TARGET", ""),
+            ("TARGET", long.as_str()),
+            ("TARGET", "bad id"),
+            ("TARGET", "tombstone:S1"),
+            ("TARGET", "line\nbreak"),
+        ];
+        for (target, id) in bad {
+            let outcome = store_revoke_tombstone(&store, &revoke(target), GROUP, PEER_PHONE, id, 200).await;
+            assert_eq!(outcome, Tombstone::ImplausibleId, "target {target:?}, id {id:?}");
+        }
+        assert!(message_rows(&dir).is_empty(), "nothing is stored");
+        assert_eq!(row_counts_outside_messages(&dir), before);
+
+        // A revoke with no key id at all has an empty target.
+        let no_id = wa::Message {
+            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+                r#type: Some(0),
+                key: Some(wa::MessageKey { id: None, ..Default::default() }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(store_revoke_tombstone(&store, &no_id, GROUP, PEER_PHONE, "S2", 200).await, Tombstone::ImplausibleId);
+
+        // The longest accepted ID is stored, with its full label.
+        assert_eq!(store_revoke_tombstone(&store, &revoke(&boundary), GROUP, PEER_PHONE, &boundary, 200).await, Tombstone::Stored);
+        let rows = message_rows(&dir);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body.as_deref(), Some(format!("[deleted {boundary}]").as_str()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn any_other_message_from_a_non_allowed_sender_stays_dropped() {
+        let (store, dir) = open_store("stays-dropped");
+        let before = row_counts_outside_messages(&dir);
+        let others = [
+            text("hello"),
+            text("[deleted TARGET]"),
+            image(),
+            ephemeral(text("hi")),
+            protocol(3, Some(key("TARGET", Some(true), None))),
+            protocol(0, None),
+            wa::Message::default(),
+        ];
+        for (n, msg) in others.iter().enumerate() {
+            let outcome = store_revoke_tombstone(&store, msg, GROUP, PEER_PHONE, &format!("MSG{n}"), 200).await;
+            assert_eq!(outcome, Tombstone::NotARevoke, "message {n} is not a revoke");
+        }
+        assert!(message_rows(&dir).is_empty(), "nothing is stored");
+        assert_eq!(row_counts_outside_messages(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_allowed_path_row_is_unchanged_and_keeps_its_own_id() {
+        let (store, dir) = open_store("allowed-path");
+        let content = InboundContent::Text { body: "hello".to_owned(), link_preview: None };
+        let key = InboundKey { jid: PEER_JID, sender: PEER_PHONE, id: "ALLOWED1", timestamp: 300, from_me: true };
+
+        assert!(persist_inbound(&store, &key, &content, InboundWrite::Message).await.unwrap());
+        assert!(!persist_inbound(&store, &key, &content, InboundWrite::Message).await.unwrap(), "a repeated ID is ignored");
+        let rows = message_rows(&dir);
+        assert_eq!(
+            rows,
+            vec![Row {
+                chat: PEER_JID.to_owned(),
+                sender: PEER_PHONE.to_owned(),
+                id: "ALLOWED1".to_owned(),
+                kind: "text".to_owned(),
+                body: Some("hello".to_owned()),
+                timestamp: 300,
+                from_me: 1,
+                source: "live".to_owned(),
+                embed_status: "pending".to_owned(),
+            }]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

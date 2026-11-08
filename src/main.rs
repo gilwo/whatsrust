@@ -444,7 +444,10 @@ async fn async_main() -> Result<()> {
         .collect();
 
     if !allowed.is_empty() {
-        info!(allowed = ?allowed, "sender allowlist active");
+        info!(
+            allowed = ?allowed,
+            "sender allowlist active: messages from anyone else are dropped, except that a sender's revoke is stored as its revoke row"
+        );
     }
 
     let api_port = get_port();
