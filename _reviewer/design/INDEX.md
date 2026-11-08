@@ -17,3 +17,4 @@
 | 2026-10-30 | On-demand media download (ADR 0050 Proposed v2) — v2 (follow-up) — [report](2026-10-30-on-demand-media-download-v2.md) | Approve with changes (2 blocking, 7 major, 9 minor, 7 questions) |
 | 2026-11-01 | On-demand media download (ADR 0050 Proposed v3) — v3 (follow-up) — [report](2026-11-01-on-demand-media-download-v3.md) | Approve with changes (0 blocking, 6 major, 11 minor, 6 questions) |
 | 2026-11-04 | On-demand media download (ADR 0050 Proposed v4) — v4 (follow-up) — [report](2026-11-04-on-demand-media-download-v4.md) | Approve with changes (0 blocking, 6 major, 8 minor, 6 questions) |
+| 2026-11-08 | On-demand media download, phase 2 (design v5.2 + phase 2 plan) — v5 (follow-up) — [report](2026-11-08-on-demand-media-download-v5.md) | Approve with changes (0 blocking, 6 major, 6 minor, 7 questions) |
