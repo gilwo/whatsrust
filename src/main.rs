@@ -1644,7 +1644,7 @@ async fn do_force_migrate() -> Result<()> {
             eprintln!("whatsrust --migrate: migration succeeded. Starting daemon normally...");
         }
         Err(e) => {
-            eprintln!("whatsrust --migrate: migration failed again: {e}");
+            eprintln!("whatsrust --migrate: migration failed again: {}", storage::store_error_text(&e));
             std::process::exit(1);
         }
     }

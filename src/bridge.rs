@@ -36,7 +36,7 @@ use whatsapp_rust::download::Downloadable;
 use whatsapp_rust::pair_code::PairCodeOptions;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
-use crate::storage::Store;
+use crate::storage::{bare_user, DuplicateMedia, HistoryMessageRow, HistoryWrite, Store};
 
 const OUTBOUND_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// Max message IDs to remember for dedup (prevents double-processing on reconnect).
@@ -4080,6 +4080,27 @@ fn unsafe_media_location(media: &dyn Downloadable) -> Option<&'static str> {
     }
 }
 
+/// What a media reference keeps that `Downloadable` does not give: from the media message itself.
+#[derive(Clone, Copy, Default)]
+struct MediaExtra<'a> {
+    /// A document's raw file name (`None` for other media and for a document without one).
+    file_name: Option<&'a str>,
+    /// The message's `mediaKeyTimestamp` (when the media key was made, seconds).
+    media_key_timestamp: Option<i64>,
+}
+
+impl MediaExtra<'_> {
+    /// The extras of a media message that has only a `mediaKeyTimestamp`.
+    fn timestamp(media_key_timestamp: Option<i64>) -> Self {
+        Self { file_name: None, media_key_timestamp }
+    }
+}
+
+/// The extras of a document message: its raw file name and `mediaKeyTimestamp`.
+fn document_extra(doc: &wa::message::DocumentMessage) -> MediaExtra<'_> {
+    MediaExtra { file_name: doc.file_name.as_deref(), media_key_timestamp: doc.media_key_timestamp }
+}
+
 /// What `extract_content_inner` does with a media message's bytes.
 enum MediaMode<'a> {
     /// Live ingest: download the bytes (one slot of `dl_semaphore` at a time, size-limited); the
@@ -4087,7 +4108,11 @@ enum MediaMode<'a> {
     Download { client: &'a Arc<Client>, dl_semaphore: &'a Semaphore },
     /// Stored history (ADR 0048): download nothing. The content carries no bytes, and the media
     /// message's reference is kept in `media_ref` for the caller to store (`media_refs`, ADR 0005).
-    Reference { media_ref: Option<crate::storage::MediaRefRow> },
+    ///
+    /// `view_once` is whether the extractor's recursion has entered a view-once wrapper or read a
+    /// view-once flag on the media message itself (`MediaMode::mark_view_once`); it goes into the
+    /// reference, so no separate walk of the message can disagree with the extraction.
+    Reference { media_ref: Option<Box<crate::storage::MediaRefRow>>, view_once: bool },
 }
 
 /// Why a media message gave no content (the two non-content `ExtractResult`s).
@@ -4112,19 +4137,33 @@ impl From<MediaSkip> for ExtractResult {
 impl MediaMode<'_> {
     /// A mode for stored history: no download, the reference is recorded.
     fn reference() -> MediaMode<'static> {
-        MediaMode::Reference { media_ref: None }
+        MediaMode::Reference { media_ref: None, view_once: false }
     }
 
-    /// The reference `Reference` mode recorded for the media message it extracted, if any.
+    /// The reference `Reference` mode recorded for the media message it extracted, if any, with
+    /// `view_once` set from what the recursion saw (`Some(false)` for ordinary media).
     fn into_media_ref(self) -> Option<crate::storage::MediaRefRow> {
         match self {
-            Self::Reference { media_ref } => media_ref,
+            Self::Reference { media_ref, view_once } => {
+                media_ref.map(|m| crate::storage::MediaRefRow { view_once: Some(view_once), ..*m })
+            }
             Self::Download { .. } => None,
         }
     }
 
+    /// Note that the message being extracted is view-once: called by the extractor when it enters
+    /// a view-once wrapper arm and for a media message that carries the flag itself. Only stored
+    /// history records it; live ingest downloads as before.
+    fn mark_view_once(&mut self) {
+        if let Self::Reference { view_once, .. } = self {
+            *view_once = true;
+        }
+    }
+
     /// The bytes of one media message, per mode. `what` names the media type in logs; `mime`,
-    /// `width` and `height` are what the content will carry (kept in the reference).
+    /// `width` and `height` are what the content will carry (kept in the reference), and `extra`
+    /// is what the reference keeps beyond `Downloadable` (a document's raw file name, not the
+    /// `"file"` display fallback, and the message's `mediaKeyTimestamp`).
     ///
     /// `Download`: refuse a file over `MAX_MEDIA_BYTES` (by its `file_length`, before downloading,
     /// and by its size after), refuse a media location that could send the request to another
@@ -4138,6 +4177,7 @@ impl MediaMode<'_> {
         mime: &str,
         width: Option<u32>,
         height: Option<u32>,
+        extra: MediaExtra<'_>,
     ) -> Result<Arc<[u8]>, MediaSkip> {
         match self {
             Self::Download { client, dl_semaphore } => {
@@ -4166,8 +4206,8 @@ impl MediaMode<'_> {
                     }
                 }
             }
-            Self::Reference { media_ref } => {
-                *media_ref = Some(media_ref_row(media, Some(mime), width, height));
+            Self::Reference { media_ref, .. } => {
+                *media_ref = Some(Box::new(media_ref_row(media, Some(mime), width, height, extra)));
                 Ok(Arc::from(Vec::<u8>::new()))
             }
         }
@@ -4175,7 +4215,16 @@ impl MediaMode<'_> {
 }
 
 /// The `media_refs` row that describes one media message (ADR 0005): what a later download needs.
-fn media_ref_row(media: &dyn Downloadable, mime: Option<&str>, width: Option<u32>, height: Option<u32>) -> crate::storage::MediaRefRow {
+///
+/// `remote_jid`, `participant` and `view_once` are the caller's to fill (the message key and the
+/// extraction), so they stay empty here.
+fn media_ref_row(
+    media: &dyn Downloadable,
+    mime: Option<&str>,
+    width: Option<u32>,
+    height: Option<u32>,
+    extra: MediaExtra<'_>,
+) -> crate::storage::MediaRefRow {
     crate::storage::MediaRefRow {
         media_key: media.media_key().map(<[u8]>::to_vec),
         direct_path: media.direct_path().map(str::to_owned),
@@ -4184,6 +4233,10 @@ fn media_ref_row(media: &dyn Downloadable, mime: Option<&str>, width: Option<u32
         file_length: media.file_length().and_then(|n| i64::try_from(n).ok()),
         width: width.map(i64::from),
         height: height.map(i64::from),
+        file_name: extra.file_name.map(str::to_owned),
+        file_sha256: media.file_sha256().map(<[u8]>::to_vec),
+        media_key_timestamp: extra.media_key_timestamp,
+        ..Default::default()
     }
 }
 
@@ -4195,15 +4248,21 @@ fn cached_media_ref(msg: &wa::Message) -> Option<crate::storage::MediaRefRow> {
     let inner = unwrap_to_inner(msg);
     let inner = inner.document_with_caption_message.as_ref().and_then(|d| d.message.as_deref()).unwrap_or(inner);
     if let Some(m) = inner.image_message.as_deref() {
-        Some(media_ref_row(m, m.mimetype.as_deref(), m.width, m.height))
+        let extra = MediaExtra::timestamp(m.media_key_timestamp);
+        Some(media_ref_row(m, m.mimetype.as_deref(), m.width, m.height, extra))
     } else if let Some(m) = inner.video_message.as_deref() {
-        Some(media_ref_row(m, m.mimetype.as_deref(), m.width, m.height))
+        let extra = MediaExtra::timestamp(m.media_key_timestamp);
+        Some(media_ref_row(m, m.mimetype.as_deref(), m.width, m.height, extra))
     } else if let Some(m) = inner.audio_message.as_deref() {
-        Some(media_ref_row(m, m.mimetype.as_deref(), None, None))
+        let extra = MediaExtra::timestamp(m.media_key_timestamp);
+        Some(media_ref_row(m, m.mimetype.as_deref(), None, None, extra))
     } else if let Some(m) = inner.document_message.as_deref() {
-        Some(media_ref_row(m, m.mimetype.as_deref(), None, None))
+        Some(media_ref_row(m, m.mimetype.as_deref(), None, None, document_extra(m)))
     } else {
-        inner.sticker_message.as_deref().map(|m| media_ref_row(m, m.mimetype.as_deref(), m.width, m.height))
+        inner.sticker_message.as_deref().map(|m| {
+            let extra = MediaExtra::timestamp(m.media_key_timestamp);
+            media_ref_row(m, m.mimetype.as_deref(), m.width, m.height, extra)
+        })
     }
 }
 
@@ -4241,7 +4300,10 @@ async fn extract_content_inner(
         let mime = img.mimetype.clone().unwrap_or_else(|| "image/jpeg".to_string());
         let width = img.width;
         let height = img.height;
-        return match media.bytes("image", img.as_ref() as &dyn Downloadable, &mime, width, height).await {
+        if img.view_once == Some(true) {
+            media.mark_view_once();
+        }
+        return match media.bytes("image", img.as_ref() as &dyn Downloadable, &mime, width, height, MediaExtra::timestamp(img.media_key_timestamp)).await {
             Ok(data) => ExtractResult::Content(InboundContent::Image { data, mime, caption, width, height }),
             Err(skip) => skip.into(),
         };
@@ -4255,7 +4317,10 @@ async fn extract_content_inner(
         let width = vid.width;
         let height = vid.height;
         let is_gif = vid.gif_playback.unwrap_or(false);
-        return match media.bytes("video", vid as &dyn Downloadable, &mime, width, height).await {
+        if vid.view_once == Some(true) {
+            media.mark_view_once();
+        }
+        return match media.bytes("video", vid as &dyn Downloadable, &mime, width, height, MediaExtra::timestamp(vid.media_key_timestamp)).await {
             Ok(data) => ExtractResult::Content(InboundContent::Video { data, mime, caption, seconds, width, height, is_gif }),
             Err(skip) => skip.into(),
         };
@@ -4266,7 +4331,10 @@ async fn extract_content_inner(
         let mime = aud.mimetype.clone().unwrap_or_else(|| "audio/ogg".to_string());
         let seconds = aud.seconds;
         let is_voice = aud.ptt.unwrap_or(false);
-        return match media.bytes("audio", aud.as_ref() as &dyn Downloadable, &mime, None, None).await {
+        if aud.view_once == Some(true) {
+            media.mark_view_once();
+        }
+        return match media.bytes("audio", aud.as_ref() as &dyn Downloadable, &mime, None, None, MediaExtra::timestamp(aud.media_key_timestamp)).await {
             Ok(data) => ExtractResult::Content(InboundContent::Audio { data, mime, seconds, is_voice }),
             Err(skip) => skip.into(),
         };
@@ -4278,7 +4346,7 @@ async fn extract_content_inner(
         let filename = doc.file_name.clone().unwrap_or_else(|| "file".to_string());
         let caption = doc.caption.clone();
         let page_count = doc.page_count;
-        return match media.bytes("document", doc.as_ref() as &dyn Downloadable, &mime, None, None).await {
+        return match media.bytes("document", doc.as_ref() as &dyn Downloadable, &mime, None, None, document_extra(doc)).await {
             Ok(data) => ExtractResult::Content(InboundContent::Document { data, mime, filename, caption, page_count }),
             Err(skip) => skip.into(),
         };
@@ -4292,7 +4360,7 @@ async fn extract_content_inner(
                 let filename = doc.file_name.clone().unwrap_or_else(|| "file".to_string());
                 let caption = doc.caption.clone();
                 let page_count = doc.page_count;
-                return match media.bytes("document", doc.as_ref() as &dyn Downloadable, &mime, None, None).await {
+                return match media.bytes("document", doc.as_ref() as &dyn Downloadable, &mime, None, None, document_extra(doc)).await {
                     Ok(data) => ExtractResult::Content(InboundContent::Document { data, mime, filename, caption, page_count }),
                     Err(skip) => skip.into(),
                 };
@@ -4305,7 +4373,7 @@ async fn extract_content_inner(
         let mime = stk.mimetype.clone().unwrap_or_else(|| "image/webp".to_string());
         let is_animated = stk.is_animated.unwrap_or(false);
         let sticker_emoji = stk.accessibility_label.clone();
-        return match media.bytes("sticker", stk.as_ref() as &dyn Downloadable, &mime, stk.width, stk.height).await {
+        return match media.bytes("sticker", stk.as_ref() as &dyn Downloadable, &mime, stk.width, stk.height, MediaExtra::timestamp(stk.media_key_timestamp)).await {
             Ok(data) => ExtractResult::Content(InboundContent::Sticker { data, mime, is_animated, sticker_emoji }),
             Err(skip) => skip.into(),
         };
@@ -4562,19 +4630,22 @@ async fn extract_content_inner(
         }
     }
 
-    // --- View-once wrapper (unwrap and recurse) ---
+    // --- View-once wrapper (unwrap and recurse; stored history notes that the media is view-once) ---
     if let Some(ref vo) = msg.view_once_message {
         if let Some(ref inner) = vo.message {
+            media.mark_view_once();
             return Box::pin(extract_content_inner(inner, media, depth + 1, store, sender_jid)).await;
         }
     }
     if let Some(ref vo2) = msg.view_once_message_v2 {
         if let Some(ref inner) = vo2.message {
+            media.mark_view_once();
             return Box::pin(extract_content_inner(inner, media, depth + 1, store, sender_jid)).await;
         }
     }
     if let Some(ref vo2_ext) = msg.view_once_message_v2_extension {
         if let Some(ref inner) = vo2_ext.message {
+            media.mark_view_once();
             return Box::pin(extract_content_inner(inner, media, depth + 1, store, sender_jid)).await;
         }
     }
@@ -4606,12 +4677,6 @@ pub(crate) async fn resolve_alternate_chat_jid(chat_jid: &str, store: &Store) ->
     None
 }
 
-/// Strip the `@server` suffix and any `:device` qualifier to get the bare user part.
-fn bare_lid_user(jid_str: &str) -> &str {
-    let user_part = jid_str.split('@').next().unwrap_or(jid_str);
-    user_part.split(':').next().unwrap_or(user_part)
-}
-
 /// Resolve a chat JID from @lid to @s.whatsapp.net using the LID mapping table.
 /// Returns the original JID unchanged if it's not an @lid JID or no mapping exists.
 /// Groups (@g.us) and other non-LID JIDs pass through unchanged.
@@ -4631,7 +4696,7 @@ async fn resolve_chat_jid(raw: &str, sender_alt: Option<&wacore_binary::jid::Jid
         }
     }
     // 2. Fall back to DB lookup
-    let bare = bare_lid_user(raw);
+    let bare = bare_user(raw);
     if let Ok(Some(entry)) = store.get_lid_mapping(bare).await {
         return format!("{}@s.whatsapp.net", entry.phone_number);
     }
@@ -4669,7 +4734,7 @@ async fn resolve_live_chat_jid(
         let is_own_lid_chat = chat_raw
             .split_once('@')
             .is_some_and(|(_, server)| server == "lid")
-            && bare_lid_user(chat_raw) == own_lid.user.as_str();
+            && bare_user(chat_raw) == own_lid.user.as_str();
         if is_own_lid_chat {
             return format!("{}@s.whatsapp.net", own_pn.user);
         }
@@ -5254,12 +5319,19 @@ struct PersistCounts {
     duplicates: usize,
     /// Nothing to store: no payload or key, or content the extractor does not handle.
     unstorable: usize,
-    /// The insert itself failed (a database error).
+    /// The write failed (a database error); a message and its reference are written in one
+    /// transaction, so a failed reference drops its message too and counts here.
     failed: usize,
     /// `media_refs` rows written, for new media messages (ADR 0005).
     media_refs: usize,
-    /// Media references that could not be written (the message row itself was stored).
-    media_refs_failed: usize,
+    /// Sub-count of `duplicates`: the stored media reference got a NULL column filled (or a
+    /// `view_once` raised).
+    media_refs_filled: usize,
+    /// Sub-count of `duplicates`: a missing media reference was created (the stored row is not live).
+    media_refs_created: usize,
+    /// Sub-count of `duplicates`: a media duplicate whose chat, sender, `from_me` or kind differs
+    /// from the stored message; nothing was changed.
+    duplicate_mismatch: usize,
 }
 
 impl PersistCounts {
@@ -5269,16 +5341,19 @@ impl PersistCounts {
         self.unstorable += other.unstorable;
         self.failed += other.failed;
         self.media_refs += other.media_refs;
-        self.media_refs_failed += other.media_refs_failed;
+        self.media_refs_filled += other.media_refs_filled;
+        self.media_refs_created += other.media_refs_created;
+        self.duplicate_mismatch += other.duplicate_mismatch;
     }
 }
 
 /// Store `messages` as rows of `chat_jid`: extract the content (the single extraction path,
 /// ADR 0014) without downloading any media, classify `embed_status` like live ingest,
-/// `INSERT OR IGNORE` by message id, write the `media_refs` row of a new media message, and wake
-/// the embedding-drain worker for each new row left 'pending' (M2.3.2). Used by the backfill sink
-/// (`source` = backfill) and for unmatched history-sync chunks. Never fails: a message that
-/// cannot be stored is counted, not raised.
+/// `INSERT OR IGNORE` by message id, write the `media_refs` row of a new media message in the same
+/// transaction (`Store::insert_history_message`; a duplicate fills or creates a reference by the
+/// duplicate rule), and wake the embedding-drain worker for each new row left 'pending' (M2.3.2).
+/// Used by the backfill sink (`source` = backfill) and for unmatched history-sync chunks. Never
+/// fails: a message that cannot be stored is counted, not raised.
 ///
 /// `dm_alt` is the phone JID of a `@lid` direct chat (the conversation's `pnJid`): it resolves
 /// the sender of a DM message like the chat itself, as live messages use `sender_alt`.
@@ -5337,7 +5412,13 @@ async fn persist_history_messages(
         let mut media = MediaMode::reference();
         match extract_content_inner(msg, &mut media, 0, store, Some(sender_jid)).await {
             ExtractResult::Content(c) => {
-                let media_ref = media.into_media_ref();
+                // The reference carries the key's raw JIDs (as the phone sent them, LID or phone
+                // form) and, from the extraction, whether the media is view-once.
+                let media_ref = media.into_media_ref().map(|m| crate::storage::MediaRefRow {
+                    remote_jid: web.key.remote_jid.clone(),
+                    participant: web.key.participant.clone(),
+                    ..m
+                });
                 // The label shows the size the proto gives (`file_length`), as a download would
                 // have measured it.
                 let media_len = media_ref.as_ref().and_then(|m| u64::try_from(m.file_length?).ok());
@@ -5348,38 +5429,58 @@ async fn persist_history_messages(
                 // Option C / backlog-tolerance rationale (ADR 0016/0038). Stored history rows get
                 // exactly the same classification discipline as live-ingested ones.
                 let embed_status = c.embed_status();
-                match store
-                    .insert_message_if_new(
-                        chat_jid, sender_jid, msg_id, c.kind(), body_opt, ts_secs, from_me, source, embed_status,
-                    )
-                    .await
-                {
-                    Ok(true) => {
+                let row = HistoryMessageRow {
+                    chat_jid: chat_jid.to_owned(),
+                    sender_jid: sender_jid.to_owned(),
+                    message_id: msg_id.to_owned(),
+                    content_kind: c.kind().to_owned(),
+                    body_text: body_opt.map(str::to_owned),
+                    timestamp: ts_secs,
+                    from_me,
+                    source: source.to_owned(),
+                    embed_status: embed_status.to_owned(),
+                };
+                match store.insert_history_message(row, media_ref).await {
+                    Ok(HistoryWrite::Stored { media_ref }) => {
                         counts.stored += 1;
+                        counts.media_refs += usize::from(media_ref);
                         // M2.3.2: fire embed_notify when a stored row lands 'pending'.
                         if embed_status == "pending" {
                             embed_notify.notify_one();
                         }
-                        if let Some(media_ref) = media_ref {
-                            match store.insert_media_ref(msg_id, &media_ref).await {
-                                Ok(_) => counts.media_refs += 1,
-                                Err(e) => {
-                                    counts.media_refs_failed += 1;
-                                    debug!(error = %e, "history persist: insert_media_ref failed");
-                                }
-                            }
+                    }
+                    Ok(HistoryWrite::Duplicate(duplicate)) => {
+                        counts.duplicates += 1;
+                        match duplicate {
+                            DuplicateMedia::Filled => counts.media_refs_filled += 1,
+                            DuplicateMedia::Created => counts.media_refs_created += 1,
+                            DuplicateMedia::Mismatch => counts.duplicate_mismatch += 1,
+                            DuplicateMedia::NoMedia | DuplicateMedia::Unchanged | DuplicateMedia::LiveRow => {}
                         }
                     }
-                    Ok(false) => counts.duplicates += 1,
                     Err(e) => {
                         counts.failed += 1;
-                        debug!(error = %e, "history persist: insert_message failed");
+                        debug!(error = %crate::storage::store_error_text(&e), "history persist: insert_history_message failed");
                     }
                 }
             }
             // Unhandled — skip; not an error for the batch
             _ => counts.unstorable += 1,
         }
+    }
+
+    if counts.failed > 0 {
+        // A message and its reference are written in one transaction, so a failed reference drops
+        // its message: report it for the backfill path too (counts only, no ids).
+        warn!(failed = counts.failed, "history persist: some messages could not be written");
+    }
+    if counts.duplicate_mismatch > 0 {
+        // Message ids are sender-chosen: a colliding id must never fill or create another
+        // message's reference. No JIDs or ids in the log.
+        warn!(
+            duplicate_mismatch = counts.duplicate_mismatch,
+            "history persist: media duplicates that do not match the stored message (chat, sender, from_me or kind) were left unchanged",
+        );
     }
 
     counts
@@ -5532,13 +5633,15 @@ async fn store_unmatched_history(
         duplicates = stored.counts.duplicates,
         unstorable = stored.counts.unstorable,
         media_refs = stored.counts.media_refs,
+        media_refs_filled = stored.counts.media_refs_filled,
+        media_refs_created = stored.counts.media_refs_created,
+        duplicate_mismatch = stored.counts.duplicate_mismatch,
         "stored a history sync chunk",
     );
-    if stored.counts.failed > 0 || stored.counts.media_refs_failed > 0 {
+    if stored.counts.failed > 0 {
         warn!(
             sync_type,
             failed = stored.counts.failed,
-            media_refs_failed = stored.counts.media_refs_failed,
             "some messages of a history sync chunk could not be written",
         );
     }
@@ -7840,6 +7943,7 @@ mod history_storage_tests {
                 file_sha256: Some(vec![5, 5]),
                 width: Some(640),
                 height: Some(480),
+                media_key_timestamp: Some(1_700_000_001),
                 ..Default::default()
             })),
             ..Default::default()
@@ -7855,6 +7959,7 @@ mod history_storage_tests {
                 media_key: Some(vec![6, 6]),
                 direct_path: Some("/v/t62/doc".to_owned()),
                 file_enc_sha256: Some(vec![4]),
+                media_key_timestamp: Some(1_700_000_002),
                 ..Default::default()
             })),
             ..Default::default()
@@ -7932,7 +8037,8 @@ mod history_storage_tests {
         let conn = rusqlite::Connection::open(dir.join("wa.db")).unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT message_id, media_key, direct_path, file_enc_sha256, mimetype, file_length, width, height, hydrated_path
+                "SELECT message_id, media_key, direct_path, file_enc_sha256, mimetype, file_length, width, height,
+                        file_name, file_sha256, remote_jid, participant, view_once, media_key_timestamp, hydrated_path
                  FROM media_refs ORDER BY message_id",
             )
             .unwrap();
@@ -7947,8 +8053,14 @@ mod history_storage_tests {
                     file_length: r.get(5)?,
                     width: r.get(6)?,
                     height: r.get(7)?,
+                    file_name: r.get(8)?,
+                    file_sha256: r.get(9)?,
+                    remote_jid: r.get(10)?,
+                    participant: r.get(11)?,
+                    view_once: r.get(12)?,
+                    media_key_timestamp: r.get(13)?,
                 },
-                r.get(8)?,
+                r.get(14)?,
             ))
         })
         .unwrap()
@@ -8261,6 +8373,12 @@ mod history_storage_tests {
                 file_length: Some(2_048),
                 width: None,
                 height: None,
+                file_name: Some("report.pdf".to_owned()),
+                file_sha256: None,
+                remote_jid: Some(PHONE_CHAT.to_owned()),
+                participant: None,
+                view_once: Some(false),
+                media_key_timestamp: Some(1_700_000_002),
             },
         );
         assert_eq!(refs[1].0, "IMG1");
@@ -8274,6 +8392,12 @@ mod history_storage_tests {
                 file_length: Some(12_345),
                 width: Some(640),
                 height: Some(480),
+                file_name: None,
+                file_sha256: Some(vec![5, 5]),
+                remote_jid: Some(PHONE_CHAT.to_owned()),
+                participant: None,
+                view_once: Some(false),
+                media_key_timestamp: Some(1_700_000_001),
             },
         );
         assert!(refs.iter().all(|r| r.2.is_none()), "no bytes were hydrated");
@@ -8347,6 +8471,193 @@ mod history_storage_tests {
         assert_eq!(stored.counts, PersistCounts { duplicates: 1, ..Default::default() });
         assert_eq!(row(&rows(&dir), "IMG1").source, "live");
         assert!(media_refs(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- phase 2a: the v9 columns written by history ingest -----
+
+    fn future_proof(inner: wa::Message) -> Option<Box<wa::message::FutureProofMessage>> {
+        Some(Box::new(wa::message::FutureProofMessage { message: Some(Box::new(inner)) }))
+    }
+
+    fn video_message(view_once: Option<bool>) -> wa::message::VideoMessage {
+        wa::message::VideoMessage {
+            mimetype: Some("video/mp4".to_owned()),
+            file_length: Some(900),
+            media_key: Some(vec![7]),
+            direct_path: Some("/v/t62/video".to_owned()),
+            file_enc_sha256: Some(vec![8]),
+            view_once,
+            ..Default::default()
+        }
+    }
+
+    fn audio_message(view_once: Option<bool>) -> wa::Message {
+        wa::Message {
+            audio_message: Some(Box::new(wa::message::AudioMessage {
+                mimetype: Some("audio/ogg".to_owned()),
+                file_length: Some(300),
+                media_key: Some(vec![3]),
+                direct_path: Some("/v/t62/audio".to_owned()),
+                file_enc_sha256: Some(vec![2]),
+                view_once,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn image_with_flag(view_once: Option<bool>) -> wa::Message {
+        let mut m = image_message(100, None);
+        m.image_message.as_mut().unwrap().view_once = view_once;
+        m
+    }
+
+    /// `view_once` comes from the extractor's own recursion: each wrapper arm (also below an
+    /// ephemeral wrapper) and the leaf flag of an image, a video, a video note and audio; plain
+    /// media is `Some(false)`.
+    #[tokio::test]
+    async fn test_view_once_is_set_inside_the_extractors_recursion() {
+        let (store, dir) = open_store("view-once");
+        let cases: Vec<(&str, wa::Message, bool)> = vec![
+            ("PLAIN_IMG", image_message(100, None), false),
+            ("PLAIN_DOC", document_message(100, "a.pdf"), false),
+            ("PLAIN_AUD", audio_message(None), false),
+            ("PLAIN_VID", wa::Message { video_message: Some(Box::new(video_message(None))), ..Default::default() }, false),
+            ("EPH_IMG", wa::Message { ephemeral_message: future_proof(image_message(100, None)), ..Default::default() }, false),
+            ("VO_V1", wa::Message { view_once_message: future_proof(image_message(100, None)), ..Default::default() }, true),
+            ("VO_V2", wa::Message { view_once_message_v2: future_proof(image_message(100, None)), ..Default::default() }, true),
+            ("VO_EXT", wa::Message { view_once_message_v2_extension: future_proof(image_message(100, None)), ..Default::default() }, true),
+            (
+                "EPH_VO",
+                wa::Message {
+                    ephemeral_message: future_proof(wa::Message { view_once_message_v2: future_proof(image_message(100, None)), ..Default::default() }),
+                    ..Default::default()
+                },
+                true,
+            ),
+            ("VO_VID", wa::Message { view_once_message: future_proof(wa::Message { video_message: Some(Box::new(video_message(None))), ..Default::default() }), ..Default::default() }, true),
+            ("VO_AUD", wa::Message { view_once_message_v2: future_proof(audio_message(None)), ..Default::default() }, true),
+            ("FLAG_IMG", image_with_flag(Some(true)), true),
+            ("FALSE_IMG", image_with_flag(Some(false)), false),
+            ("FLAG_VID", wa::Message { video_message: Some(Box::new(video_message(Some(true)))), ..Default::default() }, true),
+            ("FLAG_PTV", wa::Message { ptv_message: Some(Box::new(video_message(Some(true)))), ..Default::default() }, true),
+            ("FLAG_AUD", audio_message(Some(true)), true),
+            ("EPH_FLAG", wa::Message { ephemeral_message: future_proof(image_with_flag(Some(true))), ..Default::default() }, true),
+        ];
+        let messages: Vec<_> = cases.iter().enumerate().map(|(i, (id, m, _))| web(id, PHONE_CHAT, false, 1_000 + i as u64, m.clone())).collect();
+        let hs = chunk(vec![conv(PHONE_CHAT, messages)]);
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.counts, PersistCounts { stored: cases.len(), media_refs: cases.len(), ..Default::default() });
+        let refs = media_refs(&dir);
+        for (id, _, expected) in &cases {
+            let found = refs.iter().find(|r| r.0 == *id).unwrap_or_else(|| panic!("no reference for {id}"));
+            assert_eq!(found.1.view_once, Some(*expected), "{id}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The key's `remote_jid` and `participant` are stored as the phone sent them, even when the
+    /// chat resolves to a phone JID; a document without a name keeps `file_name` NULL (not the
+    /// `"file"` display fallback), a named one keeps the raw name.
+    #[tokio::test]
+    async fn test_history_media_refs_keep_the_raw_key_jids_and_the_raw_file_name() {
+        let (store, dir) = open_store("raw-key");
+        let mut in_group = web("GIMG", GROUP_CHAT, false, 1_000, image_message(10, None));
+        in_group.key.participant = Some("100000000000009@lid".to_owned());
+        let mut nameless = document_message(10, "x");
+        nameless.document_message.as_mut().unwrap().file_name = None;
+        let hs = chunk(vec![
+            conv_with_pn(
+                "100000000000001@lid",
+                "15551234567@s.whatsapp.net",
+                vec![web("LIMG", "100000000000001@lid", false, 1_100, image_message(10, None))],
+            ),
+            conv(GROUP_CHAT, vec![in_group]),
+            conv(
+                PHONE_CHAT,
+                vec![
+                    web("DNAMED", PHONE_CHAT, false, 1_200, document_message(10, "Quarterly Report.pdf")),
+                    web("DNONE", PHONE_CHAT, false, 1_300, nameless),
+                ],
+            ),
+        ]);
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.counts, PersistCounts { stored: 4, media_refs: 4, ..Default::default() });
+        assert_eq!(row(&rows(&dir), "LIMG").chat_jid, "15551234567@s.whatsapp.net", "the chat resolves to the phone JID");
+        let refs = media_refs(&dir);
+        let get = |id: &str| refs.iter().find(|r| r.0 == id).map(|r| &r.1).unwrap();
+        assert_eq!(get("LIMG").remote_jid.as_deref(), Some("100000000000001@lid"), "the raw LID, not the resolved chat");
+        assert_eq!(get("LIMG").participant, None);
+        assert_eq!(get("GIMG").remote_jid.as_deref(), Some(GROUP_CHAT));
+        assert_eq!(get("GIMG").participant.as_deref(), Some("100000000000009@lid"));
+        assert_eq!(get("DNAMED").file_name.as_deref(), Some("Quarterly Report.pdf"), "raw, unsanitised");
+        assert_eq!(get("DNONE").file_name, None, "no name: NULL, not the display fallback");
+        assert_eq!(row(&rows(&dir), "DNONE").body_text.as_deref().map(|b| b.starts_with("[doc: file ")), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A re-fetched message fills the NULL columns of a v8 reference (`media_refs_filled`),
+    /// creates a missing reference for a non-live row (`media_refs_created`), and a message with
+    /// a colliding id in another chat changes nothing (`duplicate_mismatch`).
+    #[tokio::test]
+    async fn test_duplicate_history_media_fills_creates_and_counts_mismatches() {
+        let (store, dir) = open_store("dup-rule");
+        // A v8-shaped reference: the six v9 columns are NULL.
+        let v8_ref = crate::storage::MediaRefRow {
+            media_key: Some(vec![1, 2, 3, 4]),
+            direct_path: Some("/v/t62/abc?ccb=11".to_owned()),
+            file_enc_sha256: Some(vec![9, 8, 7]),
+            mimetype: Some("image/png".to_owned()),
+            file_length: Some(500),
+            width: Some(640),
+            height: Some(480),
+            ..Default::default()
+        };
+        store.insert_message(PHONE_CHAT, "15557654321@s.whatsapp.net", "FILL", "image", Some("[image 500B]"), 1_000, false, "bootstrap", "skipped").await.unwrap();
+        store.insert_media_ref("FILL", &v8_ref).await.unwrap();
+        store.insert_message(PHONE_CHAT, "15557654321@s.whatsapp.net", "NOREF", "image", Some("[image 500B]"), 1_100, false, "bootstrap", "skipped").await.unwrap();
+        store.insert_message(PHONE_CHAT, "15557654321@s.whatsapp.net", "OTHERCHAT", "image", Some("[image 500B]"), 1_200, false, "bootstrap", "skipped").await.unwrap();
+        store.insert_media_ref("OTHERCHAT", &v8_ref).await.unwrap();
+        let hs = chunk(vec![conv(
+            PHONE_CHAT,
+            vec![
+                web("FILL", PHONE_CHAT, false, 1_000, image_message(500, None)),
+                web("NOREF", PHONE_CHAT, false, 1_100, image_message(500, None)),
+            ],
+        ), conv(
+            GROUP_CHAT,
+            vec![web("OTHERCHAT", GROUP_CHAT, false, 1_200, image_message(500, None))],
+        )]);
+        let notify = tokio::sync::Notify::new();
+
+        let first = store_chunk(&store, &notify, &hs, SOURCE_BACKFILL).await;
+        let second = store_chunk(&store, &notify, &hs, SOURCE_BACKFILL).await;
+
+        assert_eq!(
+            first.counts,
+            PersistCounts { duplicates: 3, media_refs_filled: 1, media_refs_created: 1, duplicate_mismatch: 1, ..Default::default() },
+        );
+        assert_eq!(
+            second.counts,
+            PersistCounts { duplicates: 3, duplicate_mismatch: 1, ..Default::default() },
+            "the same data again changes nothing (Unchanged); a mismatch counts every time",
+        );
+        let refs = media_refs(&dir);
+        let get = |id: &str| refs.iter().find(|r| r.0 == id).map(|r| &r.1).unwrap();
+        assert_eq!(get("FILL").file_sha256, Some(vec![5, 5]));
+        assert_eq!(get("FILL").remote_jid.as_deref(), Some(PHONE_CHAT));
+        assert_eq!(get("FILL").view_once, Some(false));
+        assert_eq!(get("FILL").media_key_timestamp, None, "the stored encryption tuple is complete, so it is left alone");
+        assert_eq!(get("NOREF").remote_jid.as_deref(), Some(PHONE_CHAT));
+        assert_eq!(get("NOREF").media_key_timestamp, Some(1_700_000_001), "a created reference carries the timestamp");
+        assert_eq!(get("OTHERCHAT"), &v8_ref, "a mismatching duplicate fills nothing");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8527,7 +8838,7 @@ mod history_storage_tests {
     }
 
     #[tokio::test]
-    async fn test_a_media_ref_error_is_counted_and_the_message_row_is_kept() {
+    async fn test_a_media_ref_error_fails_the_message_too_one_transaction() {
         let (store, dir) = open_store("ref-error");
         let hs = chunk(vec![conv(PHONE_CHAT, vec![web("IMG1", PHONE_CHAT, false, 1_000, image_message(5, None))])]);
         {
@@ -8538,8 +8849,25 @@ mod history_storage_tests {
 
         let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
 
-        assert_eq!(stored.counts, PersistCounts { stored: 1, media_refs_failed: 1, ..Default::default() });
-        assert_eq!(rows(&dir).len(), 1);
+        assert_eq!(stored.counts, PersistCounts { failed: 1, ..Default::default() });
+        assert!(rows(&dir).is_empty(), "the message is rolled back with its reference");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_a_duplicate_whose_stored_row_cannot_be_read_is_counted_as_failed() {
+        let (store, dir) = open_store("dup-no-row");
+        let hs = chunk(vec![conv(PHONE_CHAT, vec![web("IMG1", PHONE_CHAT, false, 1_000, image_message(5, None))])]);
+        {
+            // The insert is ignored without a stored row; the duplicate read finds nothing.
+            let conn = rusqlite::Connection::open(dir.join("wa.db")).unwrap();
+            conn.execute_batch("CREATE TRIGGER skip BEFORE INSERT ON messages BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        }
+        let notify = tokio::sync::Notify::new();
+
+        let stored = store_chunk(&store, &notify, &hs, SOURCE_BOOTSTRAP).await;
+
+        assert_eq!(stored.counts, PersistCounts { failed: 1, ..Default::default() });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

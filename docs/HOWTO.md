@@ -1615,7 +1615,8 @@ issues to the repo.
 ## 6. DB migration recovery (`--rollback` / `--migrate`)
 
 **Goal:** recover from a failed schema migration without losing the ability
-to run the old binary against the old data.
+to run the old binary against the old data. (`--rollback` serves **failed**
+migrations only. To go back after a migration that succeeded, see §6c.)
 
 Background (ADR 0028/0029/0030): on startup, whatsrust takes a pre-migration
 backup (`<db>.pre-migration-v<old-version>-<unix-ts>.bak`, e.g.
@@ -1673,6 +1674,86 @@ so you're back to needing `--rollback` or another `--migrate` attempt).
 **Verification:** check the pin state directly if needed —
 `cat whatsapp.db.migration-pin` (JSON) shows `state` (`failed` /
 `rolled_back`) and `pinned_version`.
+
+### 6c. Going back after a healthy v8 → v9 migration
+
+`--rollback` refuses a healthy database (§6a), so a migration that **succeeded** has its own way back. Schema v9 only
+adds six nullable `media_refs` columns and one index, and the v9 step (`ensure_v9_columns`) can run again, so the
+primary way back is an in-place downgrade; restoring the backup is the fallback.
+
+**1. In-place downgrade (primary; loses nothing received since the migration):**
+```bash
+# stop the daemon first (it holds the instance lock); keep whatsapp.db, -wal and -shm together
+sqlite3 whatsapp.db 'PRAGMA user_version = 8'
+# start a v8 build: a versioned binary from `make build`, e.g. target/debug/whatsrust-<version>-<commit>
+# of a commit before the v9 work
+```
+A v8 build refuses a newer database only by the version number. At version 8 it opens the database, finds
+`schema_validated_version` stale and re-validates at its own version; the extra columns, the index and the repaired
+rows are harmless to it. Nothing received since the migration is lost, and the Signal state is untouched. A later v9
+start migrates again (the step adds only what is missing). The own-message repair (below) runs at every v9 start, so
+it also puts right any row the v8 build stored with the old attribution meanwhile; the owner marker
+`metadata.own_attribution_repair` stays.
+
+The ignored test `downgrade_to_v8_with_the_real_v8_binary_then_upgrade_again` proves it: on a synthetic database it
+migrates to v9 with the current code, sets `user_version = 8`, runs a real v8 build's `--migrate` (open, validate, exit;
+it never connects) inside a fresh temp directory with no `.env` and an empty environment, then reopens with the current
+code. It takes the v8 binary from the variable `WHATSRUST_V8_BIN` (no default path). Build one with a versioned
+`make build` on `main`, or on a commit before the v9 work: use a separate checkout so this tree stays as it is
+(`git worktree add ../whatsrust-v8 <commit>`, then `make build` there; it needs its own build directory, several GB,
+unless you share one with `CARGO_TARGET_DIR`). The binary is `target/debug/whatsrust-<version>-<commit>[-dirty]`, and
+`whatsrust --version` prints the same string.
+```bash
+WHATSRUST_V8_BIN=/path/to/whatsrust-<version>-<commit> cargo test --lib downgrade_to_v8 -- --ignored --nocapture
+```
+The budget test (500,000 messages, 50,000 rows to repair, 5,000 distinct foreign history senders; migration plus
+repair must stay under 30 s) is `cargo test --lib budget_500k -- --ignored --nocapture`; it prints the time, the
+write-ahead log peak and the time of a start that finds nothing to repair.
+
+**2. Fallback: restore the backup.** The migration wrote `whatsapp.db.pre-migration-v8-<unix-ts>.bak` before it
+changed anything (mode 600). Stop the daemon; move the v9 `whatsapp.db`, `whatsapp.db-wal` and `whatsapp.db-shm`
+aside (do not delete them yet); copy the newest `.bak` to `whatsapp.db`; make sure no `-wal`/`-shm` file is left next to
+it (a stale WAL replayed onto the restored file would corrupt it); remove a stray `whatsapp.db.migration-pin`; start the
+v8 build. This loses everything received since the migration and the Signal state (sessions and keys) since the
+backup, so WhatsApp may ask for a re-pair.
+
+Rules:
+- Keep the v8 `.bak` until the media engine (phases 4 to 6) is validated.
+- After a **validation** failure the next start says `migration pin inconsistent` (the migration committed, the pin
+  says failed): use `--rollback` or `--migrate` (§6a, §6b); do not delete the pin by hand.
+- Never let a copied paired database connect to WhatsApp (two daemons with the same keys log each other out). Work
+  on copies only with the daemon, the API and the network off for that copy.
+- **The own-message repair runs at every start that knows the account's number** (live `from_me`, the own sender
+  of history rows, the fetch cursors' anchor flag), not once: it is idempotent and changes rows only when
+  misattributed ones exist (after a v8 window, once a LID mapping is learned, after a failed lookup). Pair before
+  upgrading when you can; an unpaired profile is repaired at its first start after pairing. Details:
+  - It classifies first, reading only. A start with nothing to change takes no backup and writes nothing, except
+    the marker on the very first run and the deletion of an old failure note (about 0.3 s on 500,000 messages).
+  - If rows will change and this start did not just take the pre-migration backup, it first writes
+    `whatsapp.db.pre-repair-<unix-ts>.bak` (mode 600; created private before SQLite writes into it) next to the
+    database, and keeps only the newest 3 of these files. If that backup fails, the repair is skipped for this
+    start (logged) and tried again at the next one. `--rollback` ignores these files; delete them when you no
+    longer need them.
+  - The repair is one transaction with a post-condition (no live row of the owner with `from_me = 0`, no history
+    own row naming a foreign sender). If anything fails (the first scan too) it rolls back, logs a warning, and
+    writes the note `metadata.own_attribution_repair_failed` = `<epoch> <backup file name, or -> <reason>` (no
+    JIDs or numbers). **For the next 24 hours the repair is not tried again** (one debug line, no new backup, so
+    a persistent failure does not take a backup per start); after that it is retried once per day, reusing the
+    backup the failed attempt took, and a successful run deletes the note. Read the note with
+    `sqlite3 whatsapp.db "SELECT value FROM metadata WHERE key = 'own_attribution_repair_failed'"`.
+  - The marker `own_attribution_repair` = `<number> <first-run epoch>` only guards against a re-pair: a database
+    kept across a re-pair to **another** number is not repaired (the owner's identity changed), with one loud
+    warning at the first start that sees it, noted in `metadata.own_attribution_repair_skipped`
+    (`<current number> <epoch>`; another current number warns again); later starts log it at debug level. One
+    re-paired to another number before its first v9 start is repaired as if the current number had always been the
+    owner's. The logs never contain a number or a JID.
+  - On a database with 500,000 messages and 50,000 rows to repair, 5,000 distinct foreign senders, the repair
+    takes about 3 to 4 s (debug build; measured 2.6 to 3.6 s); the whole migrating start (backup, validation,
+    repair) about 8 to 9 s.
+- If a v9 database is one column short (a build in between, or an earlier validation failure), every start adds
+  what is missing (`ensure_v9_columns`, six column lookups when all is there), whatever `schema_validated_version`
+  says. `whatsrust --migrate` always re-validates; if that fails it prints the cause and writes the same `failed`
+  pin as a failed migration (pinned 8, blocked 9), so `whatsrust --rollback` stays available (§6a).
 
 ### 6d. Database shape report (before a schema upgrade)
 

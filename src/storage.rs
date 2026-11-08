@@ -40,11 +40,52 @@ fn db_err(e: rusqlite::Error) -> StoreError {
     StoreError::Database(Box::new(e))
 }
 
+/// A `StoreError` with its source chain. `StoreError::Database` displays only "database operation
+/// error" and keeps the detail in its source, so a message or a pin reason built from
+/// `e.to_string()` would lose the cause of a failed migration or validation.
+pub(crate) fn store_error_text(e: &StoreError) -> String {
+    let mut text = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(inner) = source {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        source = inner.source();
+    }
+    text
+}
+
 // ---------------------------------------------------------------------------
 // Schema — 15 tables, no device_id column (single-device design)
 // ---------------------------------------------------------------------------
 
-const SCHEMA: &str = "
+/// The text-sync trigger of `messages_fts`, as one literal shared by `SCHEMA` and the own-message
+/// repair, which drops the trigger for its updates (the text does not change) and re-creates it
+/// from this very text (`repair_own_attribution`).
+macro_rules! messages_fts_update_trigger_sql {
+    () => {
+        "CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, body_text) VALUES('delete', old.id, old.body_text);
+    INSERT INTO messages_fts(rowid, body_text) VALUES (new.id, new.body_text);
+END;"
+    };
+}
+
+/// [`messages_fts_update_trigger_sql!`] as a constant, for the repair.
+const MESSAGES_FTS_UPDATE_TRIGGER: &str = messages_fts_update_trigger_sql!();
+
+/// The partial index behind the revoke-label lookup (design v5.3 §4, §5.5): a revoke row is
+/// stored with the label `[deleted <target id>]` as its text. An optional performance structure
+/// (ADR 0031, like `idx_messages_embed_status`): `SCHEMA` creates it on every start and the v9
+/// step creates it too, from this one literal.
+macro_rules! revoke_label_index_sql {
+    () => {
+        "CREATE INDEX IF NOT EXISTS idx_messages_revoke_label ON messages(body_text) WHERE content_kind = 'revoke';"
+    };
+}
+
+const REVOKE_LABEL_INDEX_SQL: &str = revoke_label_index_sql!();
+
+const SCHEMA: &str = concat!("
 -- Device identity & crypto keys
 CREATE TABLE IF NOT EXISTS device (
     id INTEGER PRIMARY KEY,
@@ -233,7 +274,14 @@ CREATE TABLE IF NOT EXISTS media_refs (
     file_length     INTEGER,
     width           INTEGER,
     height          INTEGER,
-    hydrated_path   TEXT
+    hydrated_path   TEXT,
+    -- v9 (media download phase 2): history rows only; NULL on rows stored before v9.
+    file_name       TEXT,    -- a document's original file name, as sent
+    file_sha256     BLOB,    -- the plaintext hash of the file
+    remote_jid      TEXT,    -- the message key's remote_jid as the phone sent it (LID or phone)
+    participant     TEXT,    -- the message key's participant as the phone sent it
+    view_once       INTEGER, -- 1 for view-once media, 0 for other media, NULL when unknown
+    media_key_timestamp INTEGER -- the message's mediaKeyTimestamp (seconds; when the key was made)
 );
 
 -- Vectors (multi-model retention; ADR 0017)
@@ -287,10 +335,7 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts(rowid, body_text) VALUES (new.id, new.body_text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, body_text) VALUES('delete', old.id, old.body_text);
-    INSERT INTO messages_fts(rowid, body_text) VALUES (new.id, new.body_text);
-END;
+", messages_fts_update_trigger_sql!(), "
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, body_text) VALUES('delete', old.id, old.body_text);
@@ -307,9 +352,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(message_id);
 -- fetch_pending_embeddings (M2.2.4) anti-join and the M2.3.8 circuit-breaker count, both of which
 -- filter embed_status='pending' over an indefinitely-retained (ADR 0012) table.
 CREATE INDEX IF NOT EXISTS idx_messages_embed_status ON messages(embed_status, id);
-";
+-- v9 (ADR 0031 non-versioned performance index; the v9 step creates it too): the revoke-label lookup.
+", revoke_label_index_sql!(), "
+");
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 #[cfg(unix)]
 fn secure_backup_permissions(path: &Path) -> Result<()> {
@@ -391,6 +438,18 @@ fn write_migration_pin(db_path: &Path, pin: &MigrationPin) -> Result<()> {
     Ok(())
 }
 
+/// Write the `failed` pin of a migration (or forced re-validation) to the current schema version,
+/// best effort: it halts the next start and keeps `--rollback` available.
+fn write_failed_migration_pin(db_path: &Path, pinned_version: i64, reason: &str) {
+    let _ = write_migration_pin(db_path, &MigrationPin {
+        state: "failed".to_owned(),
+        pinned_version,
+        blocked_target: CURRENT_SCHEMA_VERSION,
+        created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        reason: reason.to_owned(),
+    });
+}
+
 /// Remove the migration pin file (used by `--migrate` / newer-binary auto-retry).
 fn clear_migration_pin(db_path: &Path) -> Result<()> {
     let path = pin_path(db_path);
@@ -402,21 +461,39 @@ fn clear_migration_pin(db_path: &Path) -> Result<()> {
 /// Pre-migration backup via the SQLite Backup API (fail-closed, ADR 0028 requirement B).
 /// Writes to `<name>.bak.tmp` then atomically renames to `<name>.bak`.
 fn backup_db_pre_migration(conn: &Connection, db_path: &Path, from_version: i64) -> Result<PathBuf> {
+    backup_db(conn, db_path, &format!("pre-migration-v{from_version}"))
+}
+
+/// A backup of the open database via the SQLite Backup API, mode 600, named
+/// `<db file name>.<label>-<unix seconds>.bak` next to the database. `--rollback` finds only the
+/// `pre-migration-v*` ones. The temporary file is created empty with mode 600 before SQLite writes
+/// into it, and removed on every error path.
+fn backup_db(conn: &Connection, db_path: &Path, label: &str) -> Result<PathBuf> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let bak_name = format!(
-        "{}.pre-migration-v{}-{}.bak",
+        "{}.{label}-{ts}.bak",
         db_path.file_name().and_then(|n| n.to_str()).unwrap_or("whatsapp.db"),
-        from_version,
-        ts
     );
     let bak_path = db_path.with_file_name(&bak_name);
     let tmp_path = bak_path.with_extension("bak.tmp");
 
+    let written = write_backup(conn, &tmp_path, &bak_path);
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        let mut journal = tmp_path.clone().into_os_string();
+        journal.push("-journal");
+        let _ = std::fs::remove_file(journal);
+    }
+    written.map(|()| bak_path)
+}
+
+fn write_backup(conn: &Connection, tmp_path: &Path, bak_path: &Path) -> Result<()> {
+    create_private_file(tmp_path)?;
     {
-        let mut dest = Connection::open(&tmp_path)
+        let mut dest = Connection::open(tmp_path)
             .map_err(|e| StoreError::Database(format!("open backup tmp {}: {e}", tmp_path.display()).into()))?;
         let backup = rusqlite::backup::Backup::new(conn, &mut dest)
             .map_err(|e| StoreError::Database(format!("create backup: {e}").into()))?;
@@ -424,11 +501,68 @@ fn backup_db_pre_migration(conn: &Connection, db_path: &Path, from_version: i64)
             .run_to_completion(100, std::time::Duration::from_millis(10), None)
             .map_err(|e| StoreError::Database(format!("backup run: {e}").into()))?;
     }
-
-    std::fs::rename(&tmp_path, &bak_path)
+    std::fs::rename(tmp_path, bak_path)
         .map_err(|e| StoreError::Database(format!("rename backup: {e}").into()))?;
-    secure_backup_permissions(&bak_path)?;
-    Ok(bak_path)
+    secure_backup_permissions(bak_path)
+}
+
+/// Create `path` empty with mode 600 (a stale file of an earlier crash is replaced), so the backup
+/// is never readable by others while SQLite writes into it.
+fn create_private_file(path: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .map(|_| ())
+        .map_err(|e| StoreError::Database(format!("create backup tmp {}: {e}", path.display()).into()))
+}
+
+/// The directory a database file lives in (`.` for a bare file name such as `whatsapp.db`, whose
+/// `parent()` is the empty path, which `read_dir` rejects).
+fn db_dir(db_path: &Path) -> &Path {
+    match db_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// How many `<db>.pre-repair-<ts>.bak` files are kept.
+const PRE_REPAIR_BACKUPS_KEPT: usize = 3;
+
+/// The `<db>.pre-repair-<ts>.bak` files next to `db_path`, oldest first (the timestamps have equal
+/// width, so the names sort by time).
+fn pre_repair_backups(db_path: &Path) -> Vec<PathBuf> {
+    let Some(stem) = db_path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{stem}.pre-repair-");
+    let Ok(entries) = std::fs::read_dir(db_dir(db_path)) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".bak"))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Delete all but the newest `keep` pre-repair backups.
+fn prune_pre_repair_backups(db_path: &Path, keep: usize) {
+    let found = pre_repair_backups(db_path);
+    let excess = found.len().saturating_sub(keep);
+    for old in found.into_iter().take(excess) {
+        let _ = std::fs::remove_file(old);
+    }
 }
 
 /// One-time FTS5 probe: create a temp virtual table to confirm FTS5 is compiled in.
@@ -479,8 +613,17 @@ fn validate_migration_post_commit(conn: &Connection) -> Result<()> {
         }
     }
 
+    // Expected columns on media_refs (v9)
+    for (col, _) in MEDIA_REF_V9_COLUMNS {
+        if !column_exists(conn, "media_refs", col)? {
+            return Err(StoreError::Database(format!(
+                "migration validation: media_refs.{col} column missing"
+            ).into()));
+        }
+    }
+
     // Expected indexes
-    for idx in &["idx_messages_chat_ts", "idx_messages_msg_id"] {
+    for idx in &["idx_messages_chat_ts", "idx_messages_msg_id", "idx_messages_revoke_label"] {
         let has_idx: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
             params![idx],
@@ -509,39 +652,49 @@ fn validate_migration_post_commit(conn: &Connection) -> Result<()> {
 
     // --- V3 smoke probes ---
 
-    // (a) FTS trigger sync: INSERT test row → FTS finds it → DELETE → gone
+    // The probes write test rows; they run in one transaction that is rolled back at the end (or by
+    // an early return), so they never leave a row, a vector or an index entry behind.
+    let probe = conn.unchecked_transaction().map_err(db_err)?;
+
+    // (a) FTS trigger sync: INSERT test row → FTS finds it → UPDATE its text → FTS follows
+    //     (old text gone, new text found) → DELETE → gone
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-    conn.execute(
+    probe.execute(
         "INSERT INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at)
          VALUES ('__validate__@s.whatsapp.net', '__validate__@s.whatsapp.net', '__validate_fts_probe__',
                  'text', 'xyzvalidationprobexyz', ?1, ?1)",
         params![ts],
     ).map_err(|e| StoreError::Database(format!("migration validation: FTS probe INSERT: {e}").into()))?;
 
-    let found: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'xyzvalidationprobexyz'",
-        [],
-        |r| r.get(0),
-    ).map_err(|e| StoreError::Database(format!("migration validation: FTS MATCH: {e}").into()))?;
+    let match_count = |token: &str, what: &str| -> Result<i64> {
+        probe
+            .query_row("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1", params![token], |r| r.get(0))
+            .map_err(|e| StoreError::Database(format!("migration validation: FTS MATCH{what}: {e}").into()))
+    };
 
-    conn.execute(
-        "DELETE FROM messages WHERE message_id = '__validate_fts_probe__'",
-        [],
-    ).map_err(|e| StoreError::Database(format!("migration validation: FTS probe DELETE: {e}").into()))?;
-
-    if found == 0 {
+    if match_count("xyzvalidationprobexyz", "")? == 0 {
         return Err(StoreError::Database(
             "migration validation: FTS trigger not wired — INSERT did not appear in messages_fts".into()
         ));
     }
 
-    // Check deleted row is gone from FTS
-    let after_delete: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'xyzvalidationprobexyz'",
+    // The update-trigger probe (v9): the text changes, the index must follow.
+    probe.execute(
+        "UPDATE messages SET body_text = 'xyzvalidationupdatedxyz' WHERE message_id = '__validate_fts_probe__'",
         [],
-        |r| r.get(0),
-    ).map_err(|e| StoreError::Database(format!("migration validation: FTS MATCH after delete: {e}").into()))?;
-    if after_delete != 0 {
+    ).map_err(|e| StoreError::Database(format!("migration validation: FTS probe UPDATE: {e}").into()))?;
+    let old_after_update = match_count("xyzvalidationprobexyz", " after update")?;
+    let new_after_update = match_count("xyzvalidationupdatedxyz", " after update")?;
+    if old_after_update != 0 || new_after_update != 1 {
+        return Err(StoreError::Database(
+            "migration validation: FTS update trigger not wired — an UPDATE of body_text did not reach messages_fts".into()
+        ));
+    }
+
+    probe.execute("DELETE FROM messages WHERE message_id = '__validate_fts_probe__'", [])
+        .map_err(|e| StoreError::Database(format!("migration validation: FTS probe DELETE: {e}").into()))?;
+    // Check deleted row is gone from FTS
+    if match_count("xyzvalidationupdatedxyz", " after delete")? != 0 {
         return Err(StoreError::Database(
             "migration validation: FTS delete trigger not wired — deleted row still found in messages_fts".into()
         ));
@@ -549,22 +702,16 @@ fn validate_migration_post_commit(conn: &Connection) -> Result<()> {
 
     // (b) Embeddings BLOB roundtrip
     let blob_data: Vec<u8> = vec![0x01, 0x02, 0x03, 0x04];
-    conn.execute(
+    probe.execute(
         "INSERT INTO embeddings (message_id, model_id, dim, vec) VALUES ('__validate_emb__', '__probe__', 4, ?1)",
         params![blob_data],
     ).map_err(|e| StoreError::Database(format!("migration validation: embeddings INSERT: {e}").into()))?;
 
-    let retrieved: Vec<u8> = conn.query_row(
+    let retrieved: Vec<u8> = probe.query_row(
         "SELECT vec FROM embeddings WHERE message_id = '__validate_emb__' AND model_id = '__probe__'",
         [],
         |r| r.get(0),
     ).map_err(|e| StoreError::Database(format!("migration validation: embeddings SELECT: {e}").into()))?;
-
-    conn.execute(
-        "DELETE FROM embeddings WHERE message_id = '__validate_emb__'",
-        [],
-    ).map_err(|e| StoreError::Database(format!("migration validation: embeddings DELETE: {e}").into()))?;
-
     if retrieved != blob_data {
         return Err(StoreError::Database(
             "migration validation: embeddings BLOB roundtrip mismatch".into()
@@ -572,12 +719,13 @@ fn validate_migration_post_commit(conn: &Connection) -> Result<()> {
     }
 
     // (c) Set-difference drain query shape (LIMIT 0 — just check parse/plan)
-    conn.execute_batch(
+    probe.execute_batch(
         "SELECT m.message_id FROM messages m LEFT JOIN embeddings e
          ON m.message_id = e.message_id AND e.model_id = '__probe__'
          WHERE e.message_id IS NULL LIMIT 0;"
     ).map_err(|e| StoreError::Database(format!("migration validation: drain query: {e}").into()))?;
 
+    probe.rollback().map_err(db_err)?;
     Ok(())
 }
 
@@ -638,10 +786,9 @@ pub fn watchdog_should_alert(current: u64, baseline: u64) -> Option<u32> {
 
 /// Find the newest `<db_path>.pre-migration-v*.bak` sidecar file.
 fn find_newest_bak(db_path: &Path) -> Option<PathBuf> {
-    let dir = db_path.parent()?;
     let stem = db_path.file_name().and_then(|n| n.to_str())?;
     let prefix = format!("{stem}.pre-migration-v");
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(db_dir(db_path))
         .ok()?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -715,8 +862,9 @@ pub fn open_with_mode(path: &Path, mode: MigrationMode) -> Result<Store> {
                         // Consistency check
                         if schema_version >= pin.blocked_target {
                             return Err(StoreError::Database(format!(
-                                "migration pin inconsistent: pin says 'failed' (blocked_target={}) but DB user_version={schema_version} >= blocked_target; \
-                                 pin may be stale — delete {} to clear",
+                                "migration pin inconsistent: pin says 'failed' (blocked_target={}) but DB user_version={schema_version} >= blocked_target \
+                                 (the migration committed and the validation after it failed). Run `whatsrust --rollback` to restore the \
+                                 pre-migration backup, or `whatsrust --migrate` to re-validate and retry; do not delete the pin by hand. Pin file: {}",
                                 pin.blocked_target, pin_path(path).display()
                             ).into()));
                         }
@@ -813,14 +961,8 @@ pub fn open_with_mode(path: &Path, mode: MigrationMode) -> Result<Store> {
 
         // 5. Run migration in TX (existing mechanism, unchanged)
         if let Err(e) = run_schema_migrations(&conn, schema_version) {
-            let reason = e.to_string();
-            let _ = write_migration_pin(path, &MigrationPin {
-                state: "failed".to_owned(),
-                pinned_version: schema_version,
-                blocked_target: CURRENT_SCHEMA_VERSION,
-                created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                reason: reason.clone(),
-            });
+            let reason = store_error_text(&e);
+            write_failed_migration_pin(path, schema_version, &reason);
             return Err(StoreError::Database(format!(
                 "migration failed (DB rolled back to v{schema_version}; circuit-breaker pin written): {reason}"
             ).into()));
@@ -828,14 +970,8 @@ pub fn open_with_mode(path: &Path, mode: MigrationMode) -> Result<Store> {
 
         // 6. Post-commit validation (ADR 0029) — must run AFTER COMMIT
         if let Err(e) = validate_migration_post_commit(&conn) {
-            let reason = e.to_string();
-            let _ = write_migration_pin(path, &MigrationPin {
-                state: "failed".to_owned(),
-                pinned_version: schema_version,
-                blocked_target: CURRENT_SCHEMA_VERSION,
-                created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                reason: reason.clone(),
-            });
+            let reason = store_error_text(&e);
+            write_failed_migration_pin(path, schema_version, &reason);
             return Err(StoreError::Database(format!(
                 "migration validation failed (circuit-breaker pin written): {reason}\n\
                  Run `whatsrust --rollback` to restore from {} or `whatsrust --migrate` to retry.",
@@ -849,12 +985,8 @@ pub fn open_with_mode(path: &Path, mode: MigrationMode) -> Result<Store> {
             params![CURRENT_SCHEMA_VERSION.to_string()],
         ).map_err(db_err)?;
 
-        // 8. Seed watchdog baseline (ADR 0013/0036 — final migration step)
-        seed_watchdog_baseline(&conn, path)?;
-
-        eprintln!(
-            "whatsrust: migration to v{CURRENT_SCHEMA_VERSION} complete; validated; watchdog baseline seeded"
-        );
+        // 8. Seed the watchdog baseline (ADR 0013/0036): after the own-message repair below, so
+        //    the baseline is measured on the database the repair leaves.
     } else {
         // Already at CURRENT: apply SCHEMA idempotently, then check schema_validated_version.
         conn.execute_batch(SCHEMA).map_err(db_err)?;
@@ -864,6 +996,29 @@ pub fn open_with_mode(path: &Path, mode: MigrationMode) -> Result<Store> {
             .map_err(|e| StoreError::Database(format!(
                 "FTS5 startup probe failed — DB may be corrupt or bundled rusqlite feature was removed: {e}"
             ).into()))?;
+
+        // The v9 additions where one is missing, on every start at v9: a DB one column short (a
+        // build in between) would otherwise fail every media insert and lose the messages with
+        // them. Idempotent: six column lookups and an `IF NOT EXISTS` when all is there.
+        let forced = mode == MigrationMode::ForceMigrate;
+        // A failed `--migrate` re-validation writes the same `failed` pin as a failed migration
+        // (pinned at the version before, blocked at this one), so `--rollback` stays available.
+        let startup_failure = |what: &str, e: &StoreError| -> StoreError {
+            let reason = store_error_text(e);
+            let pin_note = if forced {
+                write_failed_migration_pin(path, CURRENT_SCHEMA_VERSION - 1, &reason);
+                " (circuit-breaker pin written)"
+            } else {
+                ""
+            };
+            StoreError::Database(format!(
+                "startup schema re-validation failed{pin_note}: {what}{reason}\n\
+                 Run `whatsrust --rollback` to restore from a backup or `whatsrust --migrate` to retry."
+            ).into())
+        };
+        if let Err(e) = ensure_v9_columns(&conn) {
+            return Err(startup_failure("could not add the v9 columns: ", &e));
+        }
 
         // Re-validate if schema_validated_version is absent or stale (handles Wave-1 DBs)
         let validated_ver: Option<i64> = conn.query_row(
@@ -875,19 +1030,54 @@ pub fn open_with_mode(path: &Path, mode: MigrationMode) -> Result<Store> {
             },
         ).optional().map_err(db_err)?;
 
-        if validated_ver != Some(CURRENT_SCHEMA_VERSION) {
-            // Run validation and persist on success
+        // `--migrate` always re-validates: it is the way to repair a DB whose structure fell behind
+        // (a build in between, or an earlier validation failure).
+        if validated_ver != Some(CURRENT_SCHEMA_VERSION) || forced {
+            // Validate and persist on success.
             if let Err(e) = validate_migration_post_commit(&conn) {
-                return Err(StoreError::Database(format!(
-                    "startup schema re-validation failed: {e}\n\
-                     Run `whatsrust --rollback` to restore from a backup or `whatsrust --migrate` to retry."
-                ).into()));
+                return Err(startup_failure("", &e));
             }
             conn.execute(
                 "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_validated_version', ?1)",
                 params![CURRENT_SCHEMA_VERSION.to_string()],
             ).map_err(db_err)?;
         }
+    }
+
+    // Repair of stored own-message attribution (design v5.3 §4): after a successful open at the
+    // current version, at every start that knows the owner's number. It never stops the start: a
+    // failure rolls back, is logged and noted in `metadata`, and the next start tries again.
+    // `migration_needed`: this open just took the pre-migration backup, which covers the repair.
+    match repair_own_attribution(&conn, path, migration_needed) {
+        Ok(Some(report)) => {
+            eprintln!(
+                "whatsrust: own-message attribution repaired: {} live row(s) now from_me, {} history row(s) \
+                 now sent by the owner, {} fetch cursor flag(s) set, in {} ms",
+                report.live_from_me, report.history_sender, report.cursor_flag, report.elapsed.as_millis()
+            );
+            tracing::info!(
+                live_from_me = report.live_from_me,
+                history_sender = report.history_sender,
+                cursor_flag = report.cursor_flag,
+                elapsed_ms = report.elapsed.as_millis() as u64,
+                "own-message attribution repaired"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let reason = store_error_text(&e);
+            eprintln!("whatsrust: own-message attribution repair failed (rolled back; retried at the next start): {reason}");
+            tracing::warn!(error = %reason, "own-message attribution repair failed (rolled back; retried at the next start)");
+        }
+    }
+
+    if migration_needed {
+        // The last migration step (ADR 0013/0036), after the repair: the baseline is measured on
+        // the database the repair leaves.
+        seed_watchdog_baseline(&conn, path)?;
+        eprintln!(
+            "whatsrust: migration to v{CURRENT_SCHEMA_VERSION} complete; validated; watchdog baseline seeded"
+        );
     }
 
     Ok(Store {
@@ -983,6 +1173,202 @@ pub struct MediaRefRow {
     pub file_length: Option<i64>,
     pub width: Option<i64>,
     pub height: Option<i64>,
+    /// A document's original file name, as sent (schema v9). `None` for a document without one
+    /// and for other media.
+    pub file_name: Option<String>,
+    /// The plaintext hash of the file (schema v9).
+    pub file_sha256: Option<Vec<u8>>,
+    /// The message key's `remote_jid` as the phone sent it, LID or phone form (schema v9).
+    pub remote_jid: Option<String>,
+    /// The message key's `participant` as the phone sent it (schema v9).
+    pub participant: Option<String>,
+    /// Whether the media is view-once (schema v9): `Some(true)` when the message came in a
+    /// view-once wrapper or carries the flag, `Some(false)` for other media, `None` when unknown
+    /// (rows stored before v9).
+    pub view_once: Option<bool>,
+    /// The media message's `mediaKeyTimestamp` (schema v9): when the media key was made, seconds.
+    /// It belongs to the encryption tuple (`media_key`, `direct_path`, `file_enc_sha256`).
+    pub media_key_timestamp: Option<i64>,
+}
+
+/// A history message to store with [`Store::insert_history_message`]: the columns of `messages`
+/// that history ingest sets (`id` and `created_at` are the database's).
+#[derive(Debug, Clone)]
+pub(crate) struct HistoryMessageRow {
+    pub(crate) chat_jid: String,
+    pub(crate) sender_jid: String,
+    pub(crate) message_id: String,
+    pub(crate) content_kind: String,
+    pub(crate) body_text: Option<String>,
+    /// Unix seconds.
+    pub(crate) timestamp: i64,
+    pub(crate) from_me: bool,
+    pub(crate) source: String,
+    pub(crate) embed_status: String,
+}
+
+/// What a duplicate history message did to the media reference of the stored one (design v5.3 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DuplicateMedia {
+    /// The incoming message carries no media reference: nothing to compare or write.
+    NoMedia,
+    /// It matches the stored message and its reference, which already holds every value.
+    Unchanged,
+    /// It matches, and at least one NULL column of the stored reference was filled (or a stored
+    /// `view_once` raised).
+    Filled,
+    /// It matches a stored non-live message that had no reference: one was created.
+    Created,
+    /// It matches a stored live message without a reference: none is created (live media is out
+    /// of scope).
+    LiveRow,
+    /// It does not match the stored message (chat, sender, `from_me` or kind): nothing changed.
+    Mismatch,
+}
+
+/// The result of [`Store::insert_history_message`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryWrite {
+    /// A new message row; `media_ref` is whether its reference row was written too.
+    Stored { media_ref: bool },
+    /// The message was already stored: the row is kept, and the reference follows the duplicate rule.
+    Duplicate(DuplicateMedia),
+}
+
+/// `INSERT OR IGNORE` the reference of `message_id` with every column; `Ok(true)` for a new row.
+fn insert_media_ref_conn(conn: &Connection, message_id: &str, m: &MediaRefRow) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO media_refs
+            (message_id, media_key, direct_path, file_enc_sha256, mimetype, file_length, width, height,
+             file_name, file_sha256, remote_jid, participant, view_once, media_key_timestamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            message_id, m.media_key, m.direct_path, m.file_enc_sha256, m.mimetype, m.file_length, m.width,
+            m.height, m.file_name, m.file_sha256, m.remote_jid, m.participant, m.view_once,
+            m.media_key_timestamp
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// The stored reference of `message_id` (every column but `hydrated_path`).
+fn read_media_ref_conn(conn: &Connection, message_id: &str) -> rusqlite::Result<MediaRefRow> {
+    conn.query_row(
+        "SELECT media_key, direct_path, file_enc_sha256, mimetype, file_length, width, height,
+                file_name, file_sha256, remote_jid, participant, view_once, media_key_timestamp
+         FROM media_refs WHERE message_id = ?1",
+        params![message_id],
+        |r| {
+            Ok(MediaRefRow {
+                media_key: r.get(0)?,
+                direct_path: r.get(1)?,
+                file_enc_sha256: r.get(2)?,
+                mimetype: r.get(3)?,
+                file_length: r.get(4)?,
+                width: r.get(5)?,
+                height: r.get(6)?,
+                file_name: r.get(7)?,
+                file_sha256: r.get(8)?,
+                remote_jid: r.get(9)?,
+                participant: r.get(10)?,
+                view_once: r.get(11)?,
+                media_key_timestamp: r.get(12)?,
+            })
+        },
+    )
+}
+
+/// Write every column of `m` but `hydrated_path` over the stored reference of `message_id`.
+fn write_media_ref_conn(conn: &Connection, message_id: &str, m: &MediaRefRow) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE media_refs SET media_key = ?2, direct_path = ?3, file_enc_sha256 = ?4, mimetype = ?5,
+                file_length = ?6, width = ?7, height = ?8, file_name = ?9, file_sha256 = ?10,
+                remote_jid = ?11, participant = ?12, view_once = ?13, media_key_timestamp = ?14
+         WHERE message_id = ?1",
+        params![
+            message_id, m.media_key, m.direct_path, m.file_enc_sha256, m.mimetype, m.file_length, m.width,
+            m.height, m.file_name, m.file_sha256, m.remote_jid, m.participant, m.view_once,
+            m.media_key_timestamp
+        ],
+    )?;
+    Ok(())
+}
+
+/// The reference a duplicate leaves behind: `stored` filled from `incoming` (the duplicate rule,
+/// design v5.3 §4). Pure; this is the one place for the rules.
+///
+/// - **The encryption tuple** (`media_key`, `direct_path`, `file_enc_sha256`, `media_key_timestamp`)
+///   is filled only all together: when the stored `media_key`, `direct_path` and `file_enc_sha256`
+///   are all NULL **and** the incoming ones are all non-NULL. The incoming `media_key_timestamp`
+///   comes with them (never the stored one: it belonged to another tuple). Otherwise the tuple is
+///   left as it is, so a row never ends with a key from one copy and a path from another, and an
+///   incoming timestamp alone changes nothing.
+/// - **The plaintext properties** (`mimetype`, `file_length`, `width`, `height`, `file_name`,
+///   `file_sha256`, `remote_jid`, `participant`) fill per column, where the stored value is NULL.
+/// - `view_once` is raised, never lowered (a NULL takes any value, 0 is raised to 1).
+fn merge_media_ref(stored: &MediaRefRow, incoming: &MediaRefRow) -> MediaRefRow {
+    fn fill<T: Clone>(slot: &mut Option<T>, from: &Option<T>) {
+        if slot.is_none() {
+            slot.clone_from(from);
+        }
+    }
+    let mut merged = stored.clone();
+    let stored_tuple_empty = stored.media_key.is_none() && stored.direct_path.is_none() && stored.file_enc_sha256.is_none();
+    let incoming_tuple_whole = incoming.media_key.is_some() && incoming.direct_path.is_some() && incoming.file_enc_sha256.is_some();
+    if stored_tuple_empty && incoming_tuple_whole {
+        merged.media_key.clone_from(&incoming.media_key);
+        merged.direct_path.clone_from(&incoming.direct_path);
+        merged.file_enc_sha256.clone_from(&incoming.file_enc_sha256);
+        merged.media_key_timestamp = incoming.media_key_timestamp;
+    }
+    fill(&mut merged.mimetype, &incoming.mimetype);
+    fill(&mut merged.file_length, &incoming.file_length);
+    fill(&mut merged.width, &incoming.width);
+    fill(&mut merged.height, &incoming.height);
+    fill(&mut merged.file_name, &incoming.file_name);
+    fill(&mut merged.file_sha256, &incoming.file_sha256);
+    fill(&mut merged.remote_jid, &incoming.remote_jid);
+    fill(&mut merged.participant, &incoming.participant);
+    merged.view_once = match (stored.view_once, incoming.view_once) {
+        (Some(a), Some(b)) => Some(a || b),
+        (a, b) => a.or(b),
+    };
+    merged
+}
+
+/// The duplicate rule for a history message `row` that carries the reference `media`, whose
+/// message id is already stored (design v5.3 §4). Message ids are sender-chosen, so a reference is
+/// filled or created only when the incoming message matches the stored one: the same chat (a 1:1
+/// chat as the same user in phone or LID form, a group exactly), the same kind, the same
+/// `from_me`, and the same sender as the same user (two own rows always match).
+fn duplicate_media_conn(conn: &Connection, row: &HistoryMessageRow, media: &MediaRefRow) -> rusqlite::Result<DuplicateMedia> {
+    let (chat_jid, sender_jid, from_me, content_kind, source): (String, String, i64, String, String) = conn.query_row(
+        "SELECT chat_jid, sender_jid, from_me, content_kind, source FROM messages WHERE message_id = ?1",
+        params![row.message_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
+    let stored_from_me = from_me != 0;
+    let matches = same_chat(conn, &chat_jid, &row.chat_jid)
+        && content_kind == row.content_kind
+        && stored_from_me == row.from_me
+        && (stored_from_me || same_user(conn, &sender_jid, &row.sender_jid));
+    if !matches {
+        return Ok(DuplicateMedia::Mismatch);
+    }
+    if let Some(stored_ref) = read_media_ref_conn(conn, &row.message_id).optional()? {
+        // Merge, compare, and write only when the merged reference differs: an exact Filled / Unchanged.
+        let merged = merge_media_ref(&stored_ref, media);
+        if merged == stored_ref {
+            return Ok(DuplicateMedia::Unchanged);
+        }
+        write_media_ref_conn(conn, &row.message_id, &merged)?;
+        return Ok(DuplicateMedia::Filled);
+    }
+    if source == "live" {
+        return Ok(DuplicateMedia::LiveRow);
+    }
+    insert_media_ref_conn(conn, &row.message_id, media)?;
+    Ok(DuplicateMedia::Created)
 }
 
 /// A stored media message as the dev-only media probe reads it: the message's addressing plus its
@@ -1022,6 +1408,7 @@ fn probe_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProbeMediaRow> {
             file_length: r.get(10)?,
             width: r.get(11)?,
             height: r.get(12)?,
+            ..MediaRefRow::default()
         },
     })
 }
@@ -1528,19 +1915,57 @@ impl Store {
 
     /// Store the media reference of message `message_id` (ADR 0005, `media_refs`). `Ok(true)` for
     /// a new row, `Ok(false)` when the message already has one (the existing row is kept).
+    ///
+    /// Library API; the daemon writes references with [`insert_history_message`](Self::insert_history_message),
+    /// which does it in the message's transaction.
+    #[allow(dead_code)] // unused in the binary crate, public for library consumers
     pub async fn insert_media_ref(&self, message_id: &str, media: &MediaRefRow) -> Result<bool> {
         let mid = message_id.to_owned();
         let m = media.clone();
+        self.run(move |c| insert_media_ref_conn(c, &mid, &m).map_err(db_err)).await
+    }
+
+    /// Store one history message and its media reference in **one transaction**: a failed
+    /// reference insert rolls the message back too (the caller counts the message as failed).
+    ///
+    /// A new message gets its row and, when `media` is given, its reference with every column
+    /// (`INSERT OR IGNORE`, like [`insert_message_if_new`](Self::insert_message_if_new)). A message
+    /// id that is already stored keeps its row, and `media` follows the duplicate rule
+    /// ([`DuplicateMedia`]): it fills or creates a reference only when the incoming message
+    /// matches the stored one, and never changes `hydrated_path`.
+    pub(crate) async fn insert_history_message(
+        &self,
+        row: HistoryMessageRow,
+        media: Option<MediaRefRow>,
+    ) -> Result<HistoryWrite> {
+        let created = now_secs();
         self.run(move |c| {
-            let changed = c
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            let inserted = tx
                 .execute(
-                    "INSERT OR IGNORE INTO media_refs
-                        (message_id, media_key, direct_path, file_enc_sha256, mimetype, file_length, width, height)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![mid, m.media_key, m.direct_path, m.file_enc_sha256, m.mimetype, m.file_length, m.width, m.height],
+                    "INSERT OR IGNORE INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        row.chat_jid, row.sender_jid, row.message_id, row.content_kind, row.body_text,
+                        row.timestamp, created, row.from_me, row.source, row.embed_status
+                    ],
                 )
-                .map_err(db_err)?;
-            Ok(changed > 0)
+                .map_err(db_err)?
+                > 0;
+            let outcome = if inserted {
+                let media_ref = match &media {
+                    Some(m) => insert_media_ref_conn(&tx, &row.message_id, m).map_err(db_err)?,
+                    None => false,
+                };
+                HistoryWrite::Stored { media_ref }
+            } else {
+                HistoryWrite::Duplicate(match &media {
+                    Some(m) => duplicate_media_conn(&tx, &row, m).map_err(db_err)?,
+                    None => DuplicateMedia::NoMedia,
+                })
+            };
+            tx.commit().map_err(db_err)?;
+            Ok(outcome)
         })
         .await
     }
@@ -2978,6 +3403,13 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
             }
         }
 
+        if from_version < 9 {
+            // v8→v9: media download phase 2 — six nullable `media_refs` columns and the
+            // revoke-label index. Re-runnable (columns only when missing, index IF NOT EXISTS);
+            // no repair and no pass over rows here (the own-message repair runs after the open).
+            ensure_v9_columns(conn)?;
+        }
+
         conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .map_err(db_err)?;
         Ok(())
@@ -3040,6 +3472,514 @@ fn phone_jid_without_device(pn: &str) -> Option<String> {
         return None;
     }
     Some(format!("{number}@s.whatsapp.net"))
+}
+
+/// The LID user of a stored `device.lid` value (`<user>[:<device>]@lid`; a `.` inside the user
+/// stays). `None` for an empty value, an empty user, or any other server.
+fn lid_user_without_device(lid: &str) -> Option<&str> {
+    let (_, server) = lid.split_once('@')?;
+    if server != "lid" {
+        return None;
+    }
+    let user = bare_user(lid);
+    if user.is_empty() {
+        return None;
+    }
+    Some(user)
+}
+
+// ---------------------------------------------------------------------------
+// Identity helpers (media phase 2): who is the owner, who is the same person
+// ---------------------------------------------------------------------------
+
+/// The account's own identity: bare user parts, no server and no device part. Both are `None`
+/// when the profile is not paired (or the `device` row cannot be read).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OwnIdentity {
+    /// The account's phone number.
+    pub(crate) phone: Option<String>,
+    /// The account's LID user.
+    pub(crate) lid: Option<String>,
+}
+
+impl OwnIdentity {
+    /// `<number>@s.whatsapp.net`, or `None` without a known number.
+    pub(crate) fn phone_jid(&self) -> Option<String> {
+        self.phone.as_ref().map(|number| format!("{number}@s.whatsapp.net"))
+    }
+}
+
+/// The account's own identity from the `device` row (`pn` and `lid`, written by
+/// `save_device_to_db` as `Jid::to_string()`). When `device.lid` is empty the LID comes from
+/// `lid_pn_mapping`, by the own number.
+///
+/// Never aborts: any error (no `device` table, a missing column, no row) and an empty or non-phone
+/// `pn` (an unpaired profile) give no identity at all.
+pub(crate) fn read_own_identity(conn: &Connection) -> OwnIdentity {
+    let device = conn
+        .query_row("SELECT pn, lid FROM device WHERE id = 1", [], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })
+        .optional();
+    let Some((pn, lid)): Option<(String, String)> = (match device {
+        Ok(found) => found,
+        Err(e) => {
+            // No table, a missing column: no identity, never an abort.
+            tracing::debug!(error = %e, "own identity: the device row cannot be read; no identity");
+            None
+        }
+    }) else {
+        return OwnIdentity::default();
+    };
+    let Some(phone_jid) = phone_jid_without_device(&pn) else {
+        return OwnIdentity::default();
+    };
+    let phone = bare_user(&phone_jid);
+    let lid = lid_user_without_device(&lid).map(str::to_owned).or_else(|| {
+        conn.query_row(
+            "SELECT lid FROM lid_pn_mapping WHERE phone_number = ?1 ORDER BY updated_at DESC LIMIT 1",
+            params![phone],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|mapped| bare_user(&mapped).to_owned())
+        .filter(|user| !user.is_empty())
+    });
+    OwnIdentity { phone: Some(phone.to_owned()), lid }
+}
+
+/// The user part of a JID or a bare stored value: the part before `@`, then before `:` (the
+/// device). A `.` stays, as wacore keeps it in a LID user.
+pub(crate) fn bare_user(s: &str) -> &str {
+    let user_part = s.split('@').next().unwrap_or(s);
+    user_part.split(':').next().unwrap_or(user_part)
+}
+
+/// The other values from `lid_pn_mapping` that name the same person as the user in `sql`'s bind.
+/// Errors give no twins: a mapping that cannot be read never aborts a comparison.
+fn mapped_twins(conn: &Connection, sql: &str, bare: &str) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare_cached(sql) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(params![bare], |row| row.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| row.ok()).collect()
+}
+
+/// The forms of one person: the bare user of `s` plus its twins from `lid_pn_mapping` (a LID gives
+/// its phone number as `get_lid_mapping` does; a phone number gives all its LIDs). A value without
+/// a server is looked up both ways; a JID of another server (a group, a broadcast list) has no twins.
+fn user_forms(conn: &Connection, s: &str) -> Vec<String> {
+    let bare = bare_user(s);
+    if bare.is_empty() {
+        return Vec::new();
+    }
+    let mut forms = vec![bare.to_owned()];
+    let server = s.split_once('@').map(|(_, server)| server);
+    if matches!(server, None | Some("lid")) {
+        forms.extend(mapped_twins(conn, "SELECT phone_number FROM lid_pn_mapping WHERE lid = ?1", bare));
+    }
+    if matches!(server, None | Some("s.whatsapp.net")) {
+        forms.extend(mapped_twins(conn, "SELECT lid FROM lid_pn_mapping WHERE phone_number = ?1", bare));
+    }
+    forms.sort();
+    forms.dedup();
+    forms
+}
+
+/// Whether `a` and `b` name the same person: the same bare user, or the two forms of one mapping.
+pub(crate) fn same_user(conn: &Connection, a: &str, b: &str) -> bool {
+    let (bare_a, bare_b) = (bare_user(a), bare_user(b));
+    if bare_a.is_empty() || bare_b.is_empty() {
+        return false;
+    }
+    if bare_a == bare_b {
+        return true;
+    }
+    let forms_b = user_forms(conn, b);
+    user_forms(conn, a).iter().any(|form| forms_b.contains(form))
+}
+
+/// Whether `s` is the account itself, in any form: its forms include the own number or the own
+/// LID. The one predicate of the own-message repairs and of the revoke judgement.
+pub(crate) fn is_owner(conn: &Connection, own: &OwnIdentity, s: &str) -> bool {
+    let is_own_form = |form: &str| own.phone.as_deref() == Some(form) || own.lid.as_deref() == Some(form);
+    if own.phone.is_none() && own.lid.is_none() {
+        return false;
+    }
+    is_own_form(bare_user(s)) || user_forms(conn, s).iter().any(|form| is_own_form(form))
+}
+
+/// Whether `a` and `b` are the same chat: groups (`@g.us`) must be equal, a 1:1 chat is the same
+/// when its other person is the same user (phone or LID form).
+pub(crate) fn same_chat(conn: &Connection, a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.ends_with("@g.us") || b.ends_with("@g.us") {
+        return false;
+    }
+    same_user(conn, a, b)
+}
+
+// ---------------------------------------------------------------------------
+// Schema v9 step and the deferred own-message repair (media phase 2a)
+// ---------------------------------------------------------------------------
+
+/// The `media_refs` columns v9 adds, in `SCHEMA` order.
+const MEDIA_REF_V9_COLUMNS: [(&str, &str); 6] = [
+    ("file_name", "TEXT"),
+    ("file_sha256", "BLOB"),
+    ("remote_jid", "TEXT"),
+    ("participant", "TEXT"),
+    ("view_once", "INTEGER"),
+    ("media_key_timestamp", "INTEGER"),
+];
+
+/// Whether `table` has a column named `col`.
+fn column_exists(conn: &Connection, table: &str, col: &str) -> Result<bool> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, col],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    Ok(count > 0)
+}
+
+/// The v9 additions to an existing database: the six `media_refs` columns (each added only when
+/// missing) and the revoke-label index (`IF NOT EXISTS`). Nothing else: no repair, no pass over
+/// the rows. Idempotent (when all is there: six column lookups and an `IF NOT EXISTS`), so it is
+/// the v8 → v9 step (a downgraded DB, `PRAGMA user_version = 8`, migrates again without harm) and
+/// it runs at every other start at v9 too, so a DB one column short (a build in between, whatever
+/// its validated version says) never fails a media insert; `--migrate` also re-validates it.
+fn ensure_v9_columns(conn: &Connection) -> Result<()> {
+    for (col, def) in MEDIA_REF_V9_COLUMNS {
+        if !column_exists(conn, "media_refs", col)? {
+            conn.execute_batch(&format!("ALTER TABLE media_refs ADD COLUMN {col} {def};"))
+                .map_err(db_err)?;
+        }
+    }
+    conn.execute_batch(REVOKE_LABEL_INDEX_SQL).map_err(db_err)
+}
+
+/// `metadata` key of the owner marker: `<bare number> <epoch seconds of the first run>`. It only
+/// records whose number the repair ran for, so a DB kept across a re-pair to another number is
+/// not repaired as if it were the new owner's (the repair itself runs at every start).
+const OWN_ATTRIBUTION_REPAIR_KEY: &str = "own_attribution_repair";
+
+/// `metadata` key of the note that the repair was skipped because of another number:
+/// `<current bare number> <epoch seconds>`. The loud warning is logged once per current number;
+/// later starts log at debug level only.
+const OWN_ATTRIBUTION_REPAIR_SKIPPED_KEY: &str = "own_attribution_repair_skipped";
+
+/// `metadata` key of the note that the last repair failed and was rolled back:
+/// `<epoch seconds> <pre-repair backup file name, or -> <reason>` (no JIDs). A successful run
+/// clears it; until 24 hours have passed the repair is not tried again.
+const OWN_ATTRIBUTION_REPAIR_FAILED_KEY: &str = "own_attribution_repair_failed";
+
+/// The most values bound in one `IN (…)` list of the repair.
+const REPAIR_IN_CHUNK: usize = 500;
+
+/// Distinct senders of live rows stored as received (`from_me = 0`): the owner's among them were
+/// stored wrongly by the old code.
+const LIVE_RECEIVED_SENDERS_SQL: &str =
+    "SELECT DISTINCT sender_jid FROM messages WHERE source = 'live' AND from_me = 0";
+
+/// Distinct senders of history rows stored as own (`from_me = 1`): the old fallback named the
+/// group or the other person as the sender of these.
+const HISTORY_OWN_SENDERS_SQL: &str =
+    "SELECT DISTINCT sender_jid FROM messages WHERE source IN ('bootstrap', 'backfill') AND from_me = 1";
+
+/// Fetch cursors whose anchor message is an own message but whose flag says 0 or NULL.
+const STALE_CURSORS_WHERE: &str = "(oldest_msg_from_me = 0 OR oldest_msg_from_me IS NULL)
+     AND EXISTS (SELECT 1 FROM messages m
+                 WHERE m.message_id = backfill_cursor.oldest_msg_id
+                   AND m.chat_jid = backfill_cursor.chat_jid AND m.from_me = 1)";
+
+/// What one run of [`repair_own_attribution`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RepairReport {
+    /// Live rows of the owner that now have `from_me = 1`.
+    pub(crate) live_from_me: usize,
+    /// History rows of the owner that now name the own phone JID as the sender.
+    pub(crate) history_sender: usize,
+    /// Fetch cursors whose anchor flag is now 1.
+    pub(crate) cursor_flag: usize,
+    /// Time the whole run took (the scan, a backup if one was taken, the transaction).
+    pub(crate) elapsed: std::time::Duration,
+}
+
+/// Distinct values of the first column of `sql`.
+fn distinct_senders(conn: &Connection, sql: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(sql).map_err(db_err)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(db_err)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)
+}
+
+/// `n` numbered placeholders from `?{first}`: `?2, ?3, ?4` for `n = 3`, `first = 2`.
+fn numbered_placeholders(first: usize, n: usize) -> String {
+    (first..first + n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ")
+}
+
+/// Each distinct sender classified once: is it the owner?
+type OwnerCache = std::collections::HashMap<String, bool>;
+
+fn is_owner_cached(conn: &Connection, own: &OwnIdentity, cache: &mut OwnerCache, sender: &str) -> bool {
+    if let Some(known) = cache.get(sender) {
+        return *known;
+    }
+    let owner = is_owner(conn, own, sender);
+    cache.insert(sender.to_owned(), owner);
+    owner
+}
+
+/// What the repair would change, found by reading only.
+struct RepairScan {
+    /// Distinct live senders that are the owner (their `from_me = 0` rows get 1).
+    owner_live: Vec<String>,
+    /// Distinct history-own senders that are not the owner (their rows get the own phone JID).
+    foreign_history: Vec<String>,
+    /// Cursors whose flag is stale.
+    stale_cursors: usize,
+    classified: OwnerCache,
+}
+
+impl RepairScan {
+    fn is_clean(&self) -> bool {
+        self.owner_live.is_empty() && self.foreign_history.is_empty() && self.stale_cursors == 0
+    }
+}
+
+fn scan_for_repair(conn: &Connection, own: &OwnIdentity) -> Result<RepairScan> {
+    let mut classified = OwnerCache::new();
+    let live = distinct_senders(conn, LIVE_RECEIVED_SENDERS_SQL)?;
+    let history = distinct_senders(conn, HISTORY_OWN_SENDERS_SQL)?;
+    let owner_live = live.into_iter().filter(|s| is_owner_cached(conn, own, &mut classified, s)).collect();
+    let foreign_history = history.into_iter().filter(|s| !is_owner_cached(conn, own, &mut classified, s)).collect();
+    let stale_cursors: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM backfill_cursor WHERE {STALE_CURSORS_WHERE}"), [], |r| r.get(0))
+        .map_err(db_err)?;
+    Ok(RepairScan { owner_live, foreign_history, stale_cursors: stale_cursors as usize, classified })
+}
+
+/// The post-condition of the repair, read inside its transaction: no live row with `from_me = 0`
+/// whose sender is the owner, and no history own row whose sender is not the owner, may remain.
+fn check_repair_postcondition(conn: &Connection, own: &OwnIdentity, classified: &mut OwnerCache) -> Result<()> {
+    for sender in distinct_senders(conn, LIVE_RECEIVED_SENDERS_SQL)? {
+        if is_owner_cached(conn, own, classified, &sender) {
+            return Err(StoreError::Database(
+                "repair post-condition: a live row of the owner still has from_me = 0".into(),
+            ));
+        }
+    }
+    for sender in distinct_senders(conn, HISTORY_OWN_SENDERS_SQL)? {
+        if !is_owner_cached(conn, own, classified, &sender) {
+            return Err(StoreError::Database(
+                "repair post-condition: a history own row still names a sender who is not the owner".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn metadata_get(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT value FROM metadata WHERE key = ?1", params![key], |row| row.get(0))
+        .optional()
+        .map_err(db_err)
+}
+
+fn metadata_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)", params![key, value])
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// How long a failed repair is left alone before it is tried again.
+const REPAIR_RETRY_AFTER_SECS: i64 = 24 * 60 * 60;
+
+/// The note `own_attribution_repair_failed`: `<epoch> <backup file name, or -> <reason>`. The
+/// backup is the pre-repair file the failed attempt took, which a retry reuses.
+fn failure_note(backup: Option<&str>, e: &StoreError) -> String {
+    format!("{} {} {}", now_secs(), backup.unwrap_or("-"), store_error_text(e).replace('\n', " "))
+}
+
+/// `(epoch, backup file name)` of a failure note.
+fn parse_failure_note(note: &str) -> Option<(i64, Option<String>)> {
+    let mut parts = note.splitn(3, ' ');
+    let epoch = parts.next()?.parse().ok()?;
+    let backup = parts.next().filter(|name| *name != "-").map(str::to_owned);
+    Some((epoch, backup))
+}
+
+/// The repair of stored own-message attribution (design v5.3 §4): the old code stored live own
+/// messages with `from_me = 0` and named the group or the other person as the sender of history
+/// own messages. It runs at **every** start that knows the owner's number (it is idempotent and
+/// changes rows only when misattributed ones exist: after a v8 window, once a LID mapping is
+/// learned, after a failed lookup).
+///
+/// - No identity (an unpaired profile): nothing happens.
+/// - The marker `own_attribution_repair` (`<bare number> <epoch of the first run>`) guards against
+///   a re-pair: no marker: it is written with the current number; the same number: go on; **another**
+///   number: the repair is skipped (the DB was kept across a re-pair to another number), with a
+///   loud warning once per current number (the note `own_attribution_repair_skipped`), debug later.
+/// - A failed attempt leaves the note `own_attribution_repair_failed`. For 24 hours after it the
+///   repair is skipped (one debug line, no backup); then it is tried again, reusing the backup the
+///   failed attempt took.
+/// - Classify first, reading only: the distinct live senders with `from_me = 0` and the distinct
+///   history-own senders are classified once each (`is_owner`). Nothing to change: done. The only
+///   writes of such a start are the marker (the first time) and clearing an old failure note.
+/// - Rows will change: unless this open just took the pre-migration backup (`backup_taken`) or a
+///   failed attempt left one, a backup `<db>.pre-repair-<ts>.bak` (mode 600) is written first and
+///   all but the newest 3 are deleted. If it fails, the repair is skipped this start and logged.
+/// - One transaction, with the full-text update trigger dropped for the updates (the text does not
+///   change) and re-created from the `SCHEMA` text: live rows whose sender is the owner get
+///   `from_me = 1`; history rows (`bootstrap`, `backfill`) with `from_me = 1` whose sender is not
+///   the owner get the own phone JID; a fetch cursor whose anchor is now an own message gets its
+///   flag set. The updates are set-wise (`IN (…)`, at most [`REPAIR_IN_CHUNK`] values each). Before
+///   the commit the post-condition is checked; if it fails, or anything else does (the scan too),
+///   the transaction rolls back (the trigger with it), the note (time, backup, reason; no JIDs) is
+///   written, and the caller logs. Success clears the note.
+fn repair_own_attribution(conn: &Connection, db_path: &Path, backup_taken: bool) -> Result<Option<RepairReport>> {
+    let own = read_own_identity(conn);
+    let (Some(phone), Some(own_jid)) = (own.phone.as_deref(), own.phone_jid()) else {
+        return Ok(None);
+    };
+
+    match metadata_get(conn, OWN_ATTRIBUTION_REPAIR_KEY)? {
+        None => metadata_set(conn, OWN_ATTRIBUTION_REPAIR_KEY, &format!("{phone} {}", now_secs()))?,
+        Some(marker) if marker.split_whitespace().next() == Some(phone) => {}
+        Some(_) => {
+            // Warn loudly once per current number; the note records the number it was given for.
+            let already_warned = metadata_get(conn, OWN_ATTRIBUTION_REPAIR_SKIPPED_KEY)?
+                .is_some_and(|note| note.split_whitespace().next() == Some(phone));
+            if already_warned {
+                tracing::debug!("own-message attribution repair skipped: the marker names another number");
+            } else {
+                metadata_set(conn, OWN_ATTRIBUTION_REPAIR_SKIPPED_KEY, &format!("{phone} {}", now_secs()))?;
+                eprintln!(
+                    "whatsrust: WARNING: the own-message attribution repair is NOT run: it ran for another number \
+                     (this database was kept across a re-pair). Stored own messages of the current number may keep \
+                     a wrong sender or from_me flag. This is logged once; later starts log it at debug level"
+                );
+                tracing::warn!(
+                    "own-message attribution repair skipped: the marker names another number \
+                     (database kept across a re-pair); logged once"
+                );
+            }
+            return Ok(None);
+        }
+    }
+
+    // A failed attempt is left alone for a day; the retry reuses the backup it took.
+    let mut failed_backup: Option<String> = None;
+    if let Some((epoch, backup)) = metadata_get(conn, OWN_ATTRIBUTION_REPAIR_FAILED_KEY)?.as_deref().and_then(parse_failure_note) {
+        // (A note dated in the future, after a clock change, does not block the retry.)
+        if (0..REPAIR_RETRY_AFTER_SECS).contains(&(now_secs() - epoch)) {
+            tracing::debug!("own-message attribution repair skipped: it failed less than 24 hours ago");
+            return Ok(None);
+        }
+        failed_backup = backup;
+    }
+
+    let started = std::time::Instant::now();
+    let mut scan = match scan_for_repair(conn, &own) {
+        Ok(scan) => scan,
+        Err(e) => {
+            let _ = metadata_set(conn, OWN_ATTRIBUTION_REPAIR_FAILED_KEY, &failure_note(None, &e));
+            return Err(e);
+        }
+    };
+    if scan.is_clean() {
+        if metadata_get(conn, OWN_ATTRIBUTION_REPAIR_FAILED_KEY)?.is_some() {
+            conn.execute("DELETE FROM metadata WHERE key = ?1", params![OWN_ATTRIBUTION_REPAIR_FAILED_KEY])
+                .map_err(db_err)?;
+        }
+        tracing::debug!(elapsed_ms = started.elapsed().as_millis() as u64, "own-message attribution: nothing to repair");
+        return Ok(None);
+    }
+
+    // The backup of the state before the repair: none when the pre-migration one covers it; the one
+    // a failed attempt took, if it is still there; else a new one.
+    let mut backup_name: Option<String> = None;
+    if !backup_taken {
+        backup_name = failed_backup.filter(|name| db_path.with_file_name(name).is_file());
+        if backup_name.is_none() {
+            match backup_db(conn, db_path, "pre-repair") {
+                Ok(path) => {
+                    eprintln!("whatsrust: pre-repair backup written to {}", path.display());
+                    tracing::info!("own-message attribution repair: pre-repair backup written");
+                    prune_pre_repair_backups(db_path, PRE_REPAIR_BACKUPS_KEPT);
+                    backup_name = path.file_name().and_then(|n| n.to_str()).map(str::to_owned);
+                }
+                Err(e) => {
+                    let reason = store_error_text(&e);
+                    eprintln!("whatsrust: own-message attribution repair skipped: the pre-repair backup failed ({reason}); retried at the next start");
+                    tracing::warn!(error = %reason, "own-message attribution repair skipped: the pre-repair backup failed; retried at the next start");
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    match apply_repair(conn, &own, &own_jid, &mut scan) {
+        Ok(mut report) => {
+            report.elapsed = started.elapsed();
+            Ok(Some(report))
+        }
+        Err(e) => {
+            // The transaction was dropped (rolled back) with the error; note the failure.
+            let _ = metadata_set(conn, OWN_ATTRIBUTION_REPAIR_FAILED_KEY, &failure_note(backup_name.as_deref(), &e));
+            Err(e)
+        }
+    }
+}
+
+/// The transaction of [`repair_own_attribution`]. An error drops the transaction (a rollback).
+fn apply_repair(conn: &Connection, own: &OwnIdentity, own_jid: &str, scan: &mut RepairScan) -> Result<RepairReport> {
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    tx.execute_batch("DROP TRIGGER IF EXISTS messages_fts_update;").map_err(db_err)?;
+
+    let mut live_from_me = 0usize;
+    for chunk in scan.owner_live.chunks(REPAIR_IN_CHUNK) {
+        let sql = format!(
+            "UPDATE messages SET from_me = 1
+             WHERE source = 'live' AND from_me = 0 AND sender_jid IN ({})",
+            numbered_placeholders(1, chunk.len())
+        );
+        live_from_me += tx.execute(&sql, rusqlite::params_from_iter(chunk.iter())).map_err(db_err)?;
+    }
+
+    let mut history_sender = 0usize;
+    for chunk in scan.foreign_history.chunks(REPAIR_IN_CHUNK) {
+        let sql = format!(
+            "UPDATE messages SET sender_jid = ?1
+             WHERE source IN ('bootstrap', 'backfill') AND from_me = 1 AND sender_jid IN ({})",
+            numbered_placeholders(2, chunk.len())
+        );
+        let binds = std::iter::once(own_jid).chain(chunk.iter().map(String::as_str));
+        history_sender += tx.execute(&sql, rusqlite::params_from_iter(binds)).map_err(db_err)?;
+    }
+
+    let cursor_flag = tx
+        .execute(&format!("UPDATE backfill_cursor SET oldest_msg_from_me = 1 WHERE {STALE_CURSORS_WHERE}"), [])
+        .map_err(db_err)?;
+
+    check_repair_postcondition(&tx, own, &mut scan.classified)?;
+
+    tx.execute_batch(MESSAGES_FTS_UPDATE_TRIGGER).map_err(db_err)?;
+    tx.execute("DELETE FROM metadata WHERE key = ?1", params![OWN_ATTRIBUTION_REPAIR_FAILED_KEY])
+        .map_err(db_err)?;
+    tx.commit().map_err(db_err)?;
+
+    Ok(RepairReport { live_from_me, history_sender, cursor_flag, elapsed: std::time::Duration::ZERO })
 }
 
 /// Save a Device to the database (shared by DeviceStore::save and ::create).
@@ -4161,6 +5101,10 @@ impl DeviceStore for Store {
     }
 }
 
+// Schema v9, the own-message repair, the identity helpers and the history ingest (media phase 2a).
+#[cfg(test)]
+mod v9_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4261,9 +5205,10 @@ mod tests {
             > 0
     }
 
-    /// (1) Fresh DB opens at v8 with messages, messages_fts, sibling tables, triggers present.
+    /// (1) Fresh DB opens at the current version with messages, messages_fts, sibling tables,
+    /// triggers present.
     #[test]
-    fn test_v8_fresh_db_schema() {
+    fn test_fresh_db_schema() {
         let dir = unique_test_dir("v8-fresh");
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("wa.db");
@@ -4271,7 +5216,7 @@ mod tests {
         let conn = open_fresh_conn(&db_path);
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 8, "user_version must be 8");
+        assert_eq!(version, CURRENT_SCHEMA_VERSION, "user_version must be the current version");
 
         // Core tables
         assert!(table_exists(&conn, "messages"), "messages table must exist");
@@ -4336,9 +5281,9 @@ mod tests {
         // Verify via a fresh raw connection.
         let conn = Connection::open(&db_path).unwrap();
 
-        // user_version=8
+        // user_version=current (the v8 step and the v9 step both ran)
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         // inbound_messages must be gone
         let old_exists: i64 = conn
@@ -4472,8 +5417,8 @@ mod tests {
     // Wave 2: staged-migration ceremony tests (ADR 0028/0029/0030/0032/0036)
     // -------------------------------------------------------------------------
 
-    /// (a) Staged v7→v8 migration: backup appears, migrates, validates,
-    ///     sets schema_validated_version=8, seeds watchdog baseline.
+    /// (a) Staged v7→current migration: backup appears, migrates, validates,
+    ///     sets schema_validated_version=current, seeds watchdog baseline.
     #[test]
     fn test_staged_migration_creates_bak_and_validates() {
         let dir = unique_test_dir("staged-mig");
@@ -4512,12 +5457,12 @@ mod tests {
         assert!(bak.is_some(), "pre-migration .bak file must exist");
         assert!(bak.unwrap().exists(), ".bak file must be readable");
 
-        // DB must be at v8
+        // DB must be at the current version
         let conn_arc = store.conn.clone();
         let guard = conn_arc.lock();
 
         let version: i64 = guard.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         // schema_validated_version must be set
         let svv: Option<String> = guard.query_row(
@@ -4525,7 +5470,11 @@ mod tests {
             [],
             |r| r.get(0),
         ).optional().unwrap();
-        assert_eq!(svv.as_deref(), Some("8"), "schema_validated_version must be '8'");
+        assert_eq!(
+            svv.as_deref(),
+            Some(CURRENT_SCHEMA_VERSION.to_string().as_str()),
+            "schema_validated_version must be the current version"
+        );
 
         // Watchdog baseline must be seeded
         let wdog: Option<String> = guard.query_row(
@@ -4554,12 +5503,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("whatsapp.db");
 
-        // Write the pin file directly to simulate a prior failure, then verify
-        // that Normal-mode startup correctly halts with an actionable error.
+        // Write the pin file directly to simulate a prior failure of the migration to the current
+        // version, then verify that Normal-mode startup correctly halts with an actionable error.
         write_migration_pin(&db_path, &MigrationPin {
             state: "failed".to_owned(),
-            pinned_version: 7,
-            blocked_target: 8,
+            pinned_version: CURRENT_SCHEMA_VERSION - 1,
+            blocked_target: CURRENT_SCHEMA_VERSION,
             created_at: 0,
             reason: "simulated migration failure for test".to_owned(),
         }).unwrap();
@@ -4567,11 +5516,11 @@ mod tests {
         // Pin must be present on disk
         assert!(pin_path(&db_path).exists(), "pin file must exist after write");
 
-        // Build a v7 DB to accompany it
+        // Build a DB one version behind to accompany it
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch("PRAGMA journal_mode = DELETE;").unwrap();
-            conn.pragma_update(None, "user_version", 7_i64).unwrap();
+            conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION - 1).unwrap();
         }
 
         // Normal startup must halt due to pin
@@ -4579,7 +5528,7 @@ mod tests {
         assert!(result.is_err(), "open must halt when failed pin is present");
 
         // ForceMigrate clears pin and proceeds
-        // (we expect it to succeed since this is a valid v7 DB with no data to conflict)
+        // (we expect it to succeed since this is a valid previous-version DB with no data to conflict)
         let result2 = open_with_mode(&db_path, MigrationMode::ForceMigrate);
         assert!(result2.is_ok(), "ForceMigrate must succeed after clearing pin: {:?}", result2.err().map(|e| e.to_string()));
 
@@ -4596,21 +5545,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("whatsapp.db");
 
-        // Build a v7 DB (so migration would be needed)
+        // Build a DB one version behind (so migration would be needed)
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(
                 "PRAGMA journal_mode = WAL;
                  PRAGMA auto_vacuum = INCREMENTAL;",
             ).unwrap();
-            conn.pragma_update(None, "user_version", 7_i64).unwrap();
+            conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION - 1).unwrap();
         }
 
         // Write a "failed" pin manually
         write_migration_pin(&db_path, &MigrationPin {
             state: "failed".to_owned(),
-            pinned_version: 7,
-            blocked_target: 8,
+            pinned_version: CURRENT_SCHEMA_VERSION - 1,
+            blocked_target: CURRENT_SCHEMA_VERSION,
             created_at: 0,
             reason: "test-induced failure".to_owned(),
         }).unwrap();
@@ -5437,6 +6386,12 @@ mod tests {
             file_length: Some(1234),
             width: Some(10),
             height: Some(20),
+            file_name: Some("report.pdf".to_owned()),
+            file_sha256: Some(vec![6, 7]),
+            remote_jid: Some("100000000000001@lid".to_owned()),
+            participant: Some("100000000000009@lid".to_owned()),
+            view_once: Some(false),
+            media_key_timestamp: Some(1_700_000_000),
         }
     }
 
@@ -5462,6 +6417,22 @@ mod tests {
             .unwrap();
         assert_eq!((key, path.as_str(), sha, mime.as_str(), len, w, h), (vec![1, 2, 3], "/v/t62/x", vec![4, 5], "image/jpeg", 1234, 10, 20));
         assert_eq!(hydrated, None);
+        let (name, file_sha, remote, participant, view_once): (String, Vec<u8>, String, String, i64) = conn
+            .query_row(
+                "SELECT file_name, file_sha256, remote_jid, participant, view_once FROM media_refs WHERE message_id = 'img-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (name.as_str(), file_sha, remote.as_str(), participant.as_str(), view_once),
+            ("report.pdf", vec![6, 7], "100000000000001@lid", "100000000000009@lid", 0),
+            "the v9 columns are written too"
+        );
+        let key_timestamp: i64 = conn
+            .query_row("SELECT media_key_timestamp FROM media_refs WHERE message_id = 'img-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(key_timestamp, 1_700_000_000);
         assert_eq!(media_ref_count(&dir), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6973,7 +7944,8 @@ mod tests {
             "The actual SQL DELETE execute call with model_id must appear exactly once"
         );
 
-        // The only other DELETE statement touching embeddings should be the validation probe cleanup.
+        // The validation probe used to clean up its vector row with a DELETE; it now rolls its
+        // transaction back instead, so no other DELETE statement touches embeddings.
         let validate_cleanup_count = source
             .lines()
             .filter(|line| {
@@ -6984,7 +7956,7 @@ mod tests {
                     && !trimmed.starts_with("///")
             })
             .count();
-        assert_eq!(validate_cleanup_count, 1, "validation probe cleanup is a different statement");
+        assert_eq!(validate_cleanup_count, 0, "the validation probe rolls back; it has no cleanup DELETE");
     }
 
     /// 2.5.2d: API/MCP/CLI round-trip test. Verify all three surfaces return the same
