@@ -11,6 +11,9 @@ Work on branch `feature/media-download`, not yet on `main`.
 - Dev-only `media-probe` REPL command (Cargo feature `media-probe`, never in a release build) for the media download's live test. It downloads a stored or live-cached message's media, asks the owner's phone to re-upload it (the wa-rs request, and a `web` request sent to the account's own LID), downloads it again, and prints each step; `--web` sends only the working request; HOWTO §3 "Media re-upload probe". Live result 2026-11-01: only the request sent to the own LID works at the current wa-rs pin (`src/media_probe.rs`; ADR 0050 note)
 - Versioned binaries: `make build`, `make release` and `make dist` name each binary `whatsrust-<version>-<commit>[-dirty][-<features>]` and point a plain-name symlink at the newest, so scripts and MCP configs keep working and older builds stay; `FEATURES=a,b` adds Cargo features; the same version string is compiled in (`whatsrust --version`, the startup log); a plain `cargo build` is unchanged (HOWTO §1)
 
+### Changed
+- `AGENTS.md`: Patterns lines for the media token hygiene (bd5f785) and the own-message attribution, a `log_filter` note on `src/main.rs`, and the log-target survey as a step of a wa-rs upgrade
+
 ### Fixed
 - Own messages are attributed to the account: live rows now store the account's own messages with `from_me = 1` (they were always stored with 0), and own history messages without a key participant store the account's own phone JID as the sender instead of the group or the other person; rows stored earlier are repaired by the schema v9 migration (media download design v5.1 §4)
 
