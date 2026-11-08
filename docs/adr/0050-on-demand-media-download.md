@@ -2,8 +2,8 @@
 
 **Status:** Proposed (v5, 2026-11-04: the v4 follow-up cold review and a ureq timeout spike folded in; the old-file
 test matrix passed 2026-11-05, GO 2026-11-06; v5.1 2026-11-06: the own-message attribution fix folded into phase 2;
-next: phase 2)
-**Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4), 2026-11-04 (v5), 2026-11-06 (v5.1)
+v5.2 2026-11-08: the revoke key rule corrected, cold review pending; next: phase 2a)
+**Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4), 2026-11-04 (v5), 2026-11-06 (v5.1), 2026-11-08 (v5.2)
 
 ## Context
 
@@ -38,8 +38,8 @@ Facts that shape the design (checked in the code, the wa-rs pin `9e8c70e` and a 
    row fills an existing reference, and creates a missing one when the stored message is not live; a mismatch
    changes nothing. Staged migration per ADR 0028–0032. No backfill of the new columns. Phase 2 first fixes the
    own-message attribution (live rows store the event's `from_me`; own history messages store the own phone JID as
-   the sender), and the migration repairs the stored rows before the one-time revoke pass (owner-authorised
-   2026-11-06). **There is no supported way back after a healthy
+   the sender), and the migration repairs the stored rows and the fetch cursor's anchor flag before the one-time
+   revoke pass, all in the v9 step (owner-authorised 2026-11-06 and 2026-11-08). **There is no supported way back after a healthy
    migration** (`--rollback` serves only failed ones), so the schema phase is merged only after the old-file test
    matrix passes.
 3. **Files on disk, one folder per chat,** under `media/` beside `whatsapp.db`: `chat_<number>/`,
@@ -97,7 +97,8 @@ Facts that shape the design (checked in the code, the wa-rs pin `9e8c70e` and a 
    property, never a part of a file name (a chat whose rows are all deleted gets a `deleted: <epoch>` line in its
    name file). **Only an observed delete or a valid revoke tags a file.** A revoke is judged by identities, not by
    the stored `from_me`: the revoker must be the target's author (the owner's own account for an own message), and
-   the revoke key's `from_me`/`participant` must match the target (an admin's delete does not count). It is
+   the revoke key, which the revoker writes from its own view, must say `from_me = true` with no participant or the
+   revoker as participant (an admin's delete, `from_me = false`, does not count; corrected in v5.2). It is
    resolved once at ingest into `revoked_at`, and the migration runs a one-time pass over stored revoke rows. The
    file set comes from the rows actually deleted (a message delete also matches the chat), through per-event,
    chunked intent keys in `metadata` that startup replays. A message missing from the DB is never treated as deleted. A revoked message is never downloaded. A
@@ -192,6 +193,19 @@ sender is the owner's number or LID get `from_me = 1`; history rows with `from_m
 JID get the own phone JID),
 before the one-time revoke pass. The owner authorised this repair; it is undone only by the manual revert. The
 "live media security" fix stays on its own branch from `main` (design §11).
+
+**2026-11-08: the phase 2 implementation plan (design v5.2).** A read-only planning pass over the code found:
+- **The revoke key is written by the revoker** (wa-rs `src/send/actions.rs`): a sender revoke carries
+  `from_me = true` and no participant in every chat, an admin revoke `from_me = false` and the author. v5's rule
+  "the key's `from_me`/`participant` match the target row" would have rejected every valid revoke by another person.
+  Decision 9 now reads the key from the revoker's view. A cold review of v5.2 runs before phase 2b (owner).
+- **A migration step runs once per DB** (`if from_version < 9`), so the one-time revoke pass ships in the same commit
+  as the v9 columns (phase 2a).
+- **Own messages in LID-addressed 1:1 chats were stored under the account's own number:** wa-rs sets `sender_alt` to
+  the own phone JID for them, and live ingest resolved the chat with it. A separate fix commit precedes phase 2a;
+  earlier rows cannot be repaired.
+- The owner widened the repair (2026-11-08): own history rows whose sender is not one of the owner's identities,
+  every form of the owner's number and LID for live rows, and the fetch cursor's anchor flag.
 
 ## Alternatives considered
 
