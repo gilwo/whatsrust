@@ -109,7 +109,15 @@ notes" for more.
    - `WHATSAPP_PAIR_PHONE` — set this to use phone-number pair-code linking
      instead of scanning a QR code.
    - `WHATSAPP_ALLOWED` — comma-separated digit-only phone numbers; empty
-     means accept inbound messages from everyone.
+     means accept inbound messages from everyone. A message from anyone else
+     is dropped: no event, no stored row, no read receipt. The one exception
+     is a sender's revoke ("delete for everyone"): its revoke row is stored
+     for every sender (and nothing else happens), because stored history keeps
+     everyone's media and the media download must see that its sender deleted
+     it. That row is stored only when the revoke's IDs look like message IDs,
+     under `message_id = tombstone:<id>`, and once per chat, sender and deleted
+     message. Retention and pruning must keep rows with
+     `content_kind = 'revoke'`.
    - `WHATSRUST_DEVICE_NAME` (default `whatsrust`) — the name shown in
      WhatsApp's Linked Devices list. WhatsApp only reads this **while pairing
      a new device**; once paired, the name is stored with the session (the

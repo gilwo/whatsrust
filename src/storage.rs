@@ -1834,6 +1834,7 @@ impl Store {
     /// the `InboundContent` they have in hand (this fn only sees `content_kind`/`body_text`, not
     /// the enum, so it cannot classify itself). Bound explicitly rather than relying on the schema
     /// `DEFAULT 'pending'` (M2.2.2).
+    #[allow(dead_code)] // unused in the binary crate (the daemon writes through `insert_message_if_new`), public for library consumers
     pub async fn insert_message(
         &self,
         chat_jid: &str,
@@ -1899,6 +1900,7 @@ impl Store {
     /// `embed_status`: see `insert_message` — the live-ingest call site classifies from the
     /// `InboundContent` before calling this wrapper (M2.2.2 blast-radius fix: this wrapper used to
     /// hardcode everything except body/timestamp and had no way to thread classification through).
+    #[allow(dead_code)] // unused in the binary crate (the daemon writes through `insert_message_if_new`), public for library consumers
     pub async fn insert_inbound(
         &self,
         chat_jid: &str,
@@ -1970,6 +1972,58 @@ impl Store {
         .await
     }
 
+    /// Store the revoke row of a message the sender allowlist dropped (media design §5.5), unless
+    /// an identical one is stored. `Ok(true)` when a row was written.
+    ///
+    /// The row is the one `insert_inbound` writes for a revoke (`content_kind = 'revoke'`, `label`
+    /// as the text, source `live`), with two differences that keep a stranger from using the table:
+    /// - its `message_id` is `tombstone:<stanza_id>`, not the stanza's own ID, so a sender cannot
+    ///   take the (globally unique) ID of a message that arrives later; the judgement reads a
+    ///   revoke row's chat, sender, `from_me` and text only, never its `message_id`;
+    /// - it is not written when a revoke row with the same chat, sender, `from_me` and label
+    ///   exists, so repeating a revoke adds no row and no candidate to [`is_revoked_conn`]. The
+    ///   check and the insert are one statement under the connection mutex, so concurrent
+    ///   duplicates cannot both pass it.
+    ///
+    /// A repeated stanza ID is ignored (`INSERT OR IGNORE`), as for any message.
+    #[allow(clippy::too_many_arguments)] // the columns of `insert_message`, less the fixed ones
+    pub(crate) async fn insert_revoke_tombstone(
+        &self,
+        chat_jid: &str,
+        sender_jid: &str,
+        stanza_id: &str,
+        label: &str,
+        timestamp_secs: i64,
+        from_me: bool,
+        embed_status: &str,
+    ) -> Result<bool> {
+        let (cj, sj, label, es) = (chat_jid.to_owned(), sender_jid.to_owned(), label.to_owned(), embed_status.to_owned());
+        let message_id = format!("{TOMBSTONE_ID_PREFIX}{stanza_id}");
+        let created = now_secs();
+        self.run(move |c| {
+            let changed = c
+                .execute(
+                    REVOKE_TOMBSTONE_INSERT_SQL,
+                    params![cj, sj, message_id, label, timestamp_secs, created, es, i64::from(from_me)],
+                )
+                .map_err(db_err)?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    /// Whether the stored message `message_id` was revoked by its author ([`is_revoked_conn`]; the
+    /// account's identity is read once for the call).
+    #[allow(dead_code)] // the media engine (design §13 phases 4-6) calls it; only tests do until then
+    pub(crate) async fn is_revoked(&self, message_id: &str) -> Result<bool> {
+        let mid = message_id.to_owned();
+        self.run(move |c| {
+            let own = read_own_identity(c);
+            is_revoked_conn(c, &own, &mid)
+        })
+        .await
+    }
+
     /// Return the oldest stored message for a chat (by timestamp ASC), or None if no messages exist.
     ///
     /// Used to seed the initial backfill anchor: the frontier starts just older than what we have.
@@ -1978,8 +2032,10 @@ impl Store {
         let jid = chat_jid.to_owned();
         self.run(move |c| {
             c.query_row(
-                "SELECT message_id, from_me, timestamp FROM messages WHERE chat_jid = ?1 ORDER BY timestamp ASC LIMIT 1",
-                params![jid],
+                // A tombstone's `message_id` is not a message of the chat (`insert_revoke_tombstone`):
+                // never an anchor.
+                "SELECT message_id, from_me, timestamp FROM messages WHERE chat_jid = ?1 AND message_id NOT LIKE ?2 || '%' ORDER BY timestamp ASC LIMIT 1",
+                params![jid, TOMBSTONE_ID_PREFIX],
                 |row| {
                     let from_me_i: i64 = row.get(1)?;
                     Ok(OldestMessageRow {
@@ -3626,6 +3682,112 @@ pub(crate) fn same_chat(conn: &Connection, a: &str, b: &str) -> bool {
         return false;
     }
     same_user(conn, a, b)
+}
+
+// ---------------------------------------------------------------------------
+// The revoke judgement (media phase 2b): is a message revoked by its author?
+// ---------------------------------------------------------------------------
+
+/// The revoke rows that name one message as their target: `content_kind = 'revoke'` and the exact
+/// label `[deleted <id>]` (the text `InboundContent::Revoke` stores, `?1` the target's id).
+///
+/// The literal `'revoke'` makes the partial index `idx_messages_revoke_label` usable, and `=` on
+/// `body_text` (no `LIKE`) makes the match exact: the label of `ab` is never a prefix match for
+/// `abc`, and `%` or `_` in an id are plain characters.
+///
+/// `DISTINCT`: the judgement reads only the chat, the sender and the flag, so identical rows (a
+/// repeated revoke) are one candidate.
+const REVOKE_ROWS_SQL: &str = "SELECT DISTINCT chat_jid, sender_jid, from_me FROM messages
+     WHERE content_kind = 'revoke' AND body_text = '[deleted ' || ?1 || ']'";
+
+/// The `message_id` prefix of a revoke tombstone (`Store::insert_revoke_tombstone`): the row is
+/// not a message of its chat, so its ID is never offered as a fetch anchor.
+pub(crate) const TOMBSTONE_ID_PREFIX: &str = "tombstone:";
+
+/// Insert one revoke tombstone unless an identical revoke row (same chat, sender, `from_me` and
+/// label) is stored. The literal `'revoke'` lets the check use `idx_messages_revoke_label`.
+/// Bind: `?1` chat, `?2` sender, `?3` message id, `?4` label, `?5` timestamp, `?6` created at,
+/// `?7` embed status, `?8` `from_me`.
+const REVOKE_TOMBSTONE_INSERT_SQL: &str = "INSERT OR IGNORE INTO messages
+         (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
+     SELECT ?1, ?2, ?3, 'revoke', ?4, ?5, ?6, ?8, 'live', ?7
+     WHERE NOT EXISTS (
+         SELECT 1 FROM messages
+         WHERE content_kind = 'revoke' AND body_text = ?4 AND chat_jid = ?1 AND sender_jid = ?2 AND from_me = ?8)";
+
+/// What the revoke judgement reads from a message row.
+struct JudgedRow {
+    chat_jid: String,
+    sender_jid: String,
+    from_me: bool,
+}
+
+impl JudgedRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self { chat_jid: row.get(0)?, sender_jid: row.get(1)?, from_me: row.get::<_, i64>(2)? != 0 })
+    }
+}
+
+/// Whether `revoke` (a stored revoke row naming `target`) is a revoke by the target's author.
+///
+/// - The revoke must sit in the same chat as the target (`same_chat`: a group exactly, a 1:1 chat as
+///   the same user).
+/// - **1:1 chat:** the author is whoever the `from_me` flag says, so the revoke row's flag must
+///   equal the target's (no LID mapping needed).
+/// - **Group:** an own target (`from_me = 1`) needs the owner as the revoker (the row's flag, or an
+///   owner identity as the sender); any other target needs a revoker who is not the owner and is
+///   the target's sender as the same user (phone or LID form). An admin's delete is the revoke row
+///   of a person who is not the author, so it does not count.
+fn revoke_counts(conn: &Connection, own: &OwnIdentity, target: &JudgedRow, revoke: &JudgedRow) -> bool {
+    if !same_chat(conn, &revoke.chat_jid, &target.chat_jid) {
+        return false;
+    }
+    if !target.chat_jid.ends_with("@g.us") {
+        return revoke.from_me == target.from_me;
+    }
+    let revoker_is_owner = revoke.from_me || is_owner(conn, own, &revoke.sender_jid);
+    if target.from_me {
+        revoker_is_owner
+    } else {
+        !revoker_is_owner && same_user(conn, &revoke.sender_jid, &target.sender_jid)
+    }
+}
+
+/// Whether the stored message `message_id` was revoked by its author (design §5.5): a stored
+/// revoke row names it, sits in the same chat, and was sent by the message's author (see
+/// [`revoke_counts`]). Judged **when read** from the stored rows, so the order in which the rows
+/// arrived does not matter (a revoke stored before its target counts once the target is stored)
+/// and a rule correction is a code change, not a migration.
+///
+/// `own` is the account's identity, read once by the caller (`read_own_identity`). No stored
+/// message with that id gives `false`. A revoke row's own `message_id` is never read (a tombstone's
+/// is `tombstone:<stanza id>`); only its chat, sender, `from_me` and label are.
+///
+/// Every false negative fails open (the media stays available) rather than hiding media by a
+/// guess: an own revoke before the repair has run (an unpaired profile; it counts once the
+/// repair has run), an own revoke in a LID 1:1 chat stored before the LID-chat fix (the revoke
+/// and its target may sit in different chats), and a revoker in an unmapped LID form against a
+/// target sender in phone form. Retention and prune features must keep the
+/// `content_kind = 'revoke'` rows this reads.
+pub(crate) fn is_revoked_conn(conn: &Connection, own: &OwnIdentity, message_id: &str) -> Result<bool> {
+    let target = conn
+        .query_row(
+            "SELECT chat_jid, sender_jid, from_me FROM messages WHERE message_id = ?1",
+            params![message_id],
+            JudgedRow::from_row,
+        )
+        .optional()
+        .map_err(db_err)?;
+    let Some(target) = target else {
+        return Ok(false);
+    };
+    // Read all the candidates first: the judgement runs its own queries on the connection.
+    let revokes = {
+        let mut stmt = conn.prepare_cached(REVOKE_ROWS_SQL).map_err(db_err)?;
+        let rows = stmt.query_map(params![message_id], JudgedRow::from_row).map_err(db_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?
+    };
+    Ok(revokes.iter().any(|revoke| revoke_counts(conn, own, &target, revoke)))
 }
 
 // ---------------------------------------------------------------------------

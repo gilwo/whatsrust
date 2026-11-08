@@ -1,5 +1,6 @@
-//! Tests of schema v9, the deferred own-message repair, the identity helpers and the history
-//! ingest (media download phase 2a; plan `docs/plans/2026-11-08-media-phase2-plan.md` §2.7).
+//! Tests of schema v9, the deferred own-message repair, the identity helpers, the history ingest
+//! (media download phase 2a; plan `docs/plans/2026-11-08-media-phase2-plan.md` §2.7) and the revoke
+//! judgement `is_revoked` (run 2b, plan §3).
 //!
 //! Every database here is synthetic, built in a fresh directory under the system temp dir.
 
@@ -1775,6 +1776,388 @@ async fn a_duplicate_whose_stored_row_cannot_be_read_fails_the_write() {
     assert!(result.is_err(), "QueryReturnedNoRows is reported");
     assert_eq!(message_count(&dir), 0);
     assert!(stored_ref(&dir, "A").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// The revoke judgement (run 2b): `is_revoked`
+// ---------------------------------------------------------------------------
+
+const OTHER_PHONE: &str = "15557777777";
+const OTHER_JID: &str = "15557777777@s.whatsapp.net";
+const OTHER_GROUP: &str = "120363000000000002@g.us";
+
+/// A fresh v9 database (what a real start leaves) with the mapping `PEER_LID` <-> `PEER_PHONE`, and
+/// the owner's `device` row when `paired`.
+fn revoke_db(name: &str, paired: bool) -> (PathBuf, Connection) {
+    let dir = test_dir(name);
+    drop(Store::new(&dir.join("whatsapp.db")).unwrap());
+    let conn = raw(&dir.join("whatsapp.db"));
+    if paired {
+        conn.execute(
+            "INSERT INTO device (id, pn, lid) VALUES (1, '15550001111:12@s.whatsapp.net', '100000000000009:12@lid')",
+            [],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO lid_pn_mapping (lid, phone_number, created_at, updated_at, learning_source) VALUES (?1, ?2, 1, 1, 'test')",
+        [PEER_LID, PEER_PHONE],
+    )
+    .unwrap();
+    (dir, conn)
+}
+
+/// A revoke row as live ingest stores it: its own message id, the label of the target it names.
+fn revoke_row(conn: &Connection, revoke_id: &str, target_id: &str, chat: &str, sender: &str, from_me: i64, source: &str) {
+    conn.execute(
+        "INSERT INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
+         VALUES (?1, ?2, ?3, 'revoke', ?4, 1000, 1000, ?5, ?6, 'skipped')",
+        params![chat, sender, revoke_id, format!("[deleted {target_id}]"), from_me, source],
+    )
+    .unwrap();
+}
+
+fn revoked(conn: &Connection, id: &str) -> bool {
+    is_revoked_conn(conn, &read_own_identity(conn), id).unwrap()
+}
+
+#[test]
+fn an_own_revoke_counts_after_the_repair_and_not_on_an_unpaired_db_before_it() {
+    let (dir, conn) = revoke_db("revoke-own", false);
+    let db = dir.join("whatsapp.db");
+    assert_eq!(read_own_identity(&conn), OwnIdentity::default(), "the fixture is unpaired");
+    // Rows as the code before the attribution fix stored them: the account's own history messages
+    // carry the right flag and a wrong sender; its own live revokes carry from_me 0 and the
+    // account's bare number.
+    put(&conn, "T1", PEER_JID, PEER_JID, 1, "bootstrap", "text");
+    revoke_row(&conn, "R1", "T1", PEER_JID, OWN_PHONE, 0, "live");
+    put(&conn, "TG", GROUP, GROUP, 1, "bootstrap", "text");
+    revoke_row(&conn, "RG", "TG", GROUP, OWN_PHONE, 0, "live");
+    // An own live message in the group and its revoke, both stored with from_me 0 and the same sender.
+    put(&conn, "TL", GROUP, OWN_PHONE, 0, "live", "text");
+    revoke_row(&conn, "RL", "TL", GROUP, OWN_PHONE, 0, "live");
+
+    // Unpaired: no identity, so no repair, and the first two do not count yet (the media stays
+    // available). The live pair is the same user on both sides, which needs no identity.
+    assert!(!revoked(&conn, "T1"));
+    assert!(!revoked(&conn, "TG"));
+    assert!(revoked(&conn, "TL"));
+    assert!(repair_own_attribution(&conn, &db, true).unwrap().is_none());
+    assert!(!revoked(&conn, "T1"));
+    assert!(!revoked(&conn, "TG"));
+
+    // Paired, not repaired: the group revoke of the history message counts through the owner
+    // identity of its sender; the 1:1 revoke is judged by the flag, which still says 0; and the live
+    // pair, whose target is not flagged as the owner's, fails open until the repair has run.
+    conn.execute(
+        "INSERT INTO device (id, pn, lid) VALUES (1, '15550001111:12@s.whatsapp.net', '100000000000009:12@lid')",
+        [],
+    )
+    .unwrap();
+    assert!(!revoked(&conn, "T1"));
+    assert!(revoked(&conn, "TG"));
+    assert!(!revoked(&conn, "TL"));
+
+    // After the repair all three count.
+    let report = repair_own_attribution(&conn, &db, true).unwrap().expect("a paired DB is repaired");
+    assert_eq!(report.live_from_me, 4, "the three own revokes and the live target");
+    assert!(revoked(&conn, "T1"));
+    assert!(revoked(&conn, "TG"));
+    assert!(revoked(&conn, "TL"));
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_1_1_revoke_is_judged_by_from_me_equality_in_either_chat_form() {
+    let (dir, conn) = revoke_db("revoke-1to1", true);
+    // The peer's message, revoked by the peer (from_me 0 on both).
+    put(&conn, "T1", PEER_JID, PEER_PHONE, 0, "live", "text");
+    revoke_row(&conn, "R1", "T1", PEER_JID, PEER_PHONE, 0, "live");
+    assert!(revoked(&conn, "T1"));
+    // The revoke row filed under the LID form of the chat (stored before the mapping was known).
+    put(&conn, "T2", PEER_JID, PEER_PHONE, 0, "live", "text");
+    revoke_row(&conn, "R2", "T2", "100000000000001@lid", PEER_LID, 0, "live");
+    assert!(revoked(&conn, "T2"), "a 1:1 chat is the same chat in phone and LID form");
+    // The account's own message, revoked by the account (from_me 1 on both).
+    put(&conn, "T3", PEER_JID, OWN_JID, 1, "live", "text");
+    revoke_row(&conn, "R3", "T3", PEER_JID, OWN_PHONE, 1, "live");
+    assert!(revoked(&conn, "T3"));
+
+    // A revoke row flagged as the account's own against the peer's message does not count ...
+    put(&conn, "T4", PEER_JID, PEER_PHONE, 0, "live", "text");
+    revoke_row(&conn, "R4", "T4", PEER_JID, OWN_PHONE, 1, "live");
+    assert!(!revoked(&conn, "T4"));
+    // ... and the peer cannot revoke the account's message.
+    put(&conn, "T5", PEER_JID, OWN_JID, 1, "live", "text");
+    revoke_row(&conn, "R5", "T5", PEER_JID, PEER_PHONE, 0, "live");
+    assert!(!revoked(&conn, "T5"));
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_group_revoke_by_the_author_counts_in_phone_or_lid_form_through_the_mapping() {
+    let (dir, conn) = revoke_db("revoke-group", true);
+    // The target as history stores a sender (a phone JID); the revoke as live ingest stores it (a
+    // bare LID user, or a LID JID with a device part).
+    put(&conn, "T1", GROUP, PEER_JID, 0, "bootstrap", "text");
+    revoke_row(&conn, "R1", "T1", GROUP, PEER_LID, 0, "live");
+    assert!(revoked(&conn, "T1"), "bare LID user against a phone JID");
+    put(&conn, "T2", GROUP, PEER_JID, 0, "bootstrap", "text");
+    revoke_row(&conn, "R2", "T2", GROUP, "100000000000001:75@lid", 0, "live");
+    assert!(revoked(&conn, "T2"), "LID JID with a device part");
+    // The other way round, and the same form on both sides.
+    put(&conn, "T3", GROUP, "100000000000001@lid", 0, "bootstrap", "text");
+    revoke_row(&conn, "R3", "T3", GROUP, PEER_PHONE, 0, "live");
+    assert!(revoked(&conn, "T3"), "phone against a LID JID");
+    put(&conn, "T4", GROUP, PEER_JID, 0, "bootstrap", "text");
+    revoke_row(&conn, "R4", "T4", GROUP, PEER_JID, 0, "bootstrap");
+    assert!(revoked(&conn, "T4"));
+    // A LID the mapping does not know is another user: the media stays available.
+    put(&conn, "T5", GROUP, PEER_JID, 0, "bootstrap", "text");
+    revoke_row(&conn, "R5", "T5", GROUP, UNMAPPED_LID_JID, 0, "live");
+    assert!(!revoked(&conn, "T5"));
+
+    // The account's own message: the revoker is the owner by the flag, or by any owner identity.
+    put(&conn, "T6", GROUP, OWN_JID, 1, "live", "text");
+    revoke_row(&conn, "R6", "T6", GROUP, OWN_PHONE, 1, "live");
+    assert!(revoked(&conn, "T6"), "by the flag");
+    put(&conn, "T7", GROUP, OWN_JID, 1, "live", "text");
+    revoke_row(&conn, "R7", "T7", GROUP, "100000000000009:12@lid", 0, "live");
+    assert!(revoked(&conn, "T7"), "by the owner's LID as the sender");
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_admins_delete_and_a_forged_revoke_do_not_count() {
+    let (dir, conn) = revoke_db("revoke-forged", true);
+    // Another member "revokes" the peer's message.
+    put(&conn, "T1", GROUP, PEER_JID, 0, "bootstrap", "text");
+    revoke_row(&conn, "R1", "T1", GROUP, OTHER_JID, 0, "live");
+    assert!(!revoked(&conn, "T1"), "a forged revoke");
+    // An admin deletes the peer's message: the revoke row is the admin's, who is not the author.
+    put(&conn, "T2", GROUP, PEER_JID, 0, "bootstrap", "text");
+    revoke_row(&conn, "R2", "T2", GROUP, OTHER_PHONE, 0, "live");
+    assert!(!revoked(&conn, "T2"), "an admin other than the author");
+    // The owner as an admin deletes the peer's message: by the flag, and as a row stored with from_me 0.
+    put(&conn, "T3", GROUP, PEER_JID, 0, "bootstrap", "text");
+    revoke_row(&conn, "R3", "T3", GROUP, OWN_PHONE, 1, "live");
+    assert!(!revoked(&conn, "T3"), "the owner is not the peer's author (flag)");
+    put(&conn, "T4", GROUP, PEER_JID, 0, "bootstrap", "text");
+    revoke_row(&conn, "R4", "T4", GROUP, OWN_JID, 0, "live");
+    assert!(!revoked(&conn, "T4"), "the owner is not the peer's author (identity)");
+    // Another member against the owner's message.
+    put(&conn, "T5", GROUP, OWN_JID, 1, "live", "text");
+    revoke_row(&conn, "R5", "T5", GROUP, PEER_JID, 0, "live");
+    assert!(!revoked(&conn, "T5"), "only the owner revokes the owner's message");
+    // One valid revoke among forged ones is enough.
+    put(&conn, "T6", GROUP, PEER_JID, 0, "bootstrap", "text");
+    revoke_row(&conn, "R6a", "T6", GROUP, OTHER_JID, 0, "live");
+    revoke_row(&conn, "R6b", "T6", GROUP, PEER_PHONE, 0, "live");
+    assert!(revoked(&conn, "T6"));
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_revoke_in_another_chat_does_not_count() {
+    let (dir, conn) = revoke_db("revoke-chat", true);
+    // A group target, the right person, another group.
+    put(&conn, "T1", GROUP, PEER_JID, 0, "bootstrap", "text");
+    revoke_row(&conn, "R1", "T1", OTHER_GROUP, PEER_PHONE, 0, "live");
+    assert!(!revoked(&conn, "T1"), "groups are compared exactly");
+    // A 1:1 target, a revoke with the same flag in another person's chat, and in a group.
+    put(&conn, "T2", PEER_JID, PEER_PHONE, 0, "live", "text");
+    revoke_row(&conn, "R2", "T2", OTHER_JID, OTHER_PHONE, 0, "live");
+    revoke_row(&conn, "R3", "T2", GROUP, PEER_PHONE, 0, "live");
+    assert!(!revoked(&conn, "T2"));
+    // A group target, a revoke in a 1:1 chat.
+    put(&conn, "T3", GROUP, PEER_JID, 0, "bootstrap", "text");
+    revoke_row(&conn, "R4", "T3", PEER_JID, PEER_PHONE, 0, "live");
+    assert!(!revoked(&conn, "T3"));
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_revoke_stored_before_its_target_counts_once_the_target_is_stored() {
+    let (dir, conn) = revoke_db("revoke-order", true);
+    revoke_row(&conn, "R1", "LATE", GROUP, PEER_PHONE, 0, "live");
+    assert!(!revoked(&conn, "LATE"), "no target stored: false");
+    assert!(!revoked(&conn, "NEVER"), "an unknown id: false");
+
+    put(&conn, "LATE", GROUP, PEER_JID, 0, "backfill", "text");
+    assert!(revoked(&conn, "LATE"), "the target arrived later; no pass was needed");
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn only_the_exact_label_of_a_revoke_row_matches() {
+    let (dir, conn) = revoke_db("revoke-label", true);
+    // The revoke row names ABCD; a target that is only a prefix of that id is not revoked by it.
+    for id in ["AB", "ABC", "ABCD"] {
+        put(&conn, id, GROUP, PEER_JID, 0, "bootstrap", "text");
+    }
+    revoke_row(&conn, "R1", "ABCD", GROUP, PEER_PHONE, 0, "live");
+    assert!(!revoked(&conn, "AB"));
+    assert!(!revoked(&conn, "ABC"));
+    assert!(revoked(&conn, "ABCD"));
+    // The other way round: the revoke row names a prefix.
+    revoke_row(&conn, "R2", "AB", GROUP, PEER_PHONE, 0, "live");
+    assert!(revoked(&conn, "AB"));
+    assert!(!revoked(&conn, "ABC"));
+    // LIKE wildcards in an id are plain characters.
+    for id in ["A_C", "A%"] {
+        put(&conn, id, GROUP, PEER_JID, 0, "bootstrap", "text");
+    }
+    revoke_row(&conn, "R3", "ABC", GROUP, PEER_PHONE, 0, "live");
+    assert!(!revoked(&conn, "A_C"));
+    assert!(!revoked(&conn, "A%"));
+    revoke_row(&conn, "R4", "A_C", GROUP, PEER_PHONE, 0, "live");
+    assert!(revoked(&conn, "A_C"));
+    assert!(!revoked(&conn, "A%"));
+    // A row that only says the label is not a revoke row, and a longer text is not the label.
+    put(&conn, "T9", GROUP, PEER_JID, 0, "bootstrap", "text");
+    conn.execute(
+        "INSERT INTO messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at, from_me, source, embed_status)
+         VALUES (?1, ?2, 'X1', 'text', '[deleted T9]', 1000, 1000, 0, 'live', 'skipped')",
+        params![GROUP, PEER_PHONE],
+    )
+    .unwrap();
+    assert!(!revoked(&conn, "T9"), "a text message cannot revoke");
+    revoke_row(&conn, "R5", "T9 and more", GROUP, PEER_PHONE, 0, "live");
+    assert!(!revoked(&conn, "T9"));
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_revoke_lookup_and_the_tombstone_check_use_the_partial_index() {
+    let (dir, conn) = revoke_db("revoke-plan", true);
+    put(&conn, "T1", GROUP, PEER_JID, 0, "bootstrap", "text");
+    revoke_row(&conn, "R1", "T1", GROUP, PEER_PHONE, 0, "live");
+
+    let plan = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map(params, |r| r.get::<_, String>(3)).unwrap().collect::<std::result::Result<_, _>>().unwrap()
+    };
+
+    let lookup = plan(REVOKE_ROWS_SQL, &[&"T1"]);
+    assert!(lookup.iter().any(|detail| detail.contains("idx_messages_revoke_label")), "plan: {lookup:?}");
+    assert!(lookup.iter().all(|detail| !detail.starts_with("SCAN messages")), "no scan of messages: {lookup:?}");
+
+    // The "identical row" check of the tombstone insert is an indexed search too, not a scan of `messages`.
+    let insert = plan(REVOKE_TOMBSTONE_INSERT_SQL, &[&GROUP, &PEER_PHONE, &"tombstone:S1", &"[deleted T1]", &1_i64, &1_i64, &"skipped", &0_i64]);
+    assert!(insert.iter().any(|detail| detail.contains("idx_messages_revoke_label")), "plan: {insert:?}");
+    assert!(insert.iter().all(|detail| !detail.starts_with("SCAN messages")), "no scan of messages: {insert:?}");
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_tombstone_is_filed_under_its_prefix_and_not_repeated() {
+    let (store, dir) = ingest_store("tombstone-store").await;
+    let write = |stanza: String, sender: &'static str, label: &'static str| {
+        let store = &store;
+        async move { store.insert_revoke_tombstone(GROUP, sender, &stanza, label, 200, false, "skipped").await }
+    };
+
+    assert!(write("S1".into(), PEER_PHONE, "[deleted T1]").await.unwrap());
+    // The same stanza ID again, and the same chat, sender and label under other stanza IDs: no row.
+    assert!(!write("S1".into(), PEER_PHONE, "[deleted T1]").await.unwrap());
+    for n in 0..20 {
+        assert!(!write(format!("R{n}"), PEER_PHONE, "[deleted T1]").await.unwrap(), "R{n}");
+    }
+    // Another sender, another label, another flag, another chat: a row each.
+    assert!(write("S2".into(), OTHER_PHONE, "[deleted T1]").await.unwrap());
+    assert!(write("S3".into(), PEER_PHONE, "[deleted T2]").await.unwrap());
+    assert!(store.insert_revoke_tombstone(GROUP, PEER_PHONE, "S4", "[deleted T1]", 200, true, "skipped").await.unwrap());
+    assert!(store.insert_revoke_tombstone(OTHER_GROUP, PEER_PHONE, "S5", "[deleted T1]", 200, false, "skipped").await.unwrap());
+
+    let conn = raw(&dir.join("whatsapp.db"));
+    let ids: Vec<String> = conn
+        .prepare("SELECT message_id FROM messages ORDER BY message_id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids, ["tombstone:S1", "tombstone:S2", "tombstone:S3", "tombstone:S4", "tombstone:S5"]);
+    let (kind, source, embed, from_me): (String, String, String, i64) = conn
+        .query_row("SELECT content_kind, source, embed_status, from_me FROM messages WHERE message_id = 'tombstone:S1'", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .unwrap();
+    assert_eq!((kind.as_str(), source.as_str(), embed.as_str(), from_me), ("revoke", "live", "skipped", 0));
+    // The full-text index follows the insert, as for any row.
+    let hits: i64 = conn.query_row("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'deleted'", [], |r| r.get(0)).unwrap();
+    assert_eq!(hits, 5);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_tombstone_does_not_block_a_later_message_with_its_stanza_id_and_is_never_an_anchor() {
+    let (store, dir) = ingest_store("tombstone-id").await;
+    // A stranger's revoke carries the stanza ID "LATER"; a real message with that ID arrives afterwards.
+    assert!(store.insert_revoke_tombstone(PEER_JID, PEER_PHONE, "LATER", "[deleted X]", 100, false, "skipped").await.unwrap());
+    assert!(
+        store.insert_message_if_new(PEER_JID, PEER_PHONE, "LATER", "text", Some("real"), 300, false, "live", "pending").await.unwrap(),
+        "the real message is stored"
+    );
+    // A chat that holds only a tombstone has no anchor; with a real message, that one is the anchor
+    // even though the tombstone is older.
+    assert!(store.insert_revoke_tombstone(OTHER_GROUP, PEER_PHONE, "ONLY", "[deleted Y]", 100, false, "skipped").await.unwrap());
+    assert!(store.get_oldest_message(OTHER_GROUP).await.unwrap().is_none());
+    let oldest = store.get_oldest_message(PEER_JID).await.unwrap().expect("the real message");
+    assert_eq!((oldest.message_id.as_str(), oldest.timestamp_secs), ("LATER", 300));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_judgement_never_reads_the_message_id_of_a_revoke_row_and_counts_a_tombstone() {
+    let (store, dir) = ingest_store("tombstone-judged").await;
+    store.insert_message(GROUP, PEER_JID, "T1", "text", Some("hi"), 1, false, "bootstrap", "pending").await.unwrap();
+    store.insert_message(GROUP, PEER_JID, "T2", "text", Some("hi"), 1, false, "bootstrap", "pending").await.unwrap();
+    // A tombstone of the author (the sender in the bare form live ingest stores) counts ...
+    assert!(store.insert_revoke_tombstone(GROUP, PEER_PHONE, "S1", "[deleted T1]", 2, false, "skipped").await.unwrap());
+    assert!(store.is_revoked("T1").await.unwrap());
+    // ... one of another member does not, however many there are.
+    for n in 0..30 {
+        store.insert_revoke_tombstone(GROUP, &format!("1555000{n:04}"), &format!("F{n}"), "[deleted T2]", 2, false, "skipped").await.unwrap();
+    }
+    assert!(!store.is_revoked("T2").await.unwrap());
+    // A message whose ID looks like a tombstone's is only a target by that ID.
+    assert!(!store.is_revoked("tombstone:S1").await.unwrap(), "the tombstone is a row, not a stored target of another revoke");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn store_is_revoked_reads_the_owner_identity_and_judges_stored_rows() {
+    let (store, dir) = ingest_store("revoke-store").await;
+    store
+        .conn
+        .lock()
+        .execute(
+            "INSERT INTO device (id, pn, lid) VALUES (1, '15550001111:12@s.whatsapp.net', '100000000000009:12@lid')",
+            [],
+        )
+        .unwrap();
+    // An own group message revoked by the account, known only by its LID form as the sender.
+    store.insert_message(GROUP, OWN_JID, "T1", "text", Some("hi"), 1, true, "live", "pending").await.unwrap();
+    store
+        .insert_inbound(GROUP, "100000000000009:12@lid", "R1", "revoke", Some("[deleted T1]"), 2, false, "skipped")
+        .await
+        .unwrap();
+    // A message nobody revoked.
+    store.insert_message(GROUP, PEER_JID, "T2", "text", Some("hi"), 1, false, "live", "pending").await.unwrap();
+
+    assert!(store.is_revoked("T1").await.unwrap());
+    assert!(!store.is_revoked("T2").await.unwrap());
+    assert!(!store.is_revoked("UNKNOWN").await.unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -3,8 +3,8 @@
 **Status:** Proposed (v5, 2026-11-04: the v4 follow-up cold review and a ureq timeout spike folded in; the old-file
 test matrix passed 2026-11-05, GO 2026-11-06; v5.1 2026-11-06: the own-message attribution fix folded into phase 2;
 v5.2 2026-11-08: the revoke key rule corrected; v5.3 2026-11-08: the v5.2 cold review folded in (revokes judged
-when read, a deferred repair, an in-place downgrade); v5.4 2026-11-08: the v5.3 cold review folded in; next: phase
-2a commit, then 2b; phase 2 merges to `main` after 2b)
+when read, a deferred repair, an in-place downgrade); v5.4 2026-11-08: the v5.3 cold review folded in; phase 2 built
+2026-11-08 (2a ae89d33, then 2b); next: the merge to `main`, then phase 3)
 **Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4), 2026-11-04 (v5), 2026-11-06 (v5.1), 2026-11-08 (v5.2, v5.3, v5.4)
 
 ## Context
@@ -110,7 +110,7 @@ Facts that shape the design (checked in the code, the wa-rs pin `9e8c70e` and a 
    index on the label, so arrival order and the running build do not matter; no column stores the result and no
    pass runs over old rows (2026-11-08). In a 1:1 chat the author test is `from_me` equality; in a group, sender
    identity. **Revoked wins** (a message judged revoked is never `ready`; its file is tagged then), and revoke
-   tombstones are stored even from senders outside `WHATSRUST_ALLOWED_NUMBERS`. Remaining false negatives fail open,
+   tombstones are stored even from senders outside `WHATSAPP_ALLOWED`. Remaining false negatives fail open,
    by policy; retention must keep revoke rows. The revoke key does not gate the judgement; its shape is only logged. The
    file set comes from the rows actually deleted (a message delete also matches the chat), through per-event,
    chunked intent keys in `metadata` that startup replays. A message missing from the DB is never treated as deleted. A revoked message is never downloaded. A
@@ -241,6 +241,18 @@ changes, 0 blocking, 4 major; trajectory: converging) and the owner's decisions 
 - phase 2 merges to `main` after 2b.
 Run 2a measured the budget (7.2–8.1 s for 500,000 messages, debug build) and proved the in-place downgrade with a
 v8 build (`--migrate` accepted the DB in 0.23 s).
+
+**2026-11-08: phase 2 built.** Run 2a (ae89d33): schema v9, the repair at every start, ingest; an independent code
+review led to a backoff for failed repairs, `ensure_v9_columns` at every open, a pin when a forced re-validation
+fails, a merge function for duplicates, and a fix for `--rollback`, which could never find the backup for the
+default bare path `whatsapp.db`. Run 2b: `is_revoked` (revokes judged when read), revoke tombstones stored past the
+allowlist, the key-shape debug log. Two corrections: the allowlist variable is **`WHATSAPP_ALLOWED`** (design and ADR
+text since v4 named a variable that does not exist); tombstone rows from non-allowed senders appear in `history` and
+`search` like any revoke row (owner decision of 2026-11-08); a code review of 2b found that this let an excluded
+sender store free text and take a real message's ID, so a tombstone is stored only for message-ID-shaped IDs, under
+`message_id = tombstone:<stanza id>`, once per (chat, sender, label). Open for phases 4–6: the call sites of `is_revoked`
+(`get`, `status`, the download start and its final write, the delete-and-revoke hook), and confirming the real
+revoke key shape from the debug log.
 
 ## Alternatives considered
 
