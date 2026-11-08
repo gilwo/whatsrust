@@ -236,8 +236,8 @@ a real account)
   owner's phone as received (found by the 2026-11-01 probe); history stores the group or the other person as the
   sender of own messages (2026-11-05, 2026-11-06). The code fix is in (d2f598c); the v9 migration (phase 2a) repairs
   the stored rows and the fetch cursor's anchor flag.
-- [ ] **Own live messages in LID-addressed 1:1 chats stored under the account's own number** (found 2026-11-08; fix
-  commit before phase 2a): rows stored earlier keep the wrong chat and cannot be repaired; a re-pair that keeps
+- [ ] **Own live messages in LID-addressed 1:1 chats stored under the account's own number** (found 2026-11-08;
+  fixed 2026-11-08 for new rows, `resolve_live_chat_jid`): rows stored earlier keep the wrong chat and cannot be repaired; a re-pair that keeps
   history, or `clear-data` and a new fetch, brings them back from history.
 - [ ] **Live check of archive-key seeding** (roadmap P1, owner): archive and unarchive a chat with no
   stored message, then fetch it. The code is done (2768412). The 2026-10-22 runs never received an

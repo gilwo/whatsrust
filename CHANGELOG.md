@@ -16,6 +16,7 @@ Work on branch `feature/media-download`, not yet on `main`.
 
 ### Fixed
 - Own messages are attributed to the account: live rows now store the account's own messages with `from_me = 1` (they were always stored with 0), and own history messages without a key participant store the account's own phone JID as the sender instead of the group or the other person; rows stored earlier are repaired by the schema v9 migration (media download design v5.1 §4)
+- Own messages in a LID-addressed 1:1 chat are now stored under the other person's chat (the phone JID when the LID mapping is known, else the `…@lid` chat), no longer under the account's own number, which wa-rs offers as the sender's alt on such messages; the "message yourself" chat still resolves to the account's own number; rows stored earlier keep the wrong chat (the other person's ID was not kept)
 
 ## 2026-11-06 — Live media security
 
