@@ -1,6 +1,9 @@
 # On-demand media download — design and plan
 
-**Status:** v5.3 (2026-11-08): the v5.2 cold review folded in with the owner's decisions: revokes are judged when
+**Status:** v5.4 (2026-11-08): the v5.3 cold review folded in with the owner's decisions: the repair runs at every
+start that knows the owner's number, with a backup before it changes rows; a `media_key_timestamp` column and a
+whole-tuple fill; "revoked wins" and revoke tombstones stored past the allowlist; phase 2 merges after 2b. v5.3
+(2026-11-08): the v5.2 cold review folded in with the owner's decisions: revokes are judged when
 read (no `revoked_at` column, no one-time pass), the own-message repair runs once at the first start that knows the
 owner's number, the way back is an in-place downgrade, `view_once` comes from the extractor; real-DB facts in §2. A
 cold review of v5.3 runs before phase 2b. v5.2 (2026-11-08): the revoke key rule corrected to the protocol, the decisions of the phase 2
@@ -28,6 +31,19 @@ This document describes what is built and how. The owner's decisions are in §9;
 > upstream `main`). At this pin whatsrust runs the media HTTP transfer and builds the re-upload request itself, from
 > wa-rs's public parts (§6.2). Items marked **[wa-rs]** are where the upgrade changes this design; they sit behind
 > two adapters, `MediaTransfer` and `MediaReuploader`.
+
+### Changes in v5.4
+
+| Change | Why |
+|---|---|
+| **The repair runs at every start that knows the owner's number** (idempotent; it changes rows only when misattributed rows exist); the marker only records the number for the re-pair guard; a backup (`whatsapp.db.pre-repair-<ts>.bak`) before it changes rows outside the migrating start; an in-transaction post-condition; a persisted failure note; one warning for another number (§4; owner, 2026-11-08) | a one-shot marker locked in rows written later (a v8 window after a downgrade, an incomplete identity, a failed lookup), and a later run had no backup (v5.3 review M1, M2) |
+| The repair's purpose restated: the duplicate and revoke rules are identity-based and work without it; it corrects stored data for `history`/`search` and the fetch cursor's anchor flag (§4) | v5.3 review M2 |
+| A sixth column, `media_key_timestamp`; the encryption tuple (`media_key`, `direct_path`, `file_enc_sha256`, `media_key_timestamp`) is filled only as a whole, when all three key fields are empty (§4; owner, 2026-11-08) | per-column filling could pair a key from one encryption with a path from another (a false `integrity`); without the timestamp a newer copy could never be told apart without a v10 (v5.3 review M3) |
+| **Revoked wins:** a message judged revoked is not `ready`; `get`/`status` answer `revoked`, and a downloaded file is tagged then (idempotent) (§5.5, §6.1; owner, 2026-11-08) | the read-time judgement and event-time tagging had no precedence (v5.3 review M4) |
+| **Revoke tombstones are stored past the allowlist** (only the revoke row; no event, no receipt); the remaining false negatives fail open, as a stated policy; retention and prune features must keep revoke rows (§5.5; owner, 2026-11-08) | live ingest dropped revokes from senders not on `WHATSRUST_ALLOWED_NUMBERS` while history stored their media (v5.3 review M4) |
+| In a 1:1 chat a revoke is judged by `from_me` equality with the target (after the repair); groups by sender identity (§5.5) | removes the LID-mapping false negatives in 1:1 chats (v5.3 review m8) |
+| `ensure_v9_columns` on the re-validation branch, so `--migrate` can fix a v9 DB with a missing column; precise recovery wording (§4) | v5.3 review m1 |
+| Phase 2 merges to `main` after 2b (§9, §13; owner, 2026-11-08) | the attribution repair is user-visible on its own; the engine follows on the branch |
 
 ### Changes in v5.3
 
@@ -191,9 +207,10 @@ short-lived URL and fetches the file over the network.
 ## 4. Schema v9
 
 An additive migration through the existing staged-migration machinery (pre-migration backup, validation, circuit
-breaker; ADR 0028–0032; the schema version goes from 8 to 9): five `media_refs` columns and one partial index,
+breaker; ADR 0028–0032; the schema version goes from 8 to 9): six `media_refs` columns and one partial index,
 `CREATE INDEX … ON messages(body_text) WHERE content_kind = 'revoke'` (the revoke label lookup of §5.5). The step is
-re-runnable: each column is added only when missing, and the index uses `IF NOT EXISTS`.
+re-runnable: each column is added only when missing, and the index uses `IF NOT EXISTS`. The same guarded adds
+(`ensure_v9_columns`) also run on the re-validation branch, so `--migrate` can fix a v9 DB that misses a column.
 
 | New column | Type | Filled from | Used for |
 |---|---|---|---|
@@ -202,6 +219,7 @@ re-runnable: each column is added only when missing, and the index uses `IF NOT 
 | `remote_jid` | TEXT | the message key's `remote_jid` as the phone sent it (LID or phone) | the re-upload address of a 1:1 chat (§6.2) |
 | `participant` | TEXT | the message key's `participant` as the phone sent it | the re-upload address of a group sender (§6.2) |
 | `view_once` | INTEGER | 1 when history extraction unwrapped a view-once wrapper (any of the three, also inside an ephemeral wrapper) or the media message carries its own view-once flag, else 0 | the final state `view_once` |
+| `media_key_timestamp` | INTEGER | the media message's `mediaKeyTimestamp` | tells a newer encryption of the same message apart (a later replacement rule needs no migration) |
 
 - Existing rows keep NULL in the new columns; nothing is backfilled from `body_text`. A NULL `view_once` means
   "unknown" and is allowed. Their re-upload address comes from the LID↔phone mapping (§6.2); `status` reports the
@@ -212,8 +230,11 @@ re-runnable: each column is added only when missing, and the index uses `IF NOT 
   when the incoming message matches the stored row** (the same chat: a 1:1 chat as the same user in phone or LID
   form, a group exactly; the same sender as the same user in phone or LID form, and two own rows always match; the
   same `from_me`; the same `content_kind`):
-  - an existing `media_refs` row gets its NULL columns filled (`view_once` takes the larger value, so a stored 1 is
-    never lowered);
+  - an existing `media_refs` row gets its NULL columns filled: the encryption tuple (`media_key`, `direct_path`,
+    `file_enc_sha256`, `media_key_timestamp`) only as a whole, when the stored `media_key`, `direct_path` and
+    `file_enc_sha256` are all NULL; the plaintext properties (`file_sha256`, `file_length`, `mimetype`, `width`,
+    `height`, `file_name`, `remote_jid`, `participant`) one by one; `view_once` takes the larger value, so a stored 1
+    is never lowered;
   - a missing `media_refs` row is **created when the stored message's `source` is not `live`** (`bootstrap` or
     `backfill`); a live row stays without a reference, as live media is out of scope (owner, 2026-11-03; this
     revises the "fill only" rule of 2026-11-01).
@@ -222,15 +243,16 @@ re-runnable: each column is added only when missing, and the index uses `IF NOT 
 - Because backfill does not revisit stored rows (§2), old history rows without a reference are repaired by a
   re-pair that keeps history, or by `clear-data` followed by a new fetch (HOWTO).
 - No column for the transient states: `ready` is derived from `hydrated_path` (§6.1).
-- **Own-message attribution** (the first commit of phase 2; owner, 2026-11-06). The duplicate rule above and the
-  revoke rule (§5.5) compare the sender and `from_me`, so both values must be right first:
+- **Own-message attribution** (the first commit of phase 2; owner, 2026-11-06). New rows store the right values:
   - live ingest stores the event's own `is_from_me` (today `insert_inbound` always writes 0);
   - history ingest: a message with `from_me` and no participant stores the account's own phone JID
     (`<number>@s.whatsapp.net`, device part removed) as the sender, not the key's `remote_jid`. Without a known
     own number (no paired device row), the current fallback stays.
-- **The repair of stored rows** (owner-authorised 2026-11-06; scope and timing 2026-11-08) runs **once, at the first
-  start that knows the owner's number** (the migrating start when the profile is paired, else the first start after
-  pairing), after the migration, in its own transaction:
+- **The repair of stored rows** (owner-authorised 2026-11-06; scope and timing 2026-11-08) corrects stored data for
+  `history`, `search` and the fetch cursor; the duplicate and revoke rules are identity-based and do not depend on
+  it. It runs **at every start that knows the owner's number**, after the migration, in its own transaction, and
+  changes rows only when misattributed rows exist (after a v8 window following a downgrade, a LID that became known,
+  a failed lookup at ingest):
   - one predicate, "is the owner": the sender's bare user (before `@` and `:`; a `.` stays part of a LID user, as
     wacore keeps it) equals the owner's number or LID, or a LID the mapping gives for the owner's number. The owner's
     number and LID come from the `device` row; a missing row, an empty `pn` or a missing column means "no identity";
@@ -239,22 +261,32 @@ re-runnable: each column is added only when missing, and the index uses `IF NOT 
     the group or the other person) get the own phone JID as the sender;
   - a fetch cursor whose anchor flag (`backfill_cursor.oldest_msg_from_me`) is 0 or NULL while its anchor message
     (`oldest_msg_id` in the same chat) now has `from_me = 1` gets 1;
-  - the updates are set-wise (the distinct senders are classified once, then `UPDATE … WHERE sender_jid IN (…)`),
-    with the full-text update trigger dropped and re-created inside the transaction (the text does not change);
-  - a metadata marker records the bare number used and the time; with a marker the repair never runs again, and a
-    marker with **another** number skips it with a warning (a DB kept across a re-pair to another number). A DB
-    re-paired to another number before its first v9 start is repaired as if the current number had always been
-    the owner's (a documented limit);
-  - the counts and the elapsed time are logged (no JIDs). In the migrating start the pre-migration backup covers
-    the repair; a later run has no backup of its own (it is narrow, idempotent and harmless to a v8 binary).
-- **Budget:** the migration and the repair finish within 30 s on a synthetic DB of 500,000 messages; the test reports
-  the time and the WAL peak (the owner's largest profile: 26,080 messages, 963 rows to repair; §2).
+  - the distinct senders are classified first; the updates are set-wise (`UPDATE … WHERE sender_jid IN (…)`), with
+    the full-text update trigger dropped and re-created inside the transaction (the text does not change);
+  - **before it changes rows outside the migrating start, it takes a backup** (`whatsapp.db.pre-repair-<ts>.bak`,
+    mode 600; the migrating start is covered by the pre-migration backup); a failed backup skips the repair until
+    the next start;
+  - an in-transaction post-condition (no owner live row with `from_me = 0`, no own history row naming another
+    sender) guards the commit; a failure rolls back and persists a failure note (time and reason, no JIDs), cleared
+    by the next success;
+  - the marker `own_attribution_repair` records the owner's bare number at the first run. A marker with **another**
+    number (a DB kept across a re-pair to another number) skips the repair, with one warning at the first start that
+    sees it (a persisted note keeps later starts quiet). A DB re-paired to another number before its first v9 start
+    is repaired as if the current number had always been the owner's (a documented limit);
+  - the counts and the elapsed time are logged (no JIDs); the watchdog baseline is seeded after the repair.
+  - It is a startup data repair outside the version step: ADR 0028 records the pattern (idempotent, backed up,
+    post-conditioned, guarded).
+- **Budget:** the migration and the repair finish within 30 s on a synthetic DB of 500,000 messages, the backup
+  included; the test reports the time, the WAL peak and the time of a no-op repair (the owner's largest profile:
+  26,080 messages, 963 rows to repair; §2). First measurement (run 2a, debug build): 7.2–8.1 s, WAL peak 77 MiB.
 - **The way back after a healthy v8 → v9 migration is an in-place downgrade:** stop the daemon, set
   `PRAGMA user_version = 8`, start the v8 build. A v8 binary refuses v9 only by the version number and re-validates
   at its own version (§2); v9 adds only nullable columns and an index, and the repaired rows are harmless to it, so
   nothing received since is lost. Phase 2a proves this with a test that runs the real v8 binary on a synthetic v9
-  DB; if it fails, restoring the pre-migration backup stays the only revert (it loses everything received since,
-  including the Signal state, so a re-pair may follow). `--rollback` still serves failed migrations only. Restoring
+  DB (run 2a: the v8 build's `--migrate` accepted it in 0.23 s, and a v9 build migrated it again); restoring the
+  pre-migration backup is the fallback (it loses everything received since, including the Signal state, so a re-pair
+  may follow). `--rollback` serves failed migrations only; after a post-commit validation failure the DB is already
+  at v9, so `--migrate` re-validates (with `ensure_v9_columns`) and `--rollback` restores the backup. Restoring
   the backup is the documented fallback; keep the v8 backup until the engine is validated. A later v9 start
   migrates again (the step is re-runnable). HOWTO gets both procedures.
 - Therefore phase 2 is merged to `main` **only after the old-file test matrix passes** (§11.1, §13). After that it
@@ -370,10 +402,20 @@ file back when its message is valid again.
   to the stored chat JID), so a colliding ID in another chat is never touched.
 - **A valid revoke** is judged by identities, **when it is read** (owner, 2026-11-08):
   - a revoke counts when a stored revoke row in the same chat (a 1:1 chat as the same user, a group exactly)
-    carries the exact label `[deleted <id>]` and its revoker is the target's author: the owner for an own target
-    (the repaired `from_me` or the owner's identities), else the target's sender as the same user (phone or LID
-    form, through the mapping). An admin's delete in a group does not count: the admin is not the author (the media
-    stays available; documented);
+    carries the exact label `[deleted <id>]` and its revoker is the target's author. **In a 1:1 chat** the author
+    test is `from_me` equality between the revoke row and the target (the repaired flag; no LID mapping needed).
+    **In a group** it is the owner for an own target (the repaired `from_me` or the owner's identities), else the
+    target's sender as the same user (phone or LID form, through the mapping; the mapping comes from server stanza
+    attributes and own-phone sync, one hop only, so a reassigned phone number would merge users). An admin's delete
+    in a group does not count: the admin is not the author (the media stays available; documented);
+  - **revoke rows are stored past the allowlist:** a revoke from a sender not on `WHATSRUST_ALLOWED_NUMBERS` is
+    stored as its tombstone row only (no event, no read receipt), because history stores that sender's media
+    regardless of the allowlist (owner, 2026-11-08);
+  - **revoked wins:** a message judged revoked is never `ready`; `get` and `status` answer `revoked`, and a
+    downloaded file of it is tagged at that moment (idempotent; tagging a file of a message judged revoked is safe,
+    unlike tagging by absence);
+  - **policy:** every remaining false negative fails open (the media stays available) rather than hiding media by
+    a guess; retention and prune features must keep `content_kind = 'revoke'` rows, which the judgement reads;
   - `is_revoked(message_id)` runs this check through the partial index of §4 wherever the state matters: `get`,
     `status`, the download start and its final `hydrated_path` write (§6.2). No column stores the result, so the
     order of arrival does not matter (a revoke stored before its target applies once the target is stored), no pass
@@ -427,7 +469,7 @@ each other's entries, and no single value grows with the size of a chat.
 | `queued` | waiting for the download lane (`position` given) | – |
 | `waiting_reupload` | the link expired; waiting for, or in, a re-upload request (`bytes_expected` given, so the cost to the phone is visible) | – |
 | `downloading` | streaming; `bytes_written`, `bytes_expected` given | – |
-| `ready` | `hydrated_path` set, outside `_deleted/`, and the file exists | yes (until deleted on disk) |
+| `ready` | `hydrated_path` set, outside `_deleted/`, the file exists, and the message is not revoked (revoked wins, §5.5) | yes (until deleted on disk) |
 | `failed` | `reason`, `retryable`, `retry_after_ms` | depends on the reason |
 
 A non-final item may show `waiting: disconnected` (the client is not connected) or `waiting: no_lid` (connected,
@@ -797,8 +839,12 @@ A `media` snapshot (`{enabled: false}` when the feature is off):
 | LID 1:1 chats | Own messages in LID-addressed 1:1 chats are filed under the other person: a separate fix commit on the media branch before phase 2a; earlier rows keep the wrong chat (2026-11-08) |
 | Revoke key | The corrected rule of §5.5 goes to a cold review (v5.2) before phase 2b; phase 2a may start meanwhile (2026-11-08) |
 | Revoke model | Judged when read from the stored revoke rows; no `revoked_at`, no one-time pass; the key shape is only logged (2026-11-08, after the v5.2 cold review) |
-| Unpaired upgrade | The repair runs once at the first start that knows the owner's number, under a marker; another number → skipped with a warning (2026-11-08) |
+| Unpaired upgrade | The repair waits for the first start that knows the owner's number; another number → skipped with a warning (2026-11-08; it runs at every such start since the v5.3 review) |
 | Budget | 30 s for the migration and the repair on a synthetic 500,000-message DB (set by the coordinator; the owner gave no limit, 2026-11-08) |
+| Repair runs | At every start that knows the owner's number, with a backup before it changes rows outside the migrating start; the marker is the re-pair guard (2026-11-08, after the v5.3 cold review) |
+| Media key | A `media_key_timestamp` column in v9; the encryption tuple filled only as a whole (2026-11-08) |
+| Revoke policy | Revoked wins (tag lazily); revoke tombstones stored past the allowlist; remaining false negatives fail open (2026-11-08) |
+| Merge timing | Phase 2 merges to `main` after 2b; the engine follows on the branch (2026-11-08) |
 
 ---
 
@@ -921,7 +967,7 @@ No other new crate: the sanitiser uses the standard library (§5.3), and the qua
 | 0 | Branch from `main`; the "after a merge" step | ✅ committed; 0 stale doc hashes |
 | 1 | **The live re-upload test** with the dev probe (`media-probe`, HOWTO §3) | ✅ 2026-11-01: addressing for fresh messages settled (own LID), recorded in FEATURES F1 and ADR 0050 |
 | 1b | **The old-file test matrix** (§11.1; owner, with the probe) | ✅ 2026-11-05: recorded in ADR 0050 and §2; **GO** (2026-11-06); retest of two cells done 2026-11-06 (§11.1) |
-| 2 | Detail: `docs/plans/2026-11-08-media-phase2-plan.md` (v5.3). Done first: the own-message attribution fix (d2f598c) and the LID-chat fix (a72b1f2). **2a:** schema v9 (5 columns and the revoke-label index; a re-runnable step; staged migration, tests per ADR 0028–0032); the repair at the first start that knows the owner's number (marker, set-wise, trigger paused); the message and its reference in one transaction; history ingest writes the new columns, with `view_once` from the extractor; the duplicate rule; the in-place downgrade proven with the v8 binary and the HOWTO revert section. **2b** (after the v5.3 cold review): `is_revoked` (the read-time judgement) and the key-shape log. **Merged only after phase 1b** | migration tests (fresh DB, v8 → v9, v7 → v9, a re-run, the failed-migration path, a post-commit validation failure and `--migrate`, the update-trigger probe); repair tests (paired at migration, unpaired then paired, the marker with the same and another number, a missing `device` column, a dotted LID, the cursor flag 0 and NULL); the budget test (500,000 messages, time and WAL peak); the downgrade test with the v8 binary and a re-upgrade; ingest, `view_once` (each wrapper, the leaf flag, never lowered), duplicate (match, each mismatch, `Filled` vs `Unchanged`) tests; `is_revoked` tests (own, by another person, admin, forged, another chat, a revoke stored before its target, before and after the repair) |
+| 2 | Detail: `docs/plans/2026-11-08-media-phase2-plan.md` (v5.4). Done first: the own-message attribution fix (d2f598c) and the LID-chat fix (a72b1f2). **2a:** schema v9 (6 columns and the revoke-label index; a re-runnable step and `ensure_v9_columns`; staged migration, tests per ADR 0028–0032); the repair at every start that knows the owner's number (backup before changes, post-condition, set-wise, trigger paused); the message and its reference in one transaction; history ingest writes the new columns, with `view_once` from the extractor; the duplicate rule; the in-place downgrade proven with the v8 binary and the HOWTO revert section. **2b:** `is_revoked` (the read-time judgement; 1:1 by `from_me`), revoke tombstones stored past the allowlist, and the key-shape log. **Merged to `main` after 2b** (phase 1b passed) | migration tests (fresh DB, v8 → v9, v7 → v9, a re-run, the failed-migration path, a post-commit validation failure and `--migrate`, the update-trigger probe); repair tests (paired at migration, unpaired then paired, the marker with the same and another number, a missing `device` column, a dotted LID, the cursor flag 0 and NULL); the budget test (500,000 messages, time and WAL peak); the downgrade test with the v8 binary and a re-upgrade; ingest, `view_once` (each wrapper, the leaf flag, never lowered), duplicate (match, each mismatch, `Filled` vs `Unchanged`) tests; `is_revoked` tests (own, by another person, admin, forged, another chat, a revoke stored before its target, before and after the repair) |
 | 3 | Layout: pure functions for folders, file names (bounded IDs), sanitising (byte limits), the MIME allowlist, the name file; the `tag`/`untag` primitive; the macOS quarantine attribute | unit and property tests for every row of §5.2 and §5.4, Cc/Cf/bidi stripping, Hebrew, empty names, 64-byte cuts, long and hostile IDs, executable extensions → `bin`, the §5.5 transition table |
 | 4 | The engine: `MediaTransfer` (ureq's own idle and total limits) and `MediaReuploader` (own-LID request, the pin's request for a LID-less account) with fakes; the two lanes; the reserve; the re-upload window, breaker and memories (persisted per key); the states and the per-item backoff; cancel and cancel all; the delete hook (matched by chat) with the chunked intent journal; startup cleanup and the counts; adoption by ID and un-tag | fake-driven tests for every state and reason; the real agent against local HTTP **and HTTPS** servers (both limits); journal replay with concurrent events; the races "deleted while downloading" and "revoked while downloading"; queue full; disconnected and no-LID waits |
 | 5 | The media file listener (startup rules, the pipeline of §7.2, headers, streaming with the minimum rate, tokens with the fresh-token margin); REST `get`/`status`/`cancel`; the proxy recipe update | gate, pipeline and header tests; REST golden cases for every row of the §8.1 answer table (labelled); the proxy smoke playbook |

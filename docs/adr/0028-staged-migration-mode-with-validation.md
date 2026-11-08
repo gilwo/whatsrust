@@ -59,3 +59,20 @@ Point-in-time: messages received after upgrade are LOST on override (logged + do
 
 **Hardening (2026-06-24, v2 review):**
 - **Shutdown-race fix (B1):** Migration runs in `Store::new` BEFORE SIGINT handler installed → Ctrl-C just terminates (mostly self-safe). Backup phase: write `.bak.tmp` + atomic-rename on success (partial temp never mistaken for good). Migration TX: SQLite auto-rollback on next open (free). Validation phase (the real gap): persist `schema_validated_version` key in metadata, set ONLY after validation passes; startup re-validates whenever != CURRENT (validation idempotent). Cleaner than signal-masking.
+
+## Amendment (2026-11-08): startup data repairs outside the version step
+
+Schema v9 (ADR 0050, media download design v5.4 §4) adds a **data repair that is not a version step**: it corrects
+the attribution of the account's own messages and runs at every start that knows the owner's number, because the
+data it needs (the paired number) can appear after the migration, and rows can become wrong again later (a v8 build
+after an in-place downgrade, a failed lookup at ingest). Such a repair follows these rules:
+- **Idempotent and narrow:** it changes only rows that match its predicate, so a run with nothing to fix is a scan.
+- **Backed up:** before it changes rows outside the migrating start, it takes its own backup
+  (`<db>.pre-repair-<ts>.bak`, mode 600, the same machinery as the pre-migration backup); a failed backup skips it.
+- **Post-conditioned:** an in-transaction check of the intended result guards the commit; a failure rolls back and
+  persists a note (time and reason, no personal data), cleared by the next success.
+- **Guarded:** a metadata marker records the identity it was first run for; another identity skips it, with one
+  warning.
+- **Quiet on personal data:** counts and elapsed time only.
+- It runs after a successful open (and after validation), never inside the version transaction, and the watchdog
+  baseline is seeded after it.
