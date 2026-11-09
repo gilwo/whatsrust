@@ -1771,7 +1771,10 @@ sender and chat identifiers, and the rows the v9 own-message repair would change
 `sqlite3 -readonly` and prints only counts and shapes (for example `lid dot=0 colon=1 len=15`), never a JID, a number
 or message text, so the output can be pasted into a review. Prefer a stopped daemon; otherwise report on a copy made
 with `sqlite3 -readonly <db> ".backup /tmp/whatsrust-shape-copy.db"` and delete the copy afterwards (it holds your
-messages). `--help` shows the details.
+messages). A database that nothing has open (the end of `whatsrust --migrate`, or a `.backup` copy) keeps the WAL
+flag in its file header but has no `-wal` file, and a plain read-only connection cannot open it ("unable to open
+database file"); the script then opens it with `immutable=1` (no lock, nothing created) and prints `open=immutable`.
+With a `-wal` present it opens the database read-only and replays the `-wal`. `--help` shows the details.
 
 ---
 
