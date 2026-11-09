@@ -20,6 +20,9 @@ a LID or message text.
 
 Safety:
   - The database is opened with `sqlite3 -readonly`; nothing is written.
+  - A WAL-mode file that has no -wal file (closed cleanly, for example after `whatsrust --migrate` or
+    on a `.backup` copy) cannot be opened by a plain read-only connection, so it is opened with
+    `immutable=1` instead (no lock, no -wal or -shm created). The "open=" line shows which was used.
   - Prefer a stopped daemon. If the daemon is running, report on a consistent copy instead:
       sqlite3 -readonly <db> ".backup /tmp/whatsrust-shape-copy.db"
       scripts/db-shape-report.sh /tmp/whatsrust-shape-copy.db
@@ -47,10 +50,32 @@ esac
 command -v sqlite3 >/dev/null || { echo "error: sqlite3 not found" >&2; exit 2; }
 
 size_of() { if [[ -f "$1" ]]; then wc -c <"$1" | tr -d ' '; else echo 0; fi; }
+
+# Bytes 18 and 19 of the file header (write and read format version) are 2 and 2 in WAL mode.
+is_wal_file() { [[ "$(od -An -tx1 -j 18 -N 2 "$1" | tr -d ' \n')" == "0202" ]]; }
+
+# A WAL-mode database that nothing has open has no -wal file: a clean close (for example the end of
+# `whatsrust --migrate`, or a `.backup` copy of a closed database) checkpoints it and deletes -wal and
+# -shm, but the file header stays in WAL mode. `sqlite3 -readonly` cannot open such a file ("unable to
+# open database file", SQLITE_CANTOPEN): a read-only connection never creates the -wal. With no -wal
+# there is nothing to replay (a daemon that has the database open always has a -wal), so that case is
+# opened with immutable=1: read-only, no lock, and no -wal or -shm is created. Every other case keeps
+# the plain read-only open, which replays an existing -wal or a hot journal.
+target="$db"
+open_mode="read-only"
+if is_wal_file "$db" && [[ ! -e "$db-wal" ]]; then
+  dir="$(cd "$(dirname -- "$db")" && pwd -P)"
+  abs="${dir%/}/$(basename -- "$db")"
+  abs="${abs//%/%25}"; abs="${abs//\?/%3F}"; abs="${abs//#/%23}"   # URI escapes: % ? #
+  target="file:${abs}?immutable=1"
+  open_mode="immutable (WAL-mode file with no -wal: nothing to replay)"
+fi
+
 echo "== files (bytes)"
 echo "db=$(size_of "$db") wal=$(size_of "$db-wal") shm=$(size_of "$db-shm")"
+echo "open=$open_mode"
 
-sqlite3 -readonly -bail -header -column "$db" <<'SQL'
+sqlite3 -readonly -bail -header -column "$target" <<'SQL'
 .print
 .print == schema
 SELECT (SELECT user_version FROM pragma_user_version) AS user_version,
