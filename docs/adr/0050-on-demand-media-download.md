@@ -4,7 +4,7 @@
 test matrix passed 2026-11-05, GO 2026-11-06; v5.1 2026-11-06: the own-message attribution fix folded into phase 2;
 v5.2 2026-11-08: the revoke key rule corrected; v5.3 2026-11-08: the v5.2 cold review folded in (revokes judged
 when read, a deferred repair, an in-place downgrade); v5.4 2026-11-08: the v5.3 cold review folded in; phase 2 built
-2026-11-08 (2a ae89d33, then 2b); next: the merge to `main`, then phase 3)
+2026-11-08 (2a 12204f9, then 2b); next: the merge to `main`, then phase 3)
 **Date:** 2026-10-29 (v1), 2026-10-30 (v2), 2026-11-01 (v3), 2026-11-03 (v4), 2026-11-04 (v5), 2026-11-06 (v5.1), 2026-11-08 (v5.2, v5.3, v5.4)
 
 ## Context
@@ -242,7 +242,7 @@ changes, 0 blocking, 4 major; trajectory: converging) and the owner's decisions 
 Run 2a measured the budget (7.2–8.1 s for 500,000 messages, debug build) and proved the in-place downgrade with a
 v8 build (`--migrate` accepted the DB in 0.23 s).
 
-**2026-11-08: phase 2 built.** Run 2a (ae89d33): schema v9, the repair at every start, ingest; an independent code
+**2026-11-08: phase 2 built.** Run 2a (12204f9): schema v9, the repair at every start, ingest; an independent code
 review led to a backoff for failed repairs, `ensure_v9_columns` at every open, a pin when a forced re-validation
 fails, a merge function for duplicates, and a fix for `--rollback`, which could never find the backup for the
 default bare path `whatsapp.db`. Run 2b: `is_revoked` (revokes judged when read), revoke tombstones stored past the

@@ -3,7 +3,7 @@
 **Date:** 2026-11-08 · **Review:** follow-up of [the v5.2 review](2026-11-08-on-demand-media-download-v5.md).
 **Artifact:** `docs/plans/2026-11-08-media-phase2-plan.md` (v5.3), `docs/plans/2026-10-29-on-demand-media-download-design.md`
 (v5.3; the phase 2 parts §2, §3, §4, §5.5, §6.2 step 6, §9, §13 row 2, §14), `docs/adr/0050-on-demand-media-download.md`
-(decisions 2 and 9, Notes), the ADR 0005 amendment; committed in c3c63eb (run 2a was in progress in the working tree
+(decisions 2 and 9, Notes), the ADR 0005 amendment; committed in d1555aa (run 2a was in progress in the working tree
 and was not reviewed).
 **Verdict:** **Approve with changes.** Blocking 0, Major 4, Minor 8, Questions 6.
 
@@ -105,7 +105,7 @@ Design §3, §5.5, §6.1, §6.2 step 6; plan §3, R7.
   fails in `open_with_mode` step 4, which writes no pin, so the pin / `--rollback` / `ForceMigrate` path is never
   exercised; use a failure inside the step (for example a view named `media_refs`, so `ALTER TABLE` fails). Plan §2.4's
   order line ("index" inside the transaction) is inaccurate; R4/R6 cross-references are off by one (R3, R5).
-- **m3.** The downgrade proof is thin: `…-55cbe70-dirty` has unknown provenance (build v8 from a clean `main` into a
+- **m3.** The downgrade proof is thin: `…-16a22d2-dirty` has unknown provenance (build v8 from a clean `main` into a
   scratch directory); `--migrate` only opens and validates, not v8 storage behaviour on v9 data (also run the v8
   storage tests or a smoke script on the migrated fixture); the HOWTO procedure needs an external `sqlite3`.
 - **m4.** SQL pitfalls: scalar `max(NULL, x)` is NULL in SQLite (use `MAX(COALESCE(stored, 0), new)` or Rust; test
