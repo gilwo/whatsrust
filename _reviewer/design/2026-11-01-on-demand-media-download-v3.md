@@ -1,7 +1,7 @@
 # Cold design review: on-demand media download (design v3, ADR 0050) — follow-up
 
 **Date:** 2026-11-01 · **Review:** follow-up (v3) of [the 2026-10-30 review](2026-10-30-on-demand-media-download-v2.md) (which reconciles [v1](2026-10-29-on-demand-media-download.md)) · **Reviewer:** cold, independent `design-reviewer` subagent (it did not see the prior reviews)
-**Artifact:** `docs/plans/2026-10-29-on-demand-media-download-design.md` (v3), `docs/adr/0050-on-demand-media-download.md` (Proposed v3), the ADR 0005 amendment (revised 2026-11-01); committed in 48f19cf
+**Artifact:** `docs/plans/2026-10-29-on-demand-media-download-design.md` (v3), `docs/adr/0050-on-demand-media-download.md` (Proposed v3), the ADR 0005 amendment (revised 2026-11-01); committed in 8fc6ccc
 **Verdict:** **Approve with changes.** Blocking 0, Major 6, Minor 11, Questions 6.
 
 The coordinator's reconciliation against the v2 findings is at the end ("Reconciliation against v2").

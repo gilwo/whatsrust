@@ -36,8 +36,8 @@ cd whatsrust
 # Debug build (fast, unoptimized) — verified working
 make build          # cargo build, then names the binary with its version
 # binary: target/debug/whatsrust-<version>-<commit>[-dirty][-<features>],
-#         e.g. target/debug/whatsrust-0.3.0-d17f947; target/debug/whatsrust is a symlink to the newest
-make build FEATURES=media-probe   # Cargo features: ...-d17f947-media-probe
+#         e.g. target/debug/whatsrust-0.4.0-7e2abd4; target/debug/whatsrust is a symlink to the newest
+make build FEATURES=media-probe   # Cargo features: ...-7e2abd4-media-probe
 
 # Release build (optimized: opt-level=z, LTO, codegen-units=1, panic=abort,
 # stripped — see [profile.release] in Cargo.toml). Noticeably slower to
@@ -64,14 +64,14 @@ make dist
   `deploy.sh` (which copies the real file) and MCP client configs keep using `target/<profile>/whatsrust`.
   Older builds stay on disk next to it; delete them by hand when no longer needed.
 - The same string is compiled in: `whatsrust --version` prints it, and the startup log line shows it
-  (`whatsrust v0.3.0-d17f947`).
+  (`whatsrust v0.4.0-7e2abd4`).
 - A plain `cargo build` (also the one `run-profile.sh daemon` runs) writes an unversioned
   `target/<profile>/whatsrust` over the symlink and reports only the crate version; the next `make build`
   restores the symlink.
 
 **Verification:**
 ```bash
-./target/debug/whatsrust --version   # e.g. "whatsrust 0.3.0-d17f947"
+./target/debug/whatsrust --version   # e.g. "whatsrust 0.4.0-7e2abd4"
 ./target/debug/whatsrust --help
 ```
 This prints the full command list and exits 0 — it does **not** require a

@@ -3,7 +3,7 @@
 **Date:** 2026-11-08 · **Review:** follow-up of [the 2026-11-04 review](2026-11-04-on-demand-media-download-v4.md) (v4).
 **Artifact:** `docs/plans/2026-11-08-media-phase2-plan.md`, `docs/plans/2026-10-29-on-demand-media-download-design.md`
 (v5.2; scope: the phase 2 parts §2, §4, §5.5, §9, §13 row 2, §14), `docs/adr/0050-on-demand-media-download.md`
-(Proposed, decisions 2 and 9, Notes), the ADR 0005 amendment; committed in 9f205fe (the uncommitted LID-chat fix was
+(Proposed, decisions 2 and 9, Notes), the ADR 0005 amendment; committed in 36cc054 (the uncommitted LID-chat fix was
 in the working tree).
 **Verdict:** **Approve with changes.** Blocking 0, Major 6, Minor 6, Questions 7.
 
@@ -151,7 +151,7 @@ wrapper set.
 - **Q7.** Can you capture real revokes (other person, group member, admin, own from the phone) before 2b? (M4)
 
 ## Assumptions and limits
-- The tree at 9f205fe plus the uncommitted working tree (the LID-chat fix in `src/bridge.rs`). Plan line numbers are
+- The tree at 36cc054 plus the uncommitted working tree (the LID-chat fix in `src/bridge.rs`). Plan line numbers are
   approximate.
 - The v8 binary accepting extra columns, WAL growth under a 2 MiB cache, and real clients' revoke keys come from
   reading code and library sources; nothing was run.
@@ -167,7 +167,7 @@ Each v4 finding checked against the v5.2 artifact itself (not against this repor
 |---|---|---|
 | M1 one-way door; phase 2 could merge before the gate | **Resolved**, then **superseded** by v5.2 M3 | §4 states the no-rollback rule and the manual revert; the matrix gate passed (§13 1b). v5.2 M3 finds the door less one-way than stated (an in-place downgrade looks possible) |
 | M2 stdio MCP is a REST client | **Resolved** | §8 caller marker (`X-Whatsrust-Caller`); §9 stdio MCP row |
-| M3 revoke rule fails open: (a) own revokes, (b) sender forms, (c) existing data, key fields dropped, revoke-before-target | **Resolved** for (a)–(c) (attribution fix d2f598c, the repair, identity comparison through the mapping, the one-time pass); key fields: a helper reads them (v5.2); revoke-before-target: **accepted and documented**. Residuals **re-raised** as v5.2 M4 (key shape unproven) and M5 (order and build dependence) | §4, §5.5, §9 |
+| M3 revoke rule fails open: (a) own revokes, (b) sender forms, (c) existing data, key fields dropped, revoke-before-target | **Resolved** for (a)–(c) (attribution fix 18739df, the repair, identity comparison through the mapping, the one-time pass); key fields: a helper reads them (v5.2); revoke-before-target: **accepted and documented**. Residuals **re-raised** as v5.2 M4 (key shape unproven) and M5 (order and build dependence) | §4, §5.5, §9 |
 | M4 duplicates trust `message_id` alone | **Resolved** | §4 match rule (chat, sender, `from_me`, kind) |
 | M5 byte budget can make a file unrecoverable | **Resolved** | §6.5 one window; a lone over-size file admitted into an empty window |
 | M6 "a blocked read cannot be interrupted" | **Resolved** (design); **indeterminate** over HTTPS until the phase 4 tests | §6.2 ureq's own `timeout_recv_body` / `timeout_global`; §11 item 3 |
